@@ -45,3 +45,25 @@ The exact prompts, scheduling, caching, overlay technique, privacy guards, model
 REA `trace_feature("completion")` could not execute: no configured Ghidra/Java, Hopper, IDA, or Kuna provider. The failure diagnostics identify missing prerequisites. Provider-neutral package/Mach-O/plist inspection and REA-controlled string captures succeeded. No decompilation, call-graph proof, live Cotypist typing test, or network privacy audit was performed. `capture_process_scenario` ran the analyst's static extraction command, not Cotypist. REA's target was closed after export.
 
 The evidence bundle contains binary-internal development paths and public update verification keys, not user credentials. Public update verification keys are not secrets.
+
+## Native reference pass for the menu-first replacement
+
+REA subsequently observed the running Cotypist process and navigated its actual Setup, General, Context, Personalization, Emoji, Shortcuts, Battery, App Settings, Labs, and Statistics panes. Navigation used process-scoped native accessibility observations and existing preference-pane deep links, not an invented mockup. Preferences, licensing, and permissions were not changed. The reference settings window opened for inspection was closed afterward.
+
+Published evidence: [sanitized native records](cotypist-menu-reference.json), including authenticated record IDs and the same executable SHA-256. The authenticated raw bundle contains 11 records and is retained outside Git at `~/Library/Caches/inklow/cotypist-menu-rea-20261023.json`; its digest is in the sanitized summary. Raw preferences can expose personal custom instructions, so editable values and the Personalization screenshot are deliberately not published.
+
+| Observed surface | Behavioral/UI evidence |
+| --- | --- |
+| Native grouped sidebar preferences | [General screenshot](cotypist-general-20261023.png); launch/accessory controls, model chooser, completion defaults/inside-text/length |
+| Optional context | [Context](cotypist-context-20261023.png); clipboard and local screen-context controls. Privacy text is a vendor assertion, not a network audit. |
+| Physical acceptance keys and punctuation modes | [Shortcuts](cotypist-shortcuts-20261023.png); Tab, layout-dependent above-Tab, force, toggles, trailing space/punctuation, Escape behavior |
+| Emoji, battery, per-app/domain controls | [Emoji](cotypist-emoji-20261023.png), [Battery](cotypist-battery-20261023.png), [App Settings](cotypist-appSettings-20261023.png) |
+| Experimental choosers and local activity UI | [Labs](cotypist-labs-20261023.png), [Statistics](cotypist-statistics-20261023.png) |
+
+The model picker identified Gemma 4 E2B as the recommendation (2.8 GB displayed). This establishes a visible recommendation/configuration, **not which model actually executed a prediction**. Inklow uses its independently downloaded Qwen model, not a copied Cotypist model.
+
+On this ISO Mac keyboard, the above-Tab key is § and has native keycode 10; ANSI uses keycode 50. The geometry was checked against HIToolbox keyboard/layout APIs rather than assuming an ANSI keymap.
+
+No Cotypist suggestion overlay or accepted live prediction was established in the disposable native text target. Therefore this pass does **not** prove typing-output parity, equivalent prompts/model quality, latency superiority, memory superiority, training behavior, or network privacy. Inklow's actual native typing proof is separate in [VERIFICATION.md](VERIFICATION.md).
+
+The reconstruction intentionally does not impersonate Cotypist accounts, subscriptions, iCloud synchronization, proprietary update infrastructure, or its exact model internals. Inklow also does not implement Cotypist's spell-correction UI/current-word-only mode. Menu-bar recovery is always retained instead of offering a hide-all-controls state. Windows/Linux capability differences are explicit in the README; an identically styled panel cannot make unavailable OS accessibility capabilities real.

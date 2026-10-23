@@ -1,0 +1,211 @@
+{
+  "subject_sha256": "78286accbb9f388d724fc6c759df7ba3af9ff0e04b49bbe0c828f90ca235f0cb",
+  "source": "REA process-scoped native UI observations of installed Cotypist; no preference values changed",
+  "private_raw_bundle": "~/Library/Caches/inklow/cotypist-menu-rea-20261023.json",
+  "private_raw_sha256": "60d3cf095e518f1b3c75a7d228e3bbdd4d54a741893f3a27aef53ca1bd3649a2",
+  "privacy": "Raw authenticated bundle kept outside git because native preferences can contain personal custom instructions. Published summary omits editable field contents. Reference screenshots exclude Personalization.",
+  "panes": {
+    "setup": {
+      "evidence_id": "ev_ab8f29f1d1e9c03303be0e9d880412df6a41e1c39bff0f1f9de33e6eb3294442",
+      "window_title": "Setup",
+      "static_labels": [
+        "One Optional Step Left",
+        "Clipboard context is still off. With it on, Cotypist reads your clipboard so completions fit what you're working on. Contents are processed locally on your Mac and are never stored or sent anywhere.\n\nYou can skip this, and change it later in Context settings.",
+        "Device Control and Data Access permission",
+        "Granted",
+        "Required for Cotypist to provide completions.",
+        "Screen Recording permission",
+        "Granted",
+        "Recommended for better context-aware suggestions. Screenshots are processed locally on your Mac and are never stored or sent anywhere. Learn more about how Cotypist protects your privacy.",
+        "AI model download",
+        "Downloaded",
+        "Download the AI model required for completions.",
+        "macOS inline predictive text",
+        "Disabled",
+        "Disable the predictions built into macOS to avoid conflicts with Cotypist. To turn them back on, open System Settings > Keyboard > Input Sources > Edit… and turn on \"Show inline predictive text\".",
+        "Clipboard context",
+        "Cotypist reads your clipboard to better understand what you're working on, for more relevant completions. Clipboard contents are processed locally and are never stored or sent anywhere. You can change this later in Context settings."
+      ],
+      "editable_values_omitted": true
+    },
+    "general": {
+      "evidence_id": "ev_2b60cdb2f6dfceabd45176371069bd9fcb4339ef7fed0feff6da8236ca3a09f8",
+      "window_title": "General",
+      "static_labels": [
+        "Launch automatically at login",
+        "Show menu bar icon",
+        "Display the Cotypist icon in the menu bar for quick access to settings and statistics.",
+        "Show accessory button",
+        "Display a floating button that provides quick access to Cotypist's menu when working in text fields.",
+        "AI Settings",
+        "AI model",
+        "Select the model used for completions.",
+        "Recommended for your system: Gemma 4 E2B",
+        "Model files",
+        "Open the folder containing downloaded models.",
+        "Completion Settings",
+        "Enable completions by default",
+        "When off, completions stay off in every app except those you turn them on for in App Settings.",
+        "Complete inside existing text",
+        "Normally Cotypist suggests only at the end of a line you haven't finished writing yet. Turn this on to also get suggestions when there is still text after the cursor on the same line.",
+        "Maximum completion length",
+        "Controls how long generated completions can be.\n\nWe recommend sticking with a medium length: Longer completions are slower to generate, disrupting your typing flow. In addition, longer completions are more likely to deviate from your intent, although parts of them can be \"salvaged\" using the single-word completion shortcut.\n\n\"Current word only\" finishes the word you're typing but never suggests the next one, for when you want spelling help without suggestions of what to write.",
+        "Privacy",
+        "Share anonymous usage statistics and crash reports",
+        "Help us improve Cotypist by sharing anonymous usage statistics and crash reports. Your writing is never sent to us — completions happen entirely on your Mac. We only see general app info, e.g. what features are used, how Cotypist is performing, and details about any crashes. Changes take effect after restarting Cotypist. Learn more about how Cotypist protects your privacy.",
+        "Autocorrect",
+        "Don't show completions when typo suspected",
+        "Hides the completion when Cotypist suspects a typo in the word you're currently typing. The main purpose is to keep Cotypist from extending a word that already contains a typo: it only ever looks at the current word and may occasionally miss or misjudge a typo. It is not a substitute for a full spell-checker.",
+        "Show suggested fixes",
+        "When a likely correction is available, show it inline as a strikethrough on the typo with the fix next to it."
+      ],
+      "editable_values_omitted": true
+    },
+    "shortcuts": {
+      "evidence_id": "ev_f002eaf968910e4ae8c7da1f643403027a7cc208a6888fe27bf30a429bf97841",
+      "window_title": "Shortcuts",
+      "static_labels": [
+        "Complete only the next word",
+        "Often, only a completion's first few words might reflect what you want to type. In that case, press this key repeatedly to insert only those words, and then resume typing yourself until you get the next matching completion. This is surprisingly effective in practice, try it!",
+        "Include trailing space",
+        "Accepting a single word also inserts the space after it, so you can type the next word right away.",
+        "Trigger full completion",
+        "This will accept the entire completion at once. We recommend using the key above Tab (often ` or §, depending on your keyboard layout).",
+        "Include trailing punctuation",
+        "Choose whether accepting a suggestion also inserts the punctuation after it, such as a comma or period. Leaving it out is useful when you want to keep writing, or don't want to end a chat message with a period. Any punctuation left out stays in the suggestion, so pressing either shortcut again inserts it.",
+        "When you press Escape",
+        "This only changes what the Escape key does while a suggestion is showing. The rest of the time, Escape works as usual. Once it clears a suggestion, a second press goes straight to the app; to switch completions off for longer, use the per-app or global toggle below.",
+        "Force-activate completions",
+        "In some cases, Cotypist can't automatically detect that you have started typing. Invoke this shortcut to take matters into your own hands!",
+        "Temporarily toggle completions in the current app",
+        "Quickly turns completions off for a few minutes in the current application, or back on if they're currently disabled.",
+        "Toggle completions globally",
+        "Disables completions everywhere until you press the shortcut again. Useful when you want Cotypist to stay out of the way entirely for a while."
+      ],
+      "editable_values_omitted": true
+    },
+    "appSettings": {
+      "evidence_id": "ev_9fa4f99f881b8eac9e38b3c47f1c6c64ce107b38e215526da4ffb21a7c979d1e",
+      "window_title": "App Settings",
+      "static_labels": [
+        "Apps",
+        "Domains",
+        "Add a website to give it its own settings in any browser."
+      ],
+      "editable_values_omitted": true
+    },
+    "labs": {
+      "evidence_id": "ev_6d547c73a5e196a54fad37e0e6758f177df0be5b279d17860e6d0bd989f013c8",
+      "window_title": "Cotypist Labs",
+      "static_labels": [
+        "Cotypist Labs collects experimental features that work well enough to ship. They might not be as polished as other features.",
+        "Show alternative suggestions",
+        "Offer other words for the current completion below the cursor after a short delay or upon invoking a shortcut; press the corresponding number to insert one. This is meant for the occasional writer's block or wording hiccup, not for choosing a word on every keystroke (which would only invite decision fatigue). If you already know the word you want, it usually flows better to just start typing its first few letters and let Cotypist update its completion to match, rather than waiting for the picker and choosing.",
+        "Suggest synonyms for selected words",
+        "Select a word or short phrase to see contextual synonyms below it, either automatically after a moment or when you press the shortcut; press the corresponding number to replace the selection.",
+        "Delay before showing",
+        "1.5 s",
+        "How long a selection has to stay unchanged before Cotypist looks up synonyms.",
+        "Look up synonyms with shortcut",
+        "Optionally press this while a word is selected to show synonyms immediately.",
+        "iCloud Sync",
+        "Sync your writing between your Macs",
+        "Cotypist syncs your recorded writing between your Macs through your own iCloud account, along with the on-screen context it was written in. Everything is end-to-end encrypted, and the key reaches your other Macs through iCloud Keychain, which Apple cannot read either. So neither Apple nor we can read your writing. Synced data counts toward your iCloud storage, usually no more than a few MB in total. Learn more"
+      ],
+      "editable_values_omitted": true
+    },
+    "statistics": {
+      "evidence_id": "ev_4c20e7a4f02a0d85b7b82e61c082e54fc7fcac7cd58f64b81a4b49515c12438e",
+      "window_title": "Statistics",
+      "static_labels": [
+        "Today's Activity",
+        "Completions",
+        "Words",
+        "Characters",
+        "4",
+        "4",
+        "13",
+        "Completion Statistics",
+        "Time Range",
+        "Group By",
+        "Metric",
+        "Total",
+        "Daily Average (Active Days)",
+        "Estimated Time Saved",
+        "4",
+        "4",
+        "≈0 minutes"
+      ],
+      "editable_values_omitted": true
+    },
+    "personalization": {
+      "evidence_id": "ev_1358a899eae3799564359a9c7340f74168b227be6cd4079e3255a773e0333d1b",
+      "window_title": "Personalization",
+      "static_labels": [
+        "Typing History",
+        "Record your writing for personalization",
+        "Cotypist can record what you type in the fields where it suggests text, so its completions match your own words and phrases.\n\nAll recorded text is encrypted and stored locally on your Mac — nothing is sent to external servers unless you switch on the end-to-end encrypted iCloud sync between your Macs (in Cotypist Labs settings). In addition, you can switch off the recording for specific apps via the Cotypist menu bar icon. Learn more about how Cotypist protects your privacy.\n\nNevertheless, we do not recommend enabling this option if you work with particularly sensitive information or feel uncomfortable with the idea of nearly all your writing being recorded — even if only locally on your Mac.",
+        "Record text even when you accept no suggestion",
+        "Cotypist records the text in every field it monitors, even when you don’t accept any completions, which builds a fuller picture of your writing. When off, Cotypist records only text where you accepted at least one completion.",
+        "Personalize word choice",
+        "Off",
+        "Max",
+        "Uses your typing history to slightly favor the words and phrases you prefer. Subtle at lower values; too high may occasionally suggest a less fitting word.",
+        "Recorded texts",
+        "Delete the recorded texts of one app, or all of them, in App Settings.",
+        "Custom AI Instructions",
+        "Custom AI Instructions",
+        "Customize how Cotypist completes your text by providing instructions below. Focus on adding information highly relevant to your writing, such as your occupation and the types of writing tasks you frequently perform. There's no strict limit, but a few hundred words is a good upper bound — shorter instructions work just as well."
+      ],
+      "editable_values_omitted": true
+    },
+    "context": {
+      "evidence_id": "ev_53b02656011fbecce427abdf2e2b4c98ea7b592fecbc4e511db5655a9e7f1d1f",
+      "window_title": "Context",
+      "static_labels": [
+        "Screenshot Settings",
+        "Use screenshots for context",
+        "Cotypist reads your screen to understand the surrounding context and provide more relevant completions. Screen contents are processed locally on your Mac and are never stored or sent anywhere. Learn more about how Cotypist protects your privacy.",
+        "Use screenshots to improve suggestion appearance",
+        "Uses screenshots to improve how suggestions integrate with their surroundings. This may occasionally cause a purple Screen Recording notice to appear in the menu bar. Feel free to disable this if you are uncomfortable with that.",
+        "Clipboard Settings",
+        "Use clipboard for context",
+        "Cotypist reads your clipboard when it suggests completions, to understand what you're working with. Clipboard contents are processed locally on your Mac and are never stored or sent anywhere. Learn more about how Cotypist protects your privacy."
+      ],
+      "editable_values_omitted": true
+    },
+    "battery": {
+      "evidence_id": "ev_6fb202061a2c28b6d07892aa141606bcf8a0377e836fb7e1a13f5109446d64ae",
+      "window_title": "Battery",
+      "static_labels": [
+        "You’re currently plugged in. These settings take effect automatically when you switch to battery power.",
+        "On Battery Power",
+        "Only show completions on demand",
+        "On battery power, Cotypist doesn’t start showing completions on its own. Bring them up exactly where they’re most useful with the force-activate shortcut, which you can change in Shortcuts settings.",
+        "Use a smaller model",
+        "A lighter model draws less power and responds faster, at some cost to completion quality.",
+        "Generate slightly shorter completions",
+        "Shorter completions are quicker to generate, which reduces power draw."
+      ],
+      "editable_values_omitted": true
+    },
+    "emoji": {
+      "evidence_id": "ev_51c6a5191ac51afa7554c5326f9db06d8e8c522af684d60875e2825e59e82676",
+      "window_title": "Emoji",
+      "static_labels": [
+        "Enable emoji suggestions",
+        "Show emoji suggestions when typing \" :\". You can also type after it to filter suggestions (e.g. \":sweat_smile:\"). Note that Emoji search may not always yield the desired emoji, but you can always use the emoji picker built into macOS (⌃ + ⌘ + Space) as a fallback.",
+        "Suggest emoji from emoticons",
+        "Also suggest emoji when you type common text emoticons like \":-)\", \";-)\", \":(\" or \"<3\". When off, only the \" :\" picker and search remain.",
+        "Emoji Customization",
+        "Preferred skin tone",
+        "Applied to emoji that support skin tone modifiers.",
+        "Include neutral variant",
+        "Also suggests the neutral (default) skin tone variant alongside your preferred skin tone.",
+        "Preferred gender",
+        "Applies to people emoji that have separate male/female variants (e.g., firefighters, doctors, artists)."
+      ],
+      "editable_values_omitted": true
+    }
+  }
+}
