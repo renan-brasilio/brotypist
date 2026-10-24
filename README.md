@@ -94,6 +94,7 @@ Run in the logged-in user's X11/D-Bus session with accessibility enabled. Some Q
 - [REA Cotypist analysis, native settings observations, and limits](evidence/COTYPIST.md)
 - [Sanitized process-scoped native reference evidence](evidence/cotypist-menu-reference.json)
 - [Observed Inklow verification and platform limits](evidence/VERIFICATION.md)
+- [Passing 0.3 Windows/macOS/Ubuntu pipeline and native packages](https://github.com/renan-brasilio/inklow/actions/runs/40045550783)—source/frozen local inference and real settings event loops; not interactive Windows/Linux typing certification
 - [Real native preferences interaction receipt](evidence/menu-first-native-ui.json)
 - [Historical 0.2 latency/model samples](evidence/UPGRADE-0.2.md)—not a benchmark of 0.3
 
