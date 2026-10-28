@@ -80,6 +80,9 @@ class BridgeBase:
     uses the tiny ``_state_lock`` that is never held during platform calls.
     """
 
+    strict_visible_acceptance = False
+    requires_inline_presentation = False
+
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._state_lock = threading.Lock()

@@ -1,10 +1,12 @@
 #define _GNU_SOURCE
 #include "wayland_client.h"
+#include "wayland_ghost.h"
 #include "input-method-client-protocol.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <locale.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -17,11 +19,14 @@
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 #include <xkbcommon/xkbcommon-names.h>
+#include <xkbcommon/xkbcommon-compose.h>
 
 #define MAX_TEXT (1024u * 1024u)
 #define MAX_COMMIT 4079u
 #define MAX_IMAGE (64u * 1024u * 1024u)
 #define MAX_KEY 768u
+
+enum composition_state { COMPOSITION_UNKNOWN, COMPOSITION_IDLE, COMPOSITION_PENDING, COMPOSITION_EXPECTED };
 
 struct image_buffer {
     struct wl_buffer *buffer;
@@ -48,6 +53,13 @@ struct inklow_wl {
     struct xkb_context *xkb;
     struct xkb_keymap *keymap;
     struct xkb_state *keys;
+    struct xkb_compose_table *compose_table;
+    struct xkb_compose_state *compose;
+    struct inklow_ghost *ghost;
+    enum composition_state composition;
+    char composed[256];
+    size_t composed_length;
+    bool compose_fresh, compose_match, compose_blocked;
     struct image_buffer buffers[2];
     inklow_wl_callback callback;
     void *userdata;
@@ -56,6 +68,7 @@ struct inklow_wl {
     uint32_t generation, serial, modifiers;
     uint64_t context_id;
     uint32_t method_id, panel_id, compositor_id, shm_id, seat_id;
+    uint32_t compositor_pid;
     bool known, safe, surrounding, ready, failed, visible, pointer_inside, initial_state_pending;
     bool consumed[MAX_KEY];
     int32_t pointer_x, pointer_y;
@@ -88,6 +101,24 @@ static int emit(struct inklow_wl *w, struct inklow_wl_event *event)
     return w->callback ? w->callback(w->userdata, event) : 0;
 }
 
+static void ghost_event(void *data, int type, uint32_t state, uint64_t scene, uint64_t frame)
+{
+    struct inklow_wl *w = data;
+    struct inklow_wl_event event = {.type = type, .state = state, .serial = w->serial,
+        .scene = scene, .frame = frame};
+    emit(w, &event);
+}
+
+static void composition_reset(struct inklow_wl *w, bool fresh)
+{
+    if (w->compose) xkb_compose_state_reset(w->compose);
+    wipe(w->composed, sizeof(w->composed));
+    w->composed_length = 0;
+    w->compose_match = false;
+    w->composition = fresh && w->compose ? COMPOSITION_IDLE : COMPOSITION_UNKNOWN;
+    if (fresh) w->compose_blocked = false;
+}
+
 static void state_event(struct inklow_wl *w)
 {
     struct inklow_wl_event event = {
@@ -101,6 +132,7 @@ static void state_event(struct inklow_wl *w)
 void inklow_wl_hide(struct inklow_wl *w)
 {
     if (!w) return;
+    inklow_ghost_hide(w->ghost);
     if (w->surface && w->visible) {
         wl_surface_attach(w->surface, NULL, 0, 0);
         wl_surface_commit(w->surface);
@@ -140,6 +172,8 @@ static void drop_keyboard(struct inklow_wl *w)
     w->keys = NULL;
     w->keymap = NULL;
     w->modifiers = 128;
+    composition_reset(w, false);
+    w->compose_fresh = false;
     memset(w->consumed, 0, sizeof(w->consumed));
 }
 
@@ -263,20 +297,34 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
     w->keymap = map;
     w->keys = state;
     w->modifiers = canonical_modifiers(w);
+    if (!w->compose_fresh || !map || !state) w->compose_blocked = true;
+    composition_reset(w, w->compose_fresh && map && state);
+    invalidate(w, false);
+    state_event(w);
 }
 
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                            struct wl_surface *surface, struct wl_array *keys)
 {
-    (void)keyboard; (void)serial; (void)surface; (void)keys;
+    (void)keyboard; (void)serial; (void)surface;
     struct inklow_wl *w = data;
     memset(w->consumed, 0, sizeof(w->consumed));
+    if (keys && keys->size) {
+        w->compose_blocked = true;
+        composition_reset(w, false);
+        w->compose_fresh = false;
+        invalidate(w, false);
+        state_event(w);
+    }
 }
 
 static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface)
 {
     (void)keyboard; (void)serial; (void)surface;
     struct inklow_wl *w = data;
+    w->compose_blocked = true;
+    composition_reset(w, false);
+    w->compose_fresh = false;
     invalidate(w, true);
     memset(w->consumed, 0, sizeof(w->consumed));
     state_event(w);
@@ -289,6 +337,67 @@ static bool modifier_keysym(xkb_keysym_t sym)
            sym == XKB_KEY_Mode_switch || sym == XKB_KEY_Num_Lock;
 }
 
+static bool composition_starter(xkb_keysym_t sym)
+{
+    char name[64];
+    bool dead = sym >= 0xfe00 && sym < 0xff00 &&
+        xkb_keysym_get_name(sym, name, sizeof(name)) > 0 && !strncmp(name, "dead_", 5);
+    return dead || sym == XKB_KEY_Multi_key ||
+           (sym >= XKB_KEY_Kanji && sym <= XKB_KEY_PreviousCandidate);
+}
+
+static void composition_key(struct inklow_wl *w, xkb_keysym_t sym)
+{
+    if (modifier_keysym(sym)) return;
+    w->compose_fresh = false;
+    if (!w->compose || !w->keys || sym == XKB_KEY_NoSymbol ||
+        w->composition == COMPOSITION_UNKNOWN) {
+        if (composition_starter(sym) || sym == XKB_KEY_NoSymbol) w->compose_blocked = true;
+        composition_reset(w, false);
+        return;
+    }
+    if (w->composition == COMPOSITION_EXPECTED) {
+        /* A second host key before committed readback makes ordering unknown. */
+        composition_reset(w, false);
+        return;
+    }
+    bool baseline = w->composition == COMPOSITION_PENDING || (w->ready && w->surrounding);
+    xkb_compose_state_feed(w->compose, sym);
+    switch (xkb_compose_state_get_status(w->compose)) {
+    case XKB_COMPOSE_NOTHING:
+        /* A compose-start key unrecognized by this locale isn't idle proof. */
+        if (composition_starter(sym)) {
+            w->compose_blocked = true;
+            composition_reset(w, false);
+        }
+        break;
+    case XKB_COMPOSE_COMPOSING:
+        w->compose_blocked = true;
+        if (!baseline) composition_reset(w, false);
+        else w->composition = COMPOSITION_PENDING;
+        break;
+    case XKB_COMPOSE_COMPOSED: {
+        w->compose_blocked = true;
+        int length = xkb_compose_state_get_utf8(w->compose, w->composed, sizeof(w->composed));
+        if (!baseline || length <= 0 || (size_t)length >= sizeof(w->composed) ||
+            !utf8(w->composed, (size_t)length)) composition_reset(w, false);
+        else {
+            w->composed_length = (size_t)length;
+            w->compose_match = false;
+            w->composition = COMPOSITION_EXPECTED;
+        }
+        break;
+    }
+    case XKB_COMPOSE_CANCELLED:
+        w->compose_blocked = true;
+        /* Client cancellation policies differ. Unchanged surrounding text,
+         * Escape, or an arbitrary later edit cannot establish idle state. */
+        composition_reset(w, false);
+        break;
+    }
+    if (w->composition != COMPOSITION_IDLE) inklow_wl_hide(w);
+}
+
 static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                          uint32_t time, uint32_t key, uint32_t state)
 {
@@ -299,9 +408,11 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
     bool consume = key < MAX_KEY && w->consumed[key];
     xkb_keysym_t sym = w->keys && key < MAX_KEY
         ? xkb_state_key_get_one_sym(w->keys, key + 8) : XKB_KEY_NoSymbol;
+    xkb_keysym_t raw_sym = sym;
+    if (!consume && state == WL_KEYBOARD_KEY_STATE_PRESSED) composition_key(w, raw_sym);
     if (state == WL_KEYBOARD_KEY_STATE_RELEASED && key < MAX_KEY)
         w->consumed[key] = false;
-    if (w->ready && w->keys && key < MAX_KEY &&
+    if (w->ready && w->keys && key < MAX_KEY && !w->compose_blocked &&
         (state == WL_KEYBOARD_KEY_STATE_RELEASED || (!consume && state == WL_KEYBOARD_KEY_STATE_PRESSED))) {
         char name[128];
         const xkb_keysym_t *base = NULL;
@@ -325,11 +436,16 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
         }
     }
     if (!consume && w->context == context && !w->failed) {
-        zwp_input_method_context_v1_key(context, serial, time, key, state);
-        if (state != WL_KEYBOARD_KEY_STATE_RELEASED && !modifier_keysym(sym)) {
-            invalidate(w, true);
+        bool editing = state != WL_KEYBOARD_KEY_STATE_RELEASED && !modifier_keysym(raw_sym);
+        if (editing) {
+            /* Detach the public surface BEFORE forwarding the host key. Keep
+             * only the existing baseline while proving a composed splice. */
+            bool preserve = w->composition == COMPOSITION_PENDING || w->composition == COMPOSITION_EXPECTED;
+            invalidate(w, !preserve);
             state_event(w);
-        }
+        } else if (!modifier_keysym(raw_sym)) inklow_wl_hide(w);
+        if (w->context == context && !w->failed)
+            zwp_input_method_context_v1_key(context, serial, time, key, state);
     }
     inklow_wl_flush(w);
 }
@@ -369,28 +485,47 @@ static void context_surrounding(void *data, struct zwp_input_method_context_v1 *
 {
     struct inklow_wl *w = data;
     if (context != w->context) return;
-    invalidate(w, true);
-    if (w->known && w->safe && text) {
-        size_t length = strnlen(text, MAX_TEXT + 1);
-        if (length <= MAX_TEXT && cursor == anchor && boundary(text, length, cursor) && utf8(text, length)) {
-            if (length + 1 > w->text_capacity) {
-                size_t capacity = w->text_capacity ? w->text_capacity : 256;
-                while (capacity < length + 1 && capacity < MAX_TEXT + 1) {
-                    capacity = capacity > (MAX_TEXT + 1) / 2 ? MAX_TEXT + 1 : capacity * 2;
-                }
-                char *text_buffer = realloc(w->text, capacity);
-                if (text_buffer) {
-                    w->text = text_buffer;
-                    w->text_capacity = capacity;
-                }
-            }
-            if (length + 1 <= w->text_capacity) {
-                memcpy(w->text, text, length + 1);
-                w->length = length;
-                w->cursor = cursor;
-                w->surrounding = true;
-            }
+    size_t length = text ? strnlen(text, MAX_TEXT + 1) : MAX_TEXT + 1;
+    bool valid = w->known && w->safe && text && length <= MAX_TEXT && cursor == anchor &&
+                 boundary(text, length, cursor) && utf8(text, length);
+    bool pending = w->composition == COMPOSITION_PENDING;
+    bool expected = w->composition == COMPOSITION_EXPECTED;
+    bool unchanged = valid && w->surrounding && cursor == w->cursor && length == w->length &&
+                     !memcmp(w->text, text, length);
+    bool matched = false;
+    if (expected && valid && w->surrounding) {
+        if (w->compose_match) matched = unchanged;
+        else {
+            size_t inserted = w->composed_length;
+            matched = length == w->length + inserted && cursor == w->cursor + inserted &&
+                !memcmp(w->text, text, w->cursor) &&
+                !memcmp(w->composed, text + w->cursor, inserted) &&
+                !memcmp(w->text + w->cursor, text + cursor, w->length - w->cursor);
         }
+    }
+    if ((expected && !matched) || (pending && !unchanged)) {
+        composition_reset(w, false);
+        pending = expected = false;
+    }
+    /* Compare against the old buffer before erasing/reallocating it. An
+     * unchanged preedit refresh preserves the baseline, never rearms idle. */
+    invalidate(w, !pending);
+    if (pending) { state_event(w); return; }
+    if (valid) {
+        if (length + 1 > w->text_capacity) {
+            size_t capacity = w->text_capacity ? w->text_capacity : 256;
+            while (capacity < length + 1 && capacity < MAX_TEXT + 1)
+                capacity = capacity > (MAX_TEXT + 1) / 2 ? MAX_TEXT + 1 : capacity * 2;
+            char *text_buffer = realloc(w->text, capacity);
+            if (text_buffer) { w->text = text_buffer; w->text_capacity = capacity; }
+        }
+        if (length + 1 <= w->text_capacity) {
+            memcpy(w->text, text, length + 1);
+            w->length = length;
+            w->cursor = cursor;
+            w->surrounding = true;
+            if (expected && matched) w->compose_match = true;
+        } else if (expected) composition_reset(w, false);
     }
     state_event(w);
 }
@@ -399,6 +534,10 @@ static void context_reset(void *data, struct zwp_input_method_context_v1 *contex
 {
     struct inklow_wl *w = data;
     if (context != w->context) return;
+    /* Reset cannot prove an observed pending/uncertain composition ended.
+     * Conversely, a reset does not start composition in a proven idle context. */
+    bool idle = w->composition == COMPOSITION_IDLE && !w->compose_blocked;
+    composition_reset(w, idle);
     invalidate(w, true);
     state_event(w);
 }
@@ -415,6 +554,7 @@ static void context_content(void *data, struct zwp_input_method_context_v1 *cont
     else invalidate(w, false);
     w->known = true;
     w->safe = safe;
+    if (!safe) composition_reset(w, false);
     if (safe) ensure_keyboard(w);
     /* Keep an existing grab strictly pass-through while privacy-disabled.
      * Releasing it here drops in-flight keys or modifiers during the handoff.
@@ -438,6 +578,8 @@ static void context_commit(void *data, struct zwp_input_method_context_v1 *conte
     if (w->ready) invalidate(w, false);
     w->serial = serial;
     w->ready = w->known && w->safe && w->surrounding && !w->failed;
+    if (w->ready && w->composition == COMPOSITION_EXPECTED && w->compose_match)
+        composition_reset(w, true);
     if (w->ready) w->initial_state_pending = false;
     if (!w->ready) inklow_wl_hide(w);
     state_event(w);
@@ -471,6 +613,8 @@ static void method_activate(void *data, struct zwp_input_method_v1 *method, stru
     struct inklow_wl *w = data;
     release_context(w);
     w->context = context;
+    w->compose_fresh = true;
+    composition_reset(w, true);
     w->initial_state_pending = true;
     if (++w->context_id == 0) ++w->context_id;
     zwp_input_method_context_v1_add_listener(context, &context_listener, w);
@@ -606,13 +750,31 @@ struct inklow_wl *inklow_wl_connect(int owned_fd, inklow_wl_callback callback, v
     w->userdata = userdata;
     w->generation = 1;
     w->modifiers = 128;
-    /* connect_to_fd consumes fd, including allocation failure; never consult
-     * WAYLAND_DISPLAY and never fall back to a public display connection.
+    struct ucred peer;
+    socklen_t peer_length = sizeof(peer);
+    /* Peer identity is optional for private input forwarding, but mandatory
+     * for authenticating both independent ghost desktop-state transports. */
+    if (!getsockopt(owned_fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_length) &&
+        peer_length == sizeof(peer) && peer.pid > 0 && (uintmax_t)peer.pid <= INT32_MAX)
+        w->compositor_pid = (uint32_t)peer.pid;
+    /* The private connection consumes only the compositor-passed owned fd.
+     * The optional ghost helper separately connects to explicit public
+     * WAYLAND_DISPLAY; it can never replace this input-method transport.
      */
     w->display = wl_display_connect_to_fd(owned_fd);
     if (!w->display) { free(w); return NULL; }
     w->xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     if (!w->xkb) { inklow_wl_close(w); return NULL; }
+    const char *locale = getenv("LC_ALL");
+    if (!locale || !*locale) locale = getenv("LC_CTYPE");
+    if (!locale || !*locale) locale = getenv("LANG");
+    locale_t compose_locale = locale && *locale ? newlocale(LC_CTYPE_MASK, locale, (locale_t)0) : (locale_t)0;
+    if (compose_locale) {
+        w->compose_table = xkb_compose_table_new_from_locale(w->xkb, locale, XKB_COMPOSE_COMPILE_NO_FLAGS);
+        freelocale(compose_locale);
+    }
+    if (w->compose_table)
+        w->compose = xkb_compose_state_new(w->compose_table, XKB_COMPOSE_STATE_NO_FLAGS);
     w->registry = wl_display_get_registry(w->display);
     if (!w->registry) { inklow_wl_close(w); return NULL; }
     wl_registry_add_listener(w->registry, &registry_listener, w);
@@ -627,12 +789,18 @@ struct inklow_wl *inklow_wl_connect(int owned_fd, inklow_wl_callback callback, v
     if (!w->panel_surface) { inklow_wl_close(w); return NULL; }
     zwp_input_panel_surface_v1_set_overlay_panel(w->panel_surface);
     if (inklow_wl_flush(w) < 0) { inklow_wl_close(w); return NULL; }
+    w->ghost = inklow_ghost_connect(w->compositor_pid, ghost_event, w);
     return w;
 }
 
 int inklow_wl_fd(struct inklow_wl *w)
 {
     return w && w->display && !w->failed ? wl_display_get_fd(w->display) : -1;
+}
+
+uint32_t inklow_wl_compositor_pid(struct inklow_wl *w)
+{
+    return w && !w->failed ? w->compositor_pid : 0;
 }
 
 int inklow_wl_dispatch(struct inklow_wl *w)
@@ -661,7 +829,7 @@ int inklow_wl_dispatch(struct inklow_wl *w)
 
 int inklow_wl_state(struct inklow_wl *w, uint32_t *generation, uint32_t *serial)
 {
-    if (!w || !w->ready || !w->context || w->failed) return 0;
+    if (!w || !w->ready || !w->context || w->failed || w->compose_blocked) return 0;
     if (generation) *generation = w->generation;
     if (serial) *serial = w->serial;
     return 1;
@@ -671,6 +839,59 @@ uint64_t inklow_wl_context(struct inklow_wl *w)
 {
     return w && w->context && !w->failed ? w->context_id : 0;
 }
+
+int inklow_wl_composition_inactive(struct inklow_wl *w)
+{
+    return inklow_wl_state(w, NULL, NULL) && w->keys && w->compose &&
+           w->composition == COMPOSITION_IDLE &&
+           xkb_compose_state_get_status(w->compose) == XKB_COMPOSE_NOTHING;
+}
+
+int inklow_wl_ghost_fd(struct inklow_wl *w)
+{ return w && !w->failed ? inklow_ghost_fd(w->ghost) : -1; }
+
+int inklow_wl_ghost_dispatch(struct inklow_wl *w)
+{ return w && !w->failed ? inklow_ghost_dispatch(w->ghost) : -1; }
+
+int inklow_wl_ghost_flush(struct inklow_wl *w)
+{
+    /* Optional unavailable/failed public transport has no work to flush.
+     * Its fd/dispatch expose absence without breaking private forwarding. */
+    return !w || w->failed || inklow_ghost_fd(w->ghost) < 0 ? 1 : inklow_ghost_flush(w->ghost);
+}
+
+void inklow_wl_ghost_desktop_state(struct inklow_wl *w, int state)
+{
+    if (w && !w->failed) inklow_ghost_desktop_state(w->ghost, state);
+}
+
+int inklow_wl_ghost_window(struct inklow_wl *w, uint32_t pid, struct inklow_wl_ghost_window *window)
+{
+    return w && !w->failed ? inklow_ghost_window(w->ghost, pid, window) : 0;
+}
+
+int inklow_wl_ghost_prepare(struct inklow_wl *w, uint32_t pid, uint64_t scene,
+                           int x, int y, int width, int height)
+{
+    if (!inklow_wl_composition_inactive(w)) { if (w) inklow_ghost_hide(w->ghost); return 0; }
+    /* Never leave a manual input-panel accessory covering ordinary text. */
+    if (w->visible) inklow_wl_hide(w);
+    return inklow_ghost_prepare(w->ghost, pid, scene, x, y, width, height);
+}
+
+int inklow_wl_ghost_scale(struct inklow_wl *w)
+{ return w && !w->failed ? inklow_ghost_scale(w->ghost) : 0; }
+
+int inklow_wl_ghost_present(struct inklow_wl *w, uint64_t scene, uint64_t frame,
+                           const void *pixels, int width, int height, int stride)
+{
+    if (!inklow_wl_composition_inactive(w)) { if (w) inklow_ghost_hide(w->ghost); return 0; }
+    if (w->visible) inklow_wl_hide(w);
+    return inklow_ghost_present(w->ghost, scene, frame, pixels, width, height, stride);
+}
+
+void inklow_wl_ghost_hide(struct inklow_wl *w)
+{ if (w) inklow_ghost_hide(w->ghost); }
 
 int inklow_wl_matches(struct inklow_wl *w, uint32_t generation, uint32_t serial,
                       const char *text, size_t length, size_t cursor)
@@ -688,6 +909,7 @@ int inklow_wl_matches(struct inklow_wl *w, uint32_t generation, uint32_t serial,
 int inklow_wl_commit(struct inklow_wl *w, uint32_t generation, uint32_t serial, const char *text)
 {
     if (!inklow_wl_state(w, NULL, NULL) || generation != w->generation || serial != w->serial || !text) return 0;
+    if (w->composition == COMPOSITION_PENDING || w->composition == COMPOSITION_EXPECTED) return 0;
     size_t length = strnlen(text, MAX_COMMIT + 1);
     if (length > MAX_COMMIT || !utf8(text, length)) return 0;
     inklow_wl_hide(w);
@@ -752,6 +974,7 @@ static bool allocate_buffer(struct inklow_wl *w, struct image_buffer *b, int wid
 int inklow_wl_present(struct inklow_wl *w, const void *pixels, int width, int height, int stride, int scale)
 {
     if (!w) return 0;
+    inklow_ghost_hide(w->ghost);
     if (!inklow_wl_state(w, NULL, NULL) || !pixels || !w->surface || !w->panel_surface ||
         width <= 0 || height <= 0 || width > 16384 || height > 16384 ||
         stride < width * 4 || stride % 4 || scale <= 0 || scale > 16 || width % scale || height % scale ||
@@ -790,6 +1013,8 @@ void inklow_wl_close(struct inklow_wl *w)
     /* No user callbacks during destruction. */
     w->callback = NULL;
     release_context(w);
+    inklow_ghost_close(w->ghost);
+    w->ghost = NULL;
     if (w->pointer) {
         if (wl_pointer_get_version(w->pointer) >= WL_POINTER_RELEASE_SINCE_VERSION) wl_pointer_release(w->pointer);
         else wl_pointer_destroy(w->pointer);
@@ -806,6 +1031,8 @@ void inklow_wl_close(struct inklow_wl *w)
     if (w->shm) wl_shm_destroy(w->shm);
     if (w->compositor) wl_compositor_destroy(w->compositor);
     if (w->registry) wl_registry_destroy(w->registry);
+    if (w->compose) xkb_compose_state_unref(w->compose);
+    if (w->compose_table) xkb_compose_table_unref(w->compose_table);
     if (w->xkb) xkb_context_unref(w->xkb);
     if (w->display) { wl_display_flush(w->display); wl_display_disconnect(w->display); }
     free(w->text);

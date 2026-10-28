@@ -235,22 +235,26 @@ class SuggestionState:
             return True
 
     def accept(self, current: Snapshot, full: bool = False, trailing_space: bool = True,
-               trailing_punctuation: bool = True, visible: str | None = None) -> str:
-        """Accept from the shown suggestion; ``visible`` bounds it to drawn text.
+               trailing_punctuation: bool = True, visible: str | None = None, *,
+               exact_visible: bool = False) -> str:
+        """Accept drawn text, optionally forbidding even an unseen separator.
 
-        Only whitespace may extend past ``visible``: hidden words never insert.
+        Without ``exact_visible``, whitespace may extend past ``visible``;
+        hidden words never insert.
         """
         with self._lock:
             if (self.snapshot is None or current.key != self.snapshot.key
                     or not current.eligible(1)):
                 self.invalidate()
                 return ""
+            if exact_visible and visible is None:
+                return ""
             if visible is not None and (not visible or not self.text.startswith(visible)):
                 return ""
             limit = len(self.text) if visible is None else len(visible)
             if full:
                 end = _accept_end(self.text, limit, trailing_space, trailing_punctuation)
-                if limit < len(self.text) and trailing_space:
+                if limit < len(self.text) and trailing_space and not exact_visible:
                     while end < len(self.text) and self.text[end].isspace() and self.text[end] not in "\r\n":
                         end += 1
                 accepted, remainder = self.text[:end], self.text[end:]
@@ -258,12 +262,15 @@ class SuggestionState:
                 accepted, remainder = take_word(self.text, trailing_space, trailing_punctuation)
                 if accepted[limit:].strip():
                     return ""
+                if exact_visible and len(accepted) > limit:
+                    accepted, remainder = self.text[:limit], self.text[limit:]
             if not trailing_space and not remainder.strip():
                 remainder = ""
             if not accepted:
                 return ""
-            if (trailing_space and not full and not remainder and not current.suffix
-                    and not accepted[-1].isspace() and any(char.isalnum() for char in accepted)):
+            if (trailing_space and not exact_visible and not full and not remainder
+                    and not current.suffix and not accepted[-1].isspace()
+                    and any(char.isalnum() for char in accepted)):
                 accepted += " "
             self.generation += 1
             self.text = remainder

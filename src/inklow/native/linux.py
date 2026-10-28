@@ -11,6 +11,8 @@ from .base import BridgeBase, Shortcut
 
 
 class LinuxBridge(BridgeBase):
+    requires_inline_presentation = True
+
     def __init__(self, *, accessibility_only: bool = False) -> None:
         super().__init__()
         self._thread: threading.Thread | None = None
@@ -225,14 +227,19 @@ class LinuxBridge(BridgeBase):
             element = getattr(element, "parent", None)
         return None
 
-    def _inline_metrics(self, element, interface, text, caret, rect, attrs):
-        # AT-SPI has no universal IME-state property. Only providers explicitly
-        # advertising an inactive composition can provide a safe overlay.
+    def _inline_metrics(self, element, interface, text, caret, rect, attrs, *,
+                        coordinates=None, origin=(0, 0), composition_inactive=False):
+        # X11 keeps its explicit-provider proof. The exclusive Wayland input
+        # method may supply positive native evidence, never override active attrs.
+        composition = [value.casefold() for key, value in attrs.items()
+                       if key.casefold() in ("preedit", "composing", "composition-active")]
         if (not rect or not caret or text[caret - 1] in "\r\n"
                 or (text[caret:] and not text[caret:].startswith(("\r", "\n")))
-                or not any(attrs.get(key, "").casefold() in ("false", "0", "no")
-                           for key in ("preedit", "composing", "composition-active"))):
+                or any(value not in ("false", "0", "no", "") for value in composition)
+                or not (composition_inactive or any(value in ("false", "0", "no") for value in composition))):
             return None
+        coordinates = self.atspi.DESKTOP_COORDS if coordinates is None else coordinates
+        ox, oy = origin
         try:
             values, start, end = interface.getAttributeRun(caret - 1, True)
             run = dict(values) if isinstance(values, dict) else dict(item.split(":", 1) for item in values if ":" in item)
@@ -258,9 +265,10 @@ class LinuxBridge(BridgeBase):
                 return None
             metrics = context.get_metrics(description, Pango.Language.get_default())
             ascent, descent = metrics.get_ascent() / Pango.SCALE, metrics.get_descent() / Pango.SCALE
-            glyph = interface.getCharacterExtents(caret - 1, self.atspi.DESKTOP_COORDS)
-            bounds = element.queryComponent().getExtents(self.atspi.DESKTOP_COORDS)
-            clip = tuple(float(getattr(bounds, key)) for key in ("x", "y", "width", "height"))
+            raw_glyph = interface.getCharacterExtents(caret - 1, coordinates)
+            glyph = (raw_glyph[0] + ox, raw_glyph[1] + oy, raw_glyph[2], raw_glyph[3])
+            bounds = element.queryComponent().getExtents(coordinates)
+            clip = (float(bounds.x + ox), float(bounds.y + oy), float(bounds.width), float(bounds.height))
             parent = element
             for _ in range(16):
                 if parent is None:
@@ -269,11 +277,11 @@ class LinuxBridge(BridgeBase):
                 if (not state.contains(self.atspi.STATE_VISIBLE)
                         or not state.contains(self.atspi.STATE_SHOWING)):
                     return None
-                bounds = parent.queryComponent().getExtents(self.atspi.DESKTOP_COORDS)
+                bounds = parent.queryComponent().getExtents(coordinates)
                 if bounds.width > 0 and bounds.height > 0:
-                    left, top = max(clip[0], bounds.x), max(clip[1], bounds.y)
-                    right = min(clip[0] + clip[2], bounds.x + bounds.width)
-                    bottom = min(clip[1] + clip[3], bounds.y + bounds.height)
+                    left, top = max(clip[0], bounds.x + ox), max(clip[1], bounds.y + oy)
+                    right = min(clip[0] + clip[2], bounds.x + ox + bounds.width)
+                    bottom = min(clip[1] + clip[3], bounds.y + oy + bounds.height)
                     if right <= left or bottom <= top:
                         return None
                     clip = (float(left), float(top), float(right - left), float(bottom - top))

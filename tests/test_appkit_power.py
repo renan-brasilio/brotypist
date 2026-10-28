@@ -3,7 +3,8 @@ import pytest
 from types import SimpleNamespace
 
 A = pytest.importorskip("AppKit")
-from inklow.appkit_power import NativePowerUI, PowerHelpPanel, charging_help_text
+from inklow.appkit_power import NativePowerUI, PowerHelpPanel
+from inklow.power import charging_help_text
 
 
 def reading(*, available=True, has_battery=True, on_battery=False, charging=False, percent=65):

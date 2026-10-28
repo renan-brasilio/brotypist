@@ -34,6 +34,13 @@ class UIController:
         self.saved = []
         self.bridge = BridgeBase()
         self.ticks = 0
+        self.presentations = []
+
+    def presentation_result(self, key, text, mode="completion"):
+        self.presentations.append((key, text, mode))
+
+    def set_model(self, path, prompt_style):
+        self.update_config(replace(self.config, backend="gguf", model_path=path, prompt_style=prompt_style))
 
     def set_wake_callback(self, callback):
         self.wake_callback = callback
@@ -108,6 +115,9 @@ def shell(monkeypatch, tmp_path, request):
     monkeypatch.setenv("INKLOW_HOME", str(tmp_path))
     monkeypatch.setattr(qt_ui, "Controller", UIController)
     monkeypatch.setattr(qt_ui.system, "launch_at_login_state", lambda: False)
+    # Native session/power subprocesses are exercised by the sampler's own
+    # regressions and the Linux integration run, not this isolated UI boundary.
+    monkeypatch.setattr(qt_ui.PowerSampler, "start", lambda self: None)
     tray_available = getattr(request, "param", False)
     monkeypatch.setattr(qt_ui.QSystemTrayIcon, "isSystemTrayAvailable", lambda: tray_available)
     shell = qt_ui.MenuAgent(app, Config(global_enabled=False, check_updates_automatically=False),
@@ -183,7 +193,7 @@ def test_save_merges_draft_with_latest_controller_config(shell):
 
 
 def test_failed_validation_keeps_draft_and_reports_recovery(shell, monkeypatch):
-    shell.show_settings("Languages")
+    shell.show_settings("Personalization")
     settings = shell.settings
     settings.instructions.setPlainText("x" * 8001)
     errors = []
@@ -210,7 +220,7 @@ def test_login_failure_does_not_persist_or_install_at_startup(shell, monkeypatch
 
 
 def test_history_opt_in_failure_stays_disabled(shell, monkeypatch):
-    shell.show_settings("Privacy")
+    shell.show_settings("Personalization")
     monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
     def unavailable(enabled):
         raise RuntimeError("Unlock OS secret storage; plaintext fallback is not allowed.")
@@ -268,7 +278,7 @@ def test_unverified_completion_has_no_popup_and_clear_removes_privacy_accessory(
 def test_linux_disables_only_unsafe_rewrites_not_alternatives(shell):
     if not sys.platform.startswith("linux"):
         pytest.skip("Linux AT-SPI atomic-replacement capability boundary")
-    shell.show_settings("Autocomplete")
+    shell.show_settings("Labs")
     controls = shell.settings._bindings
     assert not controls["emoji_enabled"][0].isEnabled()
     assert not controls["synonyms_enabled"][0].isEnabled()
@@ -284,7 +294,7 @@ def test_recording_existing_global_chord_cannot_toggle_typing(shell, finish):
     bridge = BridgeBase()
     shell.controller = Controller(config, bridge)
     shell.controller.start()
-    shell.show_settings("Autocomplete")
+    shell.show_settings("Shortcuts")
     recorder = shell.settings.shortcut_controls["toggle"]
     recorder._begin()
     action = bridge._key_action("F8", ("Ctrl", "Alt"))
@@ -406,13 +416,20 @@ def test_clear_does_not_destroy_open_accessory_menu_and_dismissal_applies_hide(s
 
 
 @pytest.mark.parametrize("changed_app", ["fixture.writer", "another.writer"])
-def test_field_app_toggle_retains_original_app_after_menu_closes(shell, changed_app):
+@pytest.mark.parametrize("surface", ["tray", "accessory"])
+def test_app_toggle_retains_original_app_after_menu_closes(shell, changed_app, surface):
     status = {**shell.controller.status(), "current_app": "fixture.writer",
               "current_domain": "writing.example", "current_app_enabled": True}
     shell.controller.status = lambda: status
-    shell.accessory.button.click()
-    menu = shell.accessory.menu
-    action = next(action for action in menu.actions() if action.objectName() == "field_app_toggle")
+    if surface == "accessory":
+        shell.accessory.button.click()
+        menu = shell.accessory.menu
+        name = "field_app_toggle"
+    else:
+        menu = shell.menu
+        menu.popup(QPoint(40, 40))
+        name = "app_toggle"
+    action = next(action for action in menu.actions() if action.objectName() == name)
     menu.setActiveAction(action)
     ticks = shell.controller.ticks
     status["current_app"] = changed_app
@@ -428,6 +445,52 @@ def test_field_app_toggle_retains_original_app_after_menu_closes(shell, changed_
 
 
 
+def test_tray_pause_and_resume_preserve_preferences_and_follow_timer_state(shell):
+    shell.controller.config = replace(shell.controller.config, global_enabled=True)
+    status = {**shell.controller.status(), "paused_until": 0}
+    shell.controller.status = lambda: status
+    shell.refresh_menu()
+    actions = {action.objectName(): action for action in shell.menu.actions()}
+    pause = actions["pause"].menu()
+    choices = {action.objectName(): action for action in pause.actions()}
+    assert not choices["resume"].isVisible()
+    choices["pause_hour"].trigger()
+    assert shell.controller.actions == [("pause", 60)]
+    status["paused_until"] = time.monotonic() + 3600
+    shell.refresh_menu()
+    assert choices["resume"].isVisible() and choices["resume"].isEnabled()
+    assert actions["enabled"].isChecked()
+    choices["resume"].trigger()
+    assert shell.controller.actions == [("pause", 60), ("pause", 0)]
+    assert shell.controller.config.global_enabled
+    assert shell.controller.saved == []
+    status["paused_until"] = time.monotonic() - 1
+    shell.refresh_menu()
+    assert not choices["resume"].isVisible()
+
+
+def test_tray_global_toggle_and_current_app_checkmarks_are_independent(shell):
+    status = {**shell.controller.status(), "current_app_enabled": False}
+    shell.controller.status = lambda: status
+    shell.refresh_menu()
+    actions = {action.objectName(): action for action in shell.menu.actions()}
+    assert not actions["enabled"].isChecked()
+    assert not actions["app_toggle"].isChecked()
+    actions["enabled"].trigger()
+    assert shell.controller.config.global_enabled
+    assert not actions["app_toggle"].isChecked()
+    status["current_app_enabled"] = True
+    shell.refresh_menu()
+    assert actions["app_toggle"].isChecked()
+    actions["enabled"].trigger()
+    assert not shell.controller.config.global_enabled
+    assert actions["app_toggle"].isChecked()
+    status["current_app"] = ""
+    shell.refresh_menu()
+    assert not actions["app_toggle"].isEnabled()
+    assert not actions["app_toggle"].isChecked()
+
+
 def test_field_pause_and_resume_do_not_change_global_or_app_preferences(shell):
     shell.controller.config = replace(shell.controller.config, global_enabled=True)
     status = {**shell.controller.status(), "paused_until": 0}
@@ -440,7 +503,6 @@ def test_field_pause_and_resume_do_not_change_global_or_app_preferences(shell):
     status["paused_until"] = time.monotonic() + 3600
     menu = shell.create_field_menu()
     resume = next(action for action in menu.actions() if action.objectName() == "field_pause")
-    assert resume.text() == "Resume predictions"
     resume.trigger()
     assert shell.controller.actions == [("pause", 60), ("pause", 0)]
     assert shell.controller.config.global_enabled
@@ -448,14 +510,12 @@ def test_field_pause_and_resume_do_not_change_global_or_app_preferences(shell):
     menu.deleteLater()
 
 
-def test_unsupported_field_is_not_labeled_active_or_globally_disabled(shell):
+def test_unsupported_field_preserves_global_and_app_preferences(shell):
     shell.controller.config = replace(shell.controller.config, global_enabled=True)
     shell.controller.status = lambda: {"enabled": True, "state": "idle",
                                        "inline_available": False, "inline_message": "Unsupported text control",
                                        "current_app": "fixture.writer", "current_app_enabled": True}
     shell.refresh_menu()
-    status = next(action for action in shell.menu.actions() if action.objectName() == "status")
-    assert "Active" not in status.text()
     assert shell.controller.config.global_enabled
     menu = shell.create_field_menu()
     toggle = next(action for action in menu.actions() if action.objectName() == "field_app_toggle")
@@ -463,7 +523,7 @@ def test_unsupported_field_is_not_labeled_active_or_globally_disabled(shell):
     menu.deleteLater()
 
 
-def test_native_field_menu_uses_same_compact_actions_and_deferred_target(shell, monkeypatch):
+def test_native_field_menu_defers_target_until_tracking_ends(shell, monkeypatch):
     shell.controller.start()
     status = {**shell.controller.status(), "current_app": "fixture.writer",
               "current_domain": "writing.example", "current_app_enabled": True}
@@ -473,15 +533,13 @@ def test_native_field_menu_uses_same_compact_actions_and_deferred_target(shell, 
                         lambda items: rows.extend(items) or True, raising=False)
     monkeypatch.setattr(shell.controller.bridge, "hide_native", lambda: None, raising=False)
     shell._native_action("menu")
-    assert len(rows) == 3
-    assert rows[0][1] == "✓ Predictions in fixture.writer: Enabled"
-    assert rows[1][1] == "Pause for 1 hour"
-    assert rows[2][1] == "Settings…"
     assert shell._menu_session
     assert not shell.controller.bridge._enabled
     ticks = shell.controller.ticks
     status["current_app"] = "another.writer"
-    shell._native_action(rows[0][0])
+    toggle_id = next(key for key, _title, _enabled in rows
+                     if shell._native_actions[key].objectName() == "field_app_toggle")
+    shell._native_action(toggle_id)
     assert shell.controller.actions == []
     assert shell.controller.ticks == ticks
     assert not shell.controller.bridge._enabled
@@ -694,3 +752,177 @@ def test_disappearing_tray_host_cannot_strand_a_stale_exported_menu(shell, monke
     assert shell.settings.isVisible()
     assert shell.menu not in shell._tracking_menus
     run_until_quit(shell, shell.settings.quit_button.click)
+
+
+def test_dedicated_destinations_keep_instruction_draft_selection_on_resize_and_status(shell):
+    from PySide6.QtGui import QTextCursor
+    shell.show_settings("Personalization")
+    settings = shell.settings
+    editor = settings.instructions
+    editor.setPlainText("\n".join(f"Draft line {i}" for i in range(40)))
+    cursor = editor.textCursor()
+    cursor.setPosition(12)
+    cursor.setPosition(28, QTextCursor.MoveMode.KeepAnchor)
+    editor.setTextCursor(cursor)
+    selected = cursor.selectedText()
+    draft = editor.toPlainText()
+    shell.app.processEvents()
+    editor.verticalScrollBar().setValue(12)
+    scroll = editor.verticalScrollBar().value()
+    for pane in qt_ui.PANES:
+        settings.show_pane(pane)
+        assert settings.sidebar.currentItem().text() == pane
+    settings.show_pane("appSettings")
+    assert settings.sidebar.currentItem().text() == "App Settings"
+    settings.resize(660, 460)
+    settings.refresh_status()
+    settings.show_pane("Personalization")
+    assert settings.instructions is editor
+    assert editor.toPlainText() == draft
+    assert editor.textCursor().selectedText() == selected
+    assert editor.verticalScrollBar().value() == scroll
+    assert settings._changes()["custom_instructions"] == draft
+    assert not shell.controller.saved
+
+
+def test_models_are_embedded_and_onboarding_does_not_open_settings_or_choose_a_model(shell, monkeypatch, tmp_path):
+    model = {"id": "fixture", "label": "Installed fixture", "size_bytes": 4,
+             "installed": True, "description": "UI-only model fixture", "path": str(tmp_path / "fixture.gguf"),
+             "prompt_style": "continuation"}
+    monkeypatch.setattr(shell.controller, "models", lambda: [model])
+    shell.show_welcome()
+    shell.welcome._models()
+    assert shell.settings is None
+    manager = shell.welcome.model_manager
+    assert not manager.isWindow()
+    assert manager.isVisible() and manager.use.isEnabled()
+    assert not shell.controller.saved
+    assert shell.controller.config.model_path == ""
+    manager.use.click()
+    assert shell.controller.config.model_path == model["path"]
+    shell.show_settings("AI Models")
+    assert not shell.settings.model_manager.isWindow()
+    assert shell.settings.model_manager.isVisible()
+    assert shell.settings._changes() == {}
+
+
+def test_single_update_action_preserves_cancel_intent_across_mouse_release(shell, monkeypatch):
+    shell.show_settings("About")
+    settings = shell.settings
+    state = {"state": "downloading", "install_kind": "linux_portable", "installable": True}
+    monkeypatch.setattr(shell.updates, "snapshot", lambda: dict(state))
+    installed = []
+    monkeypatch.setattr(shell, "install_update", lambda: installed.append(True))
+    settings.refresh_updates()
+    button = settings.update_primary
+    assert button.text() == "Cancel"
+    QTest.mousePress(button, Qt.MouseButton.LeftButton)
+    state["state"] = "ready"
+    settings.refresh_updates()
+    QTest.mouseRelease(button, Qt.MouseButton.LeftButton)
+    assert not installed
+    button.click()
+    assert installed == [True]
+
+
+def test_cached_battery_reader_is_conservative_and_settings_keep_power_details(shell):
+    assert shell.controller.battery_reader()
+    shell._power_changed({"available": False, "on_battery": False})
+    assert shell.controller.battery_reader()
+    shell._power_changed({"available": True, "has_battery": True, "on_battery": False,
+                          "percent": 83, "charging": True, "session_unlocked": False})
+    assert not shell.controller.battery_reader()
+    shell.show_settings("Battery")
+    assert shell.power_ui.cards["pane"].isVisible()
+    assert not shell.power_ui.help_showing
+
+
+def test_pending_power_shutdown_attempts_other_owners_and_retries_before_exit(shell, monkeypatch):
+    shell.show_settings("General")
+    closed = []
+    attempts = []
+    def close_sampler():
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise qt_ui.ShutdownPending("Power sample still unwinding")
+    monkeypatch.setattr(shell.power_sampler, "close", close_sampler)
+    monkeypatch.setattr(shell.power_ui, "close", lambda: closed.append("power_ui"))
+    monkeypatch.setattr(shell.updates, "close", lambda: closed.append("updates"))
+    assert not shell.quit()
+    assert shell._shutdown_pending and not shell._stopped
+    assert shell.controller.stopped
+    assert "power_ui" in closed and "updates" in closed
+    run_until_quit(shell, lambda: None)
+    assert len(attempts) == 2
+
+
+def test_overlay_acknowledges_only_painted_prefix_and_clearing_disarms_it(shell):
+    from dataclasses import asdict
+    from inklow.core import InlineRender
+    from PySide6.QtGui import QFontInfo, QFontMetricsF
+    font = QApplication.font()
+    metrics, info = QFontMetricsF(font), QFontInfo(font)
+    ratio = shell.app.primaryScreen().devicePixelRatio()
+    text = " café tomorrow"
+    x, baseline = 100 * ratio, 120 * ratio
+    available = metrics.horizontalAdvance(" café ") * ratio
+    render = InlineRender(info.family(), font.pointSizeF(), baseline,
+                          (0, 0, x + available, 500 * ratio),
+                          metrics.ascent() * ratio, metrics.descent() * ratio, source="verified-host-run")
+    event = {"key": ("fixture", 1), "text": text, "mode": "completion",
+             "rect": [x, baseline - metrics.ascent() * ratio, ratio, metrics.height() * ratio],
+             "render": asdict(render), "inline": True}
+    shell._suggestion(event)
+    assert not any(shown for _key, shown, _mode in shell.controller.presentations)
+    shell.app.processEvents()
+    shell.app.processEvents()
+    shown = [value for key, value, mode in shell.controller.presentations if value]
+    assert shown and text.startswith(shown[-1]) and len(shown[-1]) < len(text)
+    assert metrics.horizontalAdvance(shown[-1]) * ratio <= available
+    shell.clear_overlay()
+    assert shell.controller.presentations[-1] == (event["key"], "", "completion")
+
+
+def test_overlay_hidden_before_first_paint_cannot_acknowledge_visibility(shell):
+    overlay = shell.overlay
+    overlay.present({"key": ("choices", 1), "mode": "alternatives", "choices": ["one", "two"]},
+                    QPoint(100, 100))
+    shell.clear_overlay()
+    shell.app.processEvents()
+    assert not any(text for _key, text, _mode in shell.controller.presentations)
+
+
+def test_native_completion_routes_only_positive_renderer_without_popup_or_manual_cover(shell, monkeypatch):
+    event = {"key": ("fixture", 4), "text": " tomorrow", "native_anchor": "1:2",
+             "mode": "completion", "inline": True, "render": {"source": "verified-host"}}
+    queued = []
+    shell._native_surface = True
+    monkeypatch.setattr(shell.controller.bridge, "hide_native", lambda: None, raising=False)
+    monkeypatch.setattr(shell.controller.bridge, "present_inline_native",
+                        lambda payload: queued.append(payload) or True, raising=False)
+    monkeypatch.setattr(shell.controller.bridge, "present_native",
+                        lambda *args, **kwargs: pytest.fail("Manual panel covered the ghost"), raising=False)
+    monkeypatch.setattr(shell.overlay, "present",
+                        lambda *args: pytest.fail("Ordinary popup fallback"))
+    monkeypatch.setattr(shell.overlay, "present_inline",
+                        lambda *args, **kwargs: pytest.fail("Qt popup used as native compositor proof"))
+    shell._suggestion(event)
+    shell._caret({"native_anchor": "1:2"})
+    assert queued == [event]
+    assert not shell.accessory.isVisible() and not shell.overlay.isVisible()
+    assert not any(text for _key, text, _mode in shell.controller.presentations)
+    shell._native_action("presentation", {"key": event["key"], "text": " tom", "mode": "completion"})
+    assert shell.controller.presentations[-1] == (event["key"], " tom", "completion")
+    shell._native_action("presentation", {"key": event["key"], "text": "", "mode": "completion"})
+    assert shell.controller.presentations[-1] == (event["key"], "", "completion")
+
+
+def test_refused_native_renderer_never_arms_ordinary_completion(shell, monkeypatch):
+    shell._native_surface = True
+    monkeypatch.setattr(shell.controller.bridge, "hide_native", lambda: None, raising=False)
+    monkeypatch.setattr(shell.controller.bridge, "present_inline_native", lambda event: False, raising=False)
+    offered = {"key": ("fixture", 5), "text": " tomorrow", "native_anchor": "1:2",
+               "mode": "completion", "inline": True, "render": None}
+    shell._suggestion(offered)
+    assert shell._last_overlay is None
+    assert shell.controller.presentations[-1] == (offered["key"], "", "completion")

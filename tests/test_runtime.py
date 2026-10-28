@@ -2443,3 +2443,59 @@ def test_resident_model_reprepares_after_pause_expires_and_explicit_reenable(run
     controller.tick()
     assert len(client.preparations) == 3
     assert not client.requests and not bridge.insertions
+
+
+def test_non_deferred_inline_requires_real_presentation_before_acceptance(runtime):
+    controller, bridge, _ = runtime
+    bridge.requires_inline_presentation = True
+    offer(controller, bridge, " arrive")
+    original = bridge.snapshot
+
+    assert not controller.invoke("word")
+    assert bridge.snapshot == original
+    assert bridge.insertions == []
+
+    draw(controller)
+    assert controller.invoke("word")
+    assert bridge.snapshot.text == original.text + " arrive "
+    assert bridge.insertions == [" arrive "]
+
+
+@pytest.mark.parametrize("action", ["word", "all"])
+def test_strict_native_inline_accepts_only_the_painted_prefix_without_hidden_space(runtime, action):
+    controller, bridge, _ = runtime
+    bridge.strict_visible_acceptance = True
+    offer(controller, bridge, " arrive tomorrow")
+    original = bridge.snapshot
+
+    assert not controller.invoke(action)
+    draw(controller, " arrive")
+    assert controller.invoke(action)
+
+    assert bridge.snapshot.text == original.text + " arrive"
+    assert bridge.insertions == [" arrive"]
+    assert controller._suggestion.text == " tomorrow"
+
+
+def test_claimed_inline_acceptance_cannot_outlive_native_frame_revocation(fast_runtime):
+    controller, bridge, _ = fast_runtime
+    bridge.strict_visible_acceptance = True
+    frame = {"visible": True}
+
+    def insert_inline(snapshot, text):
+        return frame["visible"] and bridge.insert(snapshot, text)
+
+    bridge.insert_inline = insert_inline
+    offer(controller, bridge, " arrive tomorrow")
+    draw(controller, " arrive")
+    original = bridge.snapshot
+    assert controller.fast_invoke("word")
+
+    frame["visible"] = False
+    controller.presentation_result(original.key, "", "completion")
+    controller.tick()
+    controller.tick()
+
+    assert bridge.snapshot == original
+    assert bridge.insertions == []
+    assert bridge.replayed == ["word"]

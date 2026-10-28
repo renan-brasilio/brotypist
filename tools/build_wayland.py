@@ -1,9 +1,10 @@
-"""Build the KDE Wayland input-method library from installed system protocols.
+"""Build the KDE Wayland input method and inactive public-display renderer.
 
 Usage: python tools/build_wayland.py
 Requires a C compiler, pkg-config, wayland-scanner, wayland-protocols,
-libwayland-client and libxkbcommon development files. Never downloads or installs
-packages. Generated protocol files live only in a temporary build directory.
+libwayland-client and libxkbcommon development files. Uses installed standard
+protocol XML plus notice-preserving vendored KDE/wlr metadata; never downloads
+or installs packages. Generated files live only in a temporary build directory.
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = ROOT / "src" / "inklow" / "native" / "libinklow_wayland.so"
+NATIVE = ROOT / "src" / "inklow" / "native"
 
 
 def run(command: list[str]) -> str:
@@ -47,10 +49,34 @@ def build(output: Path = DEFAULT_OUTPUT) -> Path:
     if missing:
         raise RuntimeError("Missing pkg-config development metadata: " + ", ".join(missing)
                            + ". Install the corresponding system development packages.")
-    protocol_root = Path(run([pkg_config, "--variable=pkgdatadir", "wayland-protocols"]))
-    protocol = protocol_root / "unstable" / "input-method" / "input-method-unstable-v1.xml"
-    if not protocol.is_file():
-        raise RuntimeError(f"Installed wayland-protocols is missing its input-method-v1 XML: {protocol}")
+    protocol_root_text = run([pkg_config, "--variable=pkgdatadir", "wayland-protocols"])
+    if not protocol_root_text:
+        # Some baseline distro .pc files provide datadir rather than pkgdatadir.
+        datadir = run([pkg_config, "--variable=datadir", "wayland-protocols"])
+        if not datadir:
+            raise RuntimeError("wayland-protocols pkg-config metadata has no data directory.")
+        protocol_root_text = str(Path(datadir) / "wayland-protocols")
+    protocol_root = Path(protocol_root_text)
+    candidates = {
+        "input-method": [protocol_root / "unstable/input-method/input-method-unstable-v1.xml"],
+        "xdg-shell": [protocol_root / "stable/xdg-shell/xdg-shell.xml"],
+        "xdg-output": [protocol_root / "unstable/xdg-output/xdg-output-unstable-v1.xml"],
+        # Fractional scale moved from staging to stable after Ubuntu 24.04's
+        # baseline. Do not assume the build host has the newer layout.
+        "fractional-scale": [protocol_root / "stable/fractional-scale/fractional-scale-v1.xml",
+                             protocol_root / "staging/fractional-scale/fractional-scale-v1.xml"],
+        "viewporter": [protocol_root / "stable/viewporter/viewporter.xml"],
+        "presentation-time": [protocol_root / "stable/presentation-time/presentation-time.xml"],
+        "wlr-layer-shell": [NATIVE / "protocols/wlr-layer-shell-unstable-v1.xml"],
+        "plasma-window-management": [NATIVE / "protocols/plasma-window-management.xml"],
+    }
+    protocols: dict[str, Path] = {}
+    for name, paths in candidates.items():
+        match = next((path for path in paths if path.is_file()), None)
+        if match is None:
+            raise RuntimeError(f"Missing {name} protocol XML; searched: "
+                               + ", ".join(str(path) for path in paths))
+        protocols[name] = match
     flags = shlex.split(run([pkg_config, "--cflags", "--libs", "wayland-client", "xkbcommon"]))
     output = Path(output).absolute()
     if output.is_symlink():
@@ -58,18 +84,21 @@ def build(output: Path = DEFAULT_OUTPUT) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".inklow-wayland-", dir=output.parent) as temporary:
         directory = Path(temporary)
-        header = directory / "input-method-client-protocol.h"
-        source = directory / "input-method-protocol.c"
+        sources: list[str] = []
         library = directory / output.name
-        run([scanner, "client-header", str(protocol), str(header)])
-        run([scanner, "private-code", str(protocol), str(source)])
+        for name, protocol in protocols.items():
+            header = directory / f"{name}-client-protocol.h"
+            source = directory / f"{name}-protocol.c"
+            run([scanner, "client-header", str(protocol), str(header)])
+            run([scanner, "private-code", str(protocol), str(source)])
+            sources.append(str(source))
         command = [
             *compiler, "-std=c11", "-O2", "-fPIC", "-fvisibility=hidden",
             "-Wall", "-Wextra", "-Werror", "-Wl,-z,relro,-z,now", "-Wl,--no-undefined",
             *shlex.split(os.environ.get("CPPFLAGS", "")),
             *shlex.split(os.environ.get("CFLAGS", "")),
             "-shared", "-I", str(directory),
-            str(ROOT / "src" / "inklow" / "native" / "wayland_client.c"), str(source),
+            str(NATIVE / "wayland_client.c"), str(NATIVE / "wayland_ghost.c"), *sources,
             "-o", str(library), *flags,
             *shlex.split(os.environ.get("LDFLAGS", "")),
         ]

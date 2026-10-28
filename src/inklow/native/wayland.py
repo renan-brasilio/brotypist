@@ -1,4 +1,4 @@
-"""KWin-launched input-method integration; never an ordinary display fallback."""
+"""KWin private input method with a separately owned, verified public ghost."""
 from __future__ import annotations
 
 import atexit
@@ -68,10 +68,16 @@ class _Event(ctypes.Structure):
     _fields_ = [("type", ctypes.c_int),
                 *((name, ctypes.c_uint32) for name in
                   ("generation", "serial", "time", "key", "state", "modifiers")),
-                ("x", ctypes.c_int32), ("y", ctypes.c_int32), ("name", ctypes.c_char_p)]
+                ("x", ctypes.c_int32), ("y", ctypes.c_int32), ("name", ctypes.c_char_p),
+                ("scene", ctypes.c_uint64), ("frame", ctypes.c_uint64)]
 
 
 _Callback = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_Event))
+
+
+class _GhostWindow(ctypes.Structure):
+    _fields_ = [("scene", ctypes.c_uint64), ("pid", ctypes.c_uint32),
+                *((name, ctypes.c_int32) for name in ("x", "y", "width", "height"))]
 
 
 def _load_library():
@@ -80,6 +86,7 @@ def _load_library():
     signatures = {
         "connect": ([ctypes.c_int, _Callback, pointer], pointer),
         "fd": ([pointer], ctypes.c_int),
+        "compositor_pid": ([pointer], u32),
         "dispatch": ([pointer], ctypes.c_int),
         "flush": ([pointer], ctypes.c_int),
         "close": ([pointer], None),
@@ -89,6 +96,17 @@ def _load_library():
         "commit": ([pointer, u32, u32, ctypes.c_char_p], ctypes.c_int),
         "present": ([pointer, pointer, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int], ctypes.c_int),
         "hide": ([pointer], None),
+        "ghost_fd": ([pointer], ctypes.c_int),
+        "ghost_dispatch": ([pointer], ctypes.c_int),
+        "ghost_flush": ([pointer], ctypes.c_int),
+        "ghost_window": ([pointer, u32, ctypes.POINTER(_GhostWindow)], ctypes.c_int),
+        "ghost_prepare": ([pointer, u32, ctypes.c_uint64, *([ctypes.c_int] * 4)], ctypes.c_int),
+        "ghost_scale": ([pointer], ctypes.c_int),
+        "ghost_present": ([pointer, ctypes.c_uint64, ctypes.c_uint64, pointer,
+                           ctypes.c_int, ctypes.c_int, ctypes.c_int], ctypes.c_int),
+        "ghost_hide": ([pointer], None),
+        "ghost_desktop_state": ([pointer, ctypes.c_int], None),
+        "composition_inactive": ([pointer], ctypes.c_int),
     }
     for name, (arguments, result) in signatures.items():
         function = getattr(library, f"inklow_wl_{name}")
@@ -100,6 +118,7 @@ class WaylandBridge(LinuxBridge):
     """Guarded AT-SPI snapshots bound to the compositor's exact input context."""
 
     supports_native_overlay = True
+    strict_visible_acceptance = True
 
     def __init__(self) -> None:
         global _prepared_fd
@@ -108,14 +127,22 @@ class WaylandBridge(LinuxBridge):
         self._library = None
         self._read_notifier = None
         self._write_notifier = None
+        self._ghost_read_notifier = None
+        self._ghost_write_notifier = None
+        self._ghost_event = None
+        self._ghost_snapshot = None
+        self._ghost_scene = self._ghost_frame = 0
+        self._ghost_text = ""
+        self._ghost_pending = self._ghost_presented = False
         self._dispatching = False
         self._native_depth = 0
         self._close_pending = False
-        self._ui_callback: Callable[[str], None] | None = None
+        self._ui_callback: Callable[..., None] | None = None
         self._needs_context_state = 0
         self._context_sync_pending = False
         self._context_synced = (0, 0)
         self._context_calls: set = set()
+        self._desktop_watch = None
         self._panel_snapshot: Snapshot | None = None
         self._panel_paused = False
         self._menu: list[tuple[str, str, bool]] | None = None
@@ -158,14 +185,22 @@ class WaylandBridge(LinuxBridge):
             self._write_notifier.setEnabled(False)
             self._read_notifier.activated.connect(self._read_ready)
             self._write_notifier.activated.connect(self._write_ready)
+            public_fd = self._native_call("ghost_fd", self._client)
+            if public_fd >= 0:
+                self._ghost_read_notifier = QSocketNotifier(public_fd, QSocketNotifier.Type.Read)
+                self._ghost_write_notifier = QSocketNotifier(public_fd, QSocketNotifier.Type.Write)
+                self._ghost_write_notifier.setEnabled(False)
+                self._ghost_read_notifier.activated.connect(self._ghost_read_ready)
+                self._ghost_write_notifier.activated.connect(self._ghost_write_ready)
             self._flush()
             if self._client:
                 self._set_status(
-                    "KWin native input method ready for manual controls. Ordinary inline completion "
-                    "is unavailable: this path cannot prove selection-safe, host-rendered inactive text. "
-                    "No preedit or suggestion popup is sent. Password fields and selections are excluded; "
-                    "browser website rules require observable native URL metadata."
+                    "KWin input method ready. Inline completion requires verified compositor "
+                    "capabilities, an undecorated/CSD window with matching client geometry and "
+                    "observable host-font metrics. Unsupported fields remain manual-only; no "
+                    "preedit or suggestion popup is sent. Passwords and selections are excluded."
                 )
+                self._start_desktop_watch()
                 self._queue_context_sync()
         except Exception as exc:
             if fd is not None:
@@ -244,9 +279,70 @@ class WaylandBridge(LinuxBridge):
         context_id = self._native_call("context", self._client)
         if not context_id:
             return None
-        return replace(snapshot, field_id=f"{snapshot.field_id}:wl:{context_id}",
-                       caret_rect=None, field_rect=None, native_anchor=self._anchor(before),
-                       native_inline=False)
+        current = replace(snapshot, field_id=f"{snapshot.field_id}:wl:{context_id}",
+                          caret_rect=None, field_rect=None, native_anchor=self._anchor(before),
+                          native_inline=False)
+        rendered = self._ghost_geometry(current, element, text_iface, pid)
+        message = ("Current field supports verified compositor inline text."
+                   if rendered is not None else
+                   f"{self._geometry_reason}; manual controls only.")
+        if getattr(self, "_inline_status", None) != message:
+            self._inline_status = message
+            self._set_status(message)
+        return rendered or current
+
+    def _ghost_window(self, pid: int):
+        if getattr(self, "_ghost_disabled", False):
+            return None
+        window = _GhostWindow()
+        if (self._native_call("ghost_window", self._client, pid, ctypes.byref(window)) != 1
+                or not window.scene or window.pid != pid or window.width <= 0 or window.height <= 0):
+            return None
+        return window
+
+    def _ghost_geometry(self, snapshot, element, interface, pid):
+        """Translate WINDOW coordinates only with an independently proven origin."""
+        self._geometry_reason = "Current field lacks verified client/font metrics"
+        try:
+            window = self._ghost_window(pid)
+            if window is None:
+                self._geometry_reason = "Compositor inline capability or unique active-window metadata unavailable"
+                return None
+            if self._native_call("composition_inactive", self._client) != 1:
+                self._geometry_reason = "Current field has no positive inactive-composition proof"
+                return None
+            ancestor = self._window_ancestor(element)
+            if ancestor is None:
+                return None
+            a = self.atspi
+            state = ancestor.getState()
+            if not all(state.contains(flag) for flag in (a.STATE_ACTIVE, a.STATE_VISIBLE, a.STATE_SHOWING)):
+                return None
+            bounds = ancestor.queryComponent().getExtents(a.WINDOW_COORDS)
+            # No inferred titlebar, border, DPI or symmetric decoration offsets.
+            # Only exact client/frame agreement establishes a global client origin.
+            if (bounds.x, bounds.y, bounds.width, bounds.height) != (0, 0, window.width, window.height):
+                return None
+            x, y, width, height = interface.getCharacterExtents(snapshot.caret, a.WINDOW_COORDS)
+            if width < 0 or height <= 0:
+                return None
+            rect = (float(window.x + x), float(window.y + y), float(max(1, width)), float(height))
+            attrs = dict(item.split(":", 1) for item in element.getAttributes() if ":" in item)
+            render = self._inline_metrics(
+                element, interface, snapshot.text, snapshot.caret, rect, attrs,
+                coordinates=a.WINDOW_COORDS, origin=(window.x, window.y), composition_inactive=True)
+            after = self._ghost_window(pid)
+            state = self._state()
+            if (render is None or after is None or bytes(after) != bytes(window)
+                    or state is None or self._anchor(state) != snapshot.native_anchor
+                    or self._native_call("composition_inactive", self._client) != 1):
+                return None
+            render = replace(render, source=f"wayland-atspi-font-run:{window.scene}")
+            return replace(snapshot, caret_rect=rect, inline_render=render, window_pid=pid,
+                           window_bounds=(window.x, window.y, window.width, window.height),
+                           window_revision=str(window.scene))
+        except Exception:
+            return None
 
     def context_matches(self, snapshot):
         # The private input-method connection belongs exclusively to the Qt
@@ -260,11 +356,22 @@ class WaylandBridge(LinuxBridge):
             except Exception:
                 return None
 
+    def insert_inline(self, snapshot: Snapshot, text: str) -> bool:
+        """Ordinary acceptance always needs the still-presented exact frame."""
+        with self._lock:
+            if (not isinstance(text, str) or not text or self._ghost_event is None
+                    or not self._ghost_presented or not self._ghost_text.startswith(text)
+                    or snapshot.key != self._ghost_snapshot.key or not self._ghost_current()):
+                self._hide_ghost()
+                return False
+            return self.insert(snapshot, text)
+
     def insert(self, snapshot: Snapshot, text: str) -> bool:
         if not isinstance(text, str) or not text or "\x00" in text or snapshot.protected or snapshot.selection_length:
             return False
         with self._lock:
             try:
+                self._hide_ghost()
                 current = self._capture_native()
                 if (current is None or current.key != snapshot.key
                         or current.native_anchor != snapshot.native_anchor):
@@ -387,6 +494,8 @@ class WaylandBridge(LinuxBridge):
                 state = self._state()
                 if self._panel_snapshot and (state is None or self._anchor(state) != self._panel_snapshot.native_anchor):
                     self.hide_native()
+                if self._ghost_snapshot and not self._ghost_current():
+                    self._hide_ghost()
                 if state is not None and self._ui_callback:
                     self._ui_callback("context_changed")
             elif event.type == 2 and event.state == 1:
@@ -394,6 +503,8 @@ class WaylandBridge(LinuxBridge):
                 state = self._state()
                 if state is None or state[0] != event.generation:
                     return 0
+                if self._ghost_snapshot and not self._ghost_current():
+                    self._hide_ghost()
                 key, modifiers = self._key(event)
                 if self._menu is not None:
                     return int(self._menu_key(key, modifiers))
@@ -409,12 +520,55 @@ class WaylandBridge(LinuxBridge):
             elif event.type == 5 and self._pending_render:
                 if not self._render():
                     self.hide_native()
+            elif event.type == 6:
+                if event.state == 1:
+                    self._hide_ghost(deferred=True)
+                    if self._ui_callback:
+                        self._ui_callback("context_changed")
+                elif event.state == 2 and self._ghost_pending and event.scene == self._ghost_scene:
+                    self._render_ghost()
+            elif event.type == 7:
+                if (self._ghost_event is not None and event.scene == self._ghost_scene
+                        and event.frame == self._ghost_frame):
+                    if (event.state == 1 and self._state() == (event.generation, event.serial)
+                            and self._ghost_current()):
+                        self._ghost_presented = True
+                        self._presentation(self._ghost_event, self._ghost_text)
+                    else:
+                        self._hide_ghost(deferred=True)
         except Exception:
             # A ctypes callback must never leak an exception or suppress a normal key.
             self._set_status("Native input-method callback failed; interception disabled.")
             self.set_shortcuts_enabled(False)
             self.hide_native()
         return 0
+
+    def _start_desktop_watch(self) -> None:
+        """Bootstrap public visibility without blocking or changing private input."""
+        if self._desktop_watch is not None or not self._client or self._stopped.is_set():
+            return
+        try:
+            from ._kwin_desktop import DesktopWatch
+            pid = self._native_call("compositor_pid", self._client)
+            self._desktop_watch = DesktopWatch(pid, self._desktop_watch_state)
+            self._desktop_watch.start()
+        except Exception:
+            self._stop_desktop_watch()
+            self._desktop_watch_state(-1)
+
+    def _desktop_watch_state(self, state: int) -> None:
+        if not self._client:
+            return
+        self._native_call("ghost_desktop_state", self._client, state)
+        if state != 0:
+            self._hide_ghost()
+        self._ghost_flush()
+
+    def _stop_desktop_watch(self) -> None:
+        watch, self._desktop_watch = self._desktop_watch, None
+        if watch is not None:
+            watch.stop()
+
 
     def _queue_context_sync(self) -> None:
         if (not self._needs_context_state or self._context_sync_pending
@@ -498,6 +652,7 @@ class WaylandBridge(LinuxBridge):
         elif self._client:
             self._read_notifier.setEnabled(True)
             self._write_notifier.setEnabled(result == 0)
+            self._ghost_flush()
 
     def _write_ready(self, *unused) -> None:
         if self._write_notifier:
@@ -513,15 +668,208 @@ class WaylandBridge(LinuxBridge):
             self.stop()
         elif self._write_notifier and not self._dispatching:
             self._write_notifier.setEnabled(result == 0)
+        self._ghost_flush()
 
-    def bind_ui(self, callback: Callable[[str], None]) -> None:
+    def _ghost_read_ready(self, *unused) -> None:
+        if not self._client or self._dispatching or self._ghost_read_notifier is None:
+            return
+        self._ghost_read_notifier.setEnabled(False)
+        if self._ghost_write_notifier:
+            self._ghost_write_notifier.setEnabled(False)
+        self._dispatching = True
+        try:
+            result = self._native_call("ghost_dispatch", self._client)
+        finally:
+            self._dispatching = False
+        if self._close_pending:
+            self._release_native()
+        elif result < 0:
+            self._disable_ghost_display()
+        elif self._client and self._ghost_read_notifier:
+            self._ghost_read_notifier.setEnabled(True)
+            if self._ghost_write_notifier:
+                self._ghost_write_notifier.setEnabled(result == 0)
+            self._flush()
+
+    def _ghost_write_ready(self, *unused) -> None:
+        if self._ghost_write_notifier:
+            self._ghost_write_notifier.setEnabled(False)
+        self._ghost_flush()
+
+    def _ghost_flush(self) -> None:
+        if not self._client or self._stopped.is_set() or getattr(self, "_ghost_disabled", False):
+            return
+        result = self._native_call("ghost_flush", self._client)
+        if result < 0:
+            self._disable_ghost_display()
+        elif self._ghost_write_notifier and not self._dispatching:
+            self._ghost_write_notifier.setEnabled(result == 0)
+
+    def _disable_ghost_display(self) -> None:
+        self._ghost_disabled = True
+        self._stop_desktop_watch()
+        for name in ("_ghost_read_notifier", "_ghost_write_notifier"):
+            notifier = getattr(self, name, None)
+            if notifier is not None:
+                notifier.setEnabled(False)
+                notifier.deleteLater()
+                setattr(self, name, None)
+        self._hide_ghost()
+        self._set_status("Compositor inline rendering unavailable; native manual controls remain available.")
+
+    def _presentation(self, event, text: str) -> None:
+        if self._ui_callback:
+            self._ui_callback("presentation", {"key": event.get("key"), "text": text, "mode": "completion"})
+
+    def _hide_ghost(self, *, deferred: bool = False) -> None:
+        previous, self._ghost_event = self._ghost_event, None
+        self._ghost_snapshot = None
+        self._ghost_text = ""
+        self._ghost_pending = self._ghost_presented = False
+        if previous is not None:
+            self._presentation(previous, "")
+        if deferred:
+            from PySide6.QtCore import QTimer
+            token = (self._ghost_scene, self._ghost_frame)
+            def retire():
+                if (self._ghost_event is None and token == (self._ghost_scene, self._ghost_frame)
+                        and self._client and not self._stopped.is_set()):
+                    self._native_call("ghost_hide", self._client)
+                    self._ghost_flush()
+            QTimer.singleShot(0, retire)
+        elif self._client and not self._stopped.is_set():
+            self._native_call("ghost_hide", self._client)
+
+    def _ghost_current(self) -> bool:
+        expected = self._ghost_snapshot
+        current = self.capture() if expected is not None else None
+        return bool(current is not None and current.key == expected.key
+                    and current.native_anchor == expected.native_anchor
+                    and current.caret_rect == expected.caret_rect
+                    and current.inline_render == expected.inline_render
+                    and current.window_revision == str(self._ghost_scene))
+
+    def present_inline_native(self, event: dict) -> bool:
+        """Queue a transparent native frame; only presentation feedback arms it."""
+        with self._lock:
+            if self._menu is not None:
+                self._presentation(event, "")
+                return False
+            self.hide_native()
+            self._presentation(event, "")
+            current = self.capture()
+            if (self._menu is not None or current is None or not current.inline_safe
+                    or current.key != event.get("key") or current.native_anchor != event.get("native_anchor")
+                    or not event.get("inline") or current.inline_render is None):
+                return False
+            from dataclasses import asdict
+            if (asdict(current.inline_render) != event.get("render")
+                    or list(current.caret_rect) != list(event.get("rect") or ())):
+                return False
+            self._ghost_event = dict(event)
+            self._ghost_snapshot = current
+            self._ghost_scene = int(current.window_revision)
+            self._ghost_pending = True
+            return self._render_ghost()
+
+    def _render_ghost(self) -> bool:
+        try:
+            return self._paint_ghost()
+        except Exception:
+            self._hide_ghost()
+            return False
+
+    def _paint_ghost(self) -> bool:
+        import math
+        from PySide6.QtCore import QPointF, Qt, QTextBoundaryFinder
+        from PySide6.QtGui import QFont, QFontInfo, QFontMetricsF, QImage, QPainter, QColor
+
+        if not self._ghost_current():
+            self._hide_ghost()
+            return False
+        snapshot, event = self._ghost_snapshot, self._ghost_event
+        render = snapshot.inline_render
+        x = math.floor(snapshot.caret_rect[0])
+        y = math.floor(render.baseline - render.ascent)
+        right = math.floor(render.clip_rect[0] + render.clip_rect[2])
+        height = math.ceil(render.baseline + render.descent) - y
+        if (x < render.clip_rect[0] or y < render.clip_rect[1] or right <= x or height <= 0
+                or y + height > render.clip_rect[1] + render.clip_rect[3]):
+            self._hide_ghost()
+            return False
+        # Prepare the full available row before font measurement: configure and
+        # preferred fractional scale are asynchronous compositor facts.
+        ready = self._native_call("ghost_prepare", self._client, snapshot.window_pid,
+                                  self._ghost_scene, x, y, right - x, height)
+        scale120 = self._native_call("ghost_scale", self._client)
+        if ready == 2 or (ready == 1 and scale120 == 0):
+            self._ghost_pending = True
+            self._ghost_flush()
+            return True
+        if ready != 1 or scale120 <= 0:
+            self._hide_ghost()
+            return False
+        ratio = scale120 / 120.0
+        image = QImage(math.ceil((right - x) * ratio), math.ceil(height * ratio),
+                       QImage.Format.Format_ARGB32_Premultiplied)
+        image.setDevicePixelRatio(ratio)
+        image.fill(Qt.GlobalColor.transparent)
+        font = QFont(render.font_name)
+        font.setPointSizeF(render.font_size)
+        font.setWeight(QFont.Weight(render.font_weight))
+        font.setItalic(render.italic)
+        info, metrics = QFontInfo(font), QFontMetricsF(font, image)
+        if (info.family().casefold() != render.font_name.casefold()
+                or abs(metrics.ascent() - render.ascent) * ratio > 1.5
+                or abs(metrics.descent() - render.descent) * ratio > 1.5):
+            self._hide_ghost()
+            return False
+        text = str(event.get("text") or "").split("\n", 1)[0].split("\r", 1)[0]
+        finder = QTextBoundaryFinder(QTextBoundaryFinder.BoundaryType.Grapheme, text)
+        encoded, visible = text.encode("utf-16-le"), ""
+        dx, baseline = snapshot.caret_rect[0] - x, render.baseline - y
+        while (end := finder.toNextBoundary()) >= 0:
+            prefix = encoded[:end * 2].decode("utf-16-le")
+            ink = metrics.tightBoundingRect(prefix)
+            if (dx + min(0, ink.left()) < 0
+                    or dx + max(metrics.horizontalAdvance(prefix), ink.right()) > right - x
+                    or baseline + ink.top() < 0 or baseline + ink.bottom() > height):
+                break
+            visible = prefix
+        if not visible:
+            self._hide_ghost()
+            return False
+        painter = QPainter(image)
+        painter.setFont(font)
+        painter.setPen(QColor(128, 128, 128))
+        painter.drawText(QPointF(dx, baseline), visible)
+        painter.end()
+        if not self._ghost_current():
+            self._hide_ghost()
+            return False
+        self._ghost_frame += 1
+        self._ghost_text = visible
+        self._ghost_presented = False
+        pixels = (ctypes.c_ubyte * image.sizeInBytes()).from_buffer(image.bits())
+        result = self._native_call("ghost_present", self._client, self._ghost_scene, self._ghost_frame,
+                                   ctypes.addressof(pixels), image.width(), image.height(), image.bytesPerLine())
+        self._ghost_pending = result == 2
+        self._ghost_flush()
+        if result not in (1, 2):
+            self._hide_ghost()
+            return False
+        return True
+
+    def bind_ui(self, callback: Callable[..., None]) -> None:
         self._ui_callback = callback
 
     def present_native(self, native_anchor: str, text: str, paused: bool = False) -> bool:
-        """Present only the manual control; no safe native suffix path is available."""
+        """Present only an explicit manual control, never ordinary preedit."""
         with self._lock:
             if self._menu is not None:
                 return False
+            if self._ghost_event is not None:
+                self._hide_ghost()
             current = self.capture()
             if (current is None or not native_anchor or current.native_anchor != native_anchor
                     or text != ""):
@@ -534,6 +882,7 @@ class WaylandBridge(LinuxBridge):
             return True
 
     def hide_native(self) -> None:
+        self._hide_ghost()
         had_menu = self._menu is not None
         self._panel_snapshot = None
         self._menu = None
@@ -689,10 +1038,11 @@ class WaylandBridge(LinuxBridge):
             self._dispatch(action)
 
     def _release_native(self) -> None:
+        self._stop_desktop_watch()
         for call in self._context_calls:
             call.deleteLater()
         self._context_calls.clear()
-        for name in ("_read_notifier", "_write_notifier"):
+        for name in ("_read_notifier", "_write_notifier", "_ghost_read_notifier", "_ghost_write_notifier"):
             notifier = getattr(self, name, None)
             if notifier is not None:
                 notifier.setEnabled(False)
@@ -706,6 +1056,7 @@ class WaylandBridge(LinuxBridge):
     def stop(self) -> None:
         BridgeBase.stop(self)
         self._ui_callback = None
+        self._stop_desktop_watch()
         self.hide_native()
         self._available = False
         self._desktop = None

@@ -16,9 +16,8 @@ from . import __version__
 from .models import DEFAULT_PRESET, PRESETS, download_model, get_preset, is_installed
 
 
-_PANES = (("welcome", "setup", "general", "context", "personalization", "emoji", "shortcuts",
-           "battery", "appSettings", "labs", "statistics", "about") if sys.platform == "darwin"
-          else ("welcome", "general", "models", "autocomplete", "languages", "privacy", "about"))
+_PANES = ("welcome", "setup", "general", "models", "context", "personalization", "emoji",
+          "shortcuts", "battery", "appSettings", "labs", "statistics", "about")
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments == ["_worker"]:
@@ -124,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "wayland":
             from .system import install_wayland_input_method
             path = install_wayland_input_method()
-            print(f"Installed {path}\nQuit BroTypist, then select BroTypist in KDE System Settings → Keyboard → Virtual Keyboard.\nKDE starts the input-method instance; no desktop setting was changed automatically.\nOrdinary inline completion remains unavailable; this entry provides guarded manual controls.")
+            print(f"Installed {path}\nQuit BroTypist, then select BroTypist in KDE System Settings → Keyboard → Virtual Keyboard.\nKDE starts the input-method instance; no desktop setting was changed automatically.\nCheck Setup for live compositor and field capabilities; registration does not prove same-line support.")
             return 0
         if args.command == "doctor":
             from .native import create_bridge

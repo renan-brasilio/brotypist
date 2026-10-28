@@ -1,6 +1,6 @@
 # BroTypist
 
-Local-first predictive typing for macOS and supported Linux inputs. **Current development focuses on macOS; new Linux and Windows builds are held.** BroTypist lives in the menu bar/tray and offers grey same-line suggestions where the host exposes safe layout and insertion. Settings are not a writing editor. Ordinary KDE Wayland inline completion remains unavailable; see the explicit limits below.
+Local-first predictive typing for macOS and supported Linux inputs. BroTypist lives in the menu bar/tray and offers grey same-line suggestions where the host exposes safe layout and insertion. Settings are not a writing editor. Linux development now includes the latest settings and shared prediction features; Windows builds remain held. See the explicit input/compositor limits below.
 
 [Releases](https://github.com/renan-brasilio/brotypist/releases) · [Changelog](CHANGELOG.md) · [Design specification](DESIGN.md) · [Verification](evidence/VERIFICATION.md)
 
@@ -45,22 +45,26 @@ Native Debian releases target Ubuntu 24.04+/Debian 13+ amd64, with D-Bus and an 
 
 #### KDE Wayland
 
-BroTypist uses KWin's private **input-method-v1** connection for its opt-in brand/manual-menu controls, not raw input devices, global injection, or a screen-reader identity. **Ordinary inline completion is currently unavailable on this Wayland path.** A real isolated KWin/Qt test showed that delayed preedit could replace a newly selected range and did not expose inactive styling. The unsafe preedit path was removed; missing native font metrics are not replaced with a suggestion popup.
+BroTypist uses KWin's explicitly selected **input-method-v1** connection for keyboard forwarding and text insertion. The development renderer uses a separate transparent, mouse-through layer for grey same-line text—not preedit, a suggestion card, raw input devices or a screen-reader identity. It requires layer-shell, fractional-scale, viewport, output, window-metadata and presentation-feedback protocols. A compositor lacking any required primitive remains manual-only; installer/model-preview success does not prove typing support.
 
 X11 is also capability-bound: ordinary overlays require explicit inactive-composition state, native font/direction attributes and matching visible glyph metrics. Many providers omit these; those inputs remain silent. A passing installer or local-model preview is not proof that an arbitrary Linux input supports inline completion.
 
 ```sh
-.venv/bin/python tools/build_wayland.py
-.venv/bin/brotypist wayland install
+# From a complete portable application directory:
+./launch-brotypist wayland install
+# For a Debian-managed installation:
+brotypist wayland install
 ```
 
-The install command only creates the per-user selector entry. Explicitly choose **BroTypist** in **KDE System Settings → Keyboard → Virtual Keyboard**; Welcome and Privacy can open that selector. KDE supplies the private socket and owns the resulting launch. Do not invoke `--wayland-input-method` directly from a terminal.
+The install command only creates or refreshes BroTypist's per-user selector entry, bound to its actual frozen executable. Explicitly choose **BroTypist** in **KDE System Settings → Keyboard → Virtual Keyboard**; Welcome and Setup can open that selector. KDE supplies the private socket and owns the resulting launch. Do not invoke `--wayland-input-method` directly from a terminal. After moving a portable directory, run the install command from its new location again.
 
-Selecting an input method lets it receive keyboard events and surrounding text for supported fields and occupies KDE's input-method slot. Consider an existing Fcitx/IBus setup before replacing it. BroTypist never selects itself or changes the desktop session automatically. After quitting or updating a selected source build, select **None**, then **BroTypist**, to start it again. A terminal `brotypist doctor` cannot inspect the KDE-owned private connection; use the running app's Privacy status.
+Selecting an input method lets it receive keyboard events and surrounding text for supported fields and occupies KDE's input-method slot. Consider an existing Fcitx/IBus setup before replacing it. BroTypist never selects itself or changes the desktop session automatically. After quitting a selected instance, choose **None**, then **BroTypist**, to start it again. A terminal `brotypist doctor` cannot inspect the KDE-owned private connection; use the running app's Setup status.
 
 The exercised Qt target uses **text-input-v3**. A target can request it at its own launch with `QT_WAYLAND_TEXT_INPUT_PROTOCOL=zwp_text_input_v3 QT_IM_MODULE=wayland <application>`. The tested default text-input-v2 path lacked complete context. Do not set those variables globally just to make one application work.
 
-KWin owns manual-panel placement. Protected fields, selections, stale contexts, and unmatched metadata are rejected. The current Wayland path neither submits ordinary predictions nor consumes their acceptance keys. Background window context, atomic cross-app replacement, selected-text synonyms, and emoji/emoticon rewriting remain unavailable. Restoring Wayland completion requires a proven host/compositor path with observable inactive styling and atomic stale-state fencing; the historical native-panel receipts are not proof of that capability.
+Same-line rendering additionally requires a unique active window/PID, matching client/frame geometry, trustworthy font/glyph/clip metrics and positively inactive composition. Ambiguous server-decoration offsets are not guessed. Geometry, scale, focus, selection or composition changes revoke the displayed frame; only the exact compositor-acknowledged visible prefix may be accepted. Unsupported inputs stay silent and do not consume ordinary acceptance keys. Background window context, atomic cross-app replacement, selected-text synonyms and emoji/emoticon rewriting remain unavailable on this Wayland path. Historical native-panel receipts are not same-line proof; consult the current verification record for exercised targets.
+
+KDE window-metadata access is declared through `X-KDE-Wayland-Interfaces=org_kde_plasma_window_management` for BroTypist's own executable. The renderer reads geometry, PID and state; delivered titles/app icons are ignored. The application requests no fake-input or screen-capture protocol and never disables KDE permission checks. Source registration is deliberately refused because granting a shared Python interpreter would authorize unrelated scripts; build the frozen app first. The disposable developer fixture instead uses separate private executable identities and a private compositor, without registering anything on your normal desktop.
 
 ### Verify downloads
 
@@ -80,9 +84,9 @@ Versions through 0.4.3 have no updater: **one manual installation of an OTA-capa
 
 ## First run and daily use
 
-Welcome covers privacy, system access, explicit model selection, a real local prediction preview and the resident menu. Reopen it from **About → Show Welcome**. macOS settings contain:
+Welcome covers privacy, system access, explicit model selection, a real local prediction preview and the resident menu. Reopen it from **About → Show Welcome**. The development versions on macOS and Linux share twelve focused settings sections:
 
-The layout below describes the **unreleased macOS 0.4.10 development version**, including the 0.4.6 native redesign. Published 0.4.5 keeps model controls in General; no 0.4.6–0.4.10 Linux or Windows package has been published.
+These settings are newer than published **0.4.5**. The release table above describes published assets, not an assertion that the current development checkout has been released. Platform-specific controls are shown only where supported.
 
 - **Setup:** live required/optional permission and model-readiness states.
 - **General:** startup, accessory icon, master/default prediction switches, completion length, inside-text behavior and typo controls.
@@ -99,11 +103,15 @@ New installations select **Gemma 4 E2B**, a pinned 2.84 GB public GGUF, with a c
 
 Onboarding selects, downloads or imports a model without opening Settings. Choosing a missing model blocks Continue even if another model is ready; choosing a cached catalogue model activates it without another download. Local file and inference-library readiness are checked before continuing; the next Try it step exercises actual inference. Settings resize without discarding unsaved instruction text, editor selection or scroll position.
 
-Automatic completion is eligible after one non-whitespace character by default, following the 150 ms typing pause and normal field-safety checks. Existing saved thresholds are preserved: if an older profile waits for eight characters, change **Labs → Minimum preceding characters** to `1`. Eligibility is not a guarantee of a useful model result; cold loading can still take seconds. Superseded optional-context waits are cancelled without reducing the current draft’s fresh-context budget.
+Automatic completion is eligible after one non-whitespace character by default, following the 150 ms typing pause and normal field-safety checks. Existing saved thresholds are preserved: if an older profile waits for eight characters, change **Minimum preceding characters** on macOS or **General → Minimum typed characters** on Linux to `1`. Eligibility is not a guarantee of a useful model result; cold loading can still take seconds. Superseded optional-context waits are cancelled without reducing the current draft’s fresh-context budget.
 
 Writing prompts follow the clause at the cursor rather than forcing the dominant language of the whole message. Brazilian Portuguese and English can coexist without translating existing text or introducing gratuitous slang. The original typed ending remains exact, untrusted task data while token healing restores its native token boundary. Explicit language preferences are model guidance, not a guaranteed language switch; short ambiguous prefixes can remain uncertain, and a model can return no useful suggestion.
 
-The native resident menu and Battery pane show verified power readings sampled off the UI thread at most once per 15 seconds. A brief charging cue animates the resident icon and visible power card; Reduce Motion or increased contrast keeps the charging indicator static. Reduced pane-arrival fades remain short, and hiding the surface, locking/switching sessions or quitting stops motion. At a known discharging level of **20% or below**, BroTypist asks for charging help once per discharge cycle in a nonactivating menu-bar-anchored hint; dismissing it or battery-level fluctuations do not repeat it. Reconnecting to verified external power rearms the next cycle. Unknown/no-battery readings never invent a percentage or a low-battery request.
+The resident menu stays compact: **Enable predictions**, a **Pause** submenu, the current app's prediction switch, **Settings…**, **Check for Updates…** and **Quit BroTypist**. Model details, diagnostics, recording controls, statistics and battery information live in Settings instead of menu cards. Global and current-app checkmarks describe their saved preferences; Resume clears the timed pause without changing the global switch.
+
+The Battery pane and resident-icon tooltip show verified power readings sampled off the UI thread at most once per 15 seconds. A brief charging cue animates the resident icon and visible Settings power card; Reduce Motion or increased contrast keeps the charging indicator static. Reduced pane-arrival fades remain short, and hiding the surface, locking/switching sessions or quitting stops motion. At a known discharging level of **20% or below**, BroTypist asks for charging help once per discharge cycle in a nonactivating menu-bar-anchored hint; dismissing it or battery-level fluctuations do not repeat it. Reconnecting to verified external power rearms the next cycle. Unknown/no-battery readings never invent a percentage or a low-battery request.
+
+Linux samples power/session state outside the Qt event loop. Motion is conservative: unsupported desktop motion/contrast preferences use a static charging indicator. The low-battery hint additionally requires a verified unlocked active session and a real tray anchor; an unavailable tray or unknown session never produces a floating, unanchored prompt.
 
 | Action | Existing default |
 | --- | --- |
@@ -138,7 +146,7 @@ When focused-window context is enabled, a prediction refreshes its authorized re
 
 ### Learn your writing locally
 
-1. Open **Personalization** on macOS or **Privacy → Encrypted local writing learning** on Linux.
+1. Open **Personalization**.
 2. Enable local learning after reviewing the consent dialog. OS-backed encrypted storage must be available; there is no plaintext fallback.
 3. To learn from sessions where you accept nothing, explicitly enable **Also learn when no suggestion is accepted**. Existing app/site recording overrides still take precedence.
 
@@ -205,7 +213,7 @@ uv run python tools/smoke_bundle.py
 # Run the matching native packager from a committed build:
 VERSION=$(uv run python -c 'from inklow import __version__; print(__version__)')
 uv run python tools/package_macos.py --bundle dist/BroTypist.app --output release --version "$VERSION"
-# On native Linux; the latest redesign/early-input build is currently macOS-only:
+# On native Linux:
 uv run python tools/package_linux.py --bundle dist/BroTypist --output release --version "$VERSION"
 ```
 

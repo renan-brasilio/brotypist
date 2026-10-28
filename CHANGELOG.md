@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.12 — Unpublished Linux development snapshot
+
+- Package the current Linux development source for private testing only; this snapshot is not a GitHub release.
+- Same-line Wayland prediction proof remains absent: missing caret-end geometry, font attributes and direction stay fail-closed. Rapid cross-toolkit protocol disconnects and KWin SensitiveData mapping remain unresolved; packaging and private X11 checks do not establish positive Wayland rendering.
+
+### Compact resident menus
+
+- Replace dashboard-style menu content with six native action groups on macOS and Linux: global predictions, Pause, current-app predictions, Settings, Updates and Quit. Model, battery, recording and statistics detail remains in Settings.
+- Resume clears only the timed pause; checkmarks describe saved global/app preferences independently. Deferred actions retain their original app/domain target. Preserve native submenu tracking, field controls, update intent, unsaved drafts and direct Quit.
+- The scoped macOS 0.4.11 delivery is isolated on `fix/minimal-native-menu-0.4.11`; unfinished Linux rendering work is not bundled into that macOS fix. No new Linux/Windows or GitHub release is implied.
+
+### Linux parity
+
+- Port the twelve-section settings layout to native Qt, with accessible icon controls, dedicated model management in Settings and Welcome, preserved instruction drafts/selection/scroll, and explicit Save/Revert/Discard/Cancel.
+- Keep field controls minimal and separate from the exported tray menu. Preserve a visible no-tray Quit path, draft cancellation, and asynchronous cleanup of the prediction worker, downloads, updater and power sampler.
+- Use one intent-bound update action so a displayed Cancel cannot turn into Install while the update state changes.
+- Share the existing bilingual prediction, early-input eligibility, warm/resident-model policy, scoped encrypted learning and Unicode author-evidence fixes rather than introducing a second Linux engine.
+- Add off-thread Linux power/session sampling, truthful battery/charging states and bounded charging feedback. Low-battery help requires verified discharging power at 20% or below, an unlocked active session and a real tray anchor. Unknown motion/contrast support stays static.
+- Require actual visible-prefix acknowledgement for Linux ordinary acceptance. KDE's strict path inserts only the displayed grapheme prefix, without hidden word tails or synthetic separators; manual alternatives remain separately authorized against fresh native text.
+- Native rendering, packaging and platform verification are recorded in `evidence/VERIFICATION.md`; these development changes are not a published GitHub release.
+
 ## 0.4.10 — Unreleased, native visibility and learning QA remediation
 
 - Apply the native ghost visibility/active-Space contract to explicit chooser presentation and cache reuse. Hidden, refused or other-Space choices acknowledge no insertion; unchanged presentations can recover without arming unseen words. Ordinary completion remains grey same-line text, not a popup fallback.

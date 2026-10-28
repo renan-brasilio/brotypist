@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, QTextBoundaryFinder, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QCursor, QFont, QFontInfo, QFontMetricsF, QFontDatabase, QIcon, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
@@ -24,20 +24,22 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QMenu,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
     QSpinBox, QStackedWidget, QSystemTrayIcon, QTableWidget,
-    QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
+    QTableWidgetItem, QToolButton, QVBoxLayout, QWidget, QStyle, QSizePolicy,
 )
 
 from . import __version__, system
 from .config import Config
 from .core import InlineRender
-from .models import PRESETS
-from .resources import REPOSITORY_URL, app_icon, configure_identity, tray_icon
+from .models import PRESETS, recommended_preset
+from .resources import REPOSITORY_URL, app_icon, asset_path, configure_identity, tray_icon
 from .runtime import Controller, ShutdownPending
 from .shortcuts import normalize_shortcut, shortcut_from_event
 from .updates import UpdateService
 from .update_install import HEALTH_NONCE, HEALTH_PATH, acknowledge_startup
+from .qt_power import PowerSampler, QtPowerUI
 
-PANES = ("General", "AI Models", "Autocomplete", "Languages", "Privacy", "About")
+PANES = ("Setup", "General", "AI Models", "Context", "Personalization", "Emoji",
+         "Shortcuts", "Battery", "App Settings", "Labs", "Statistics", "About")
 
 _CLIPBOARD_TIMEOUT = 0.25
 
@@ -124,31 +126,32 @@ class UiWake(QObject):
 
 def _settings_icon(index: int) -> QIcon:
     """Small native-vector symbols, never font-dependent emoji or letter tiles."""
-    colors = ("#6E717A", "#1FA97A", "#3979C6", "#605BC2", "#30343D", "#6E717A")
+    # Native-palette glyphs remain legible with high-contrast desktop themes.
+    color = QApplication.palette().color(QPalette.ColorRole.WindowText)
     image = QPixmap(40, 40)
     image.setDevicePixelRatio(2)
     image.fill(Qt.GlobalColor.transparent)
     painter = QPainter(image)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor(colors[index]))
-    painter.drawRoundedRect(QRectF(0, 0, 20, 20), 5, 5)
-    pen = QPen(Qt.GlobalColor.white, 1.35)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    pen = QPen(color, 1.35)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     painter.setPen(pen)
     painter.setBrush(Qt.BrushStyle.NoBrush)
-    if index == 0:
+    name = PANES[index]
+    if name == "General":
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(Qt.GlobalColor.white)
+        painter.setBrush(color)
         painter.translate(10, 10)
         for _ in range(8):
             painter.drawRoundedRect(QRectF(-1.8, -8, 3.6, 4), 0.6, 0.6)
             painter.rotate(45)
         painter.drawEllipse(QRectF(-5.5, -5.5, 11, 11))
-        painter.setBrush(QColor(colors[index]))
+        painter.setBrush(QApplication.palette().color(QPalette.ColorRole.Window))
         painter.drawEllipse(QRectF(-2.5, -2.5, 5, 5))
-    elif index == 1:
+    elif name == "AI Models":
         painter.drawRoundedRect(QRectF(5, 5, 10, 10), 1.5, 1.5)
         painter.drawRect(QRectF(8, 8, 4, 4))
         for position in (7, 10, 13):
@@ -156,17 +159,27 @@ def _settings_icon(index: int) -> QIcon:
             painter.drawLine(position, 15, position, 17)
             painter.drawLine(3, position, 5, position)
             painter.drawLine(15, position, 17, position)
-    elif index == 2:
-        painter.drawLine(11, 4, 11, 16)
-        painter.drawLine(8, 4, 14, 4)
-        painter.drawLine(8, 16, 14, 16)
-        painter.drawLine(4, 8, 7, 8)
-        painter.drawLine(4, 12, 7, 12)
-    elif index == 3:
+    elif name == "Context":
+        painter.drawRoundedRect(QRectF(3, 3, 14, 14), 2, 2)
+        for y in (7, 10, 13):
+            painter.drawLine(6, y, 14, y)
+    elif name == "Personalization":
+        painter.drawEllipse(QRectF(4, 3, 5, 5))
+        painter.drawArc(QRectF(2, 9, 9, 10), 0, 180 * 16)
+        painter.drawLine(12, 7, 17, 7)
+        painter.drawLine(12, 11, 17, 11)
+        painter.drawLine(12, 15, 17, 15)
+    elif name == "Shortcuts":
+        painter.drawRoundedRect(QRectF(2, 5, 16, 11), 2, 2)
+        for x in (5, 10, 15):
+            painter.drawPoint(x, 8)
+        painter.drawLine(6, 12, 14, 12)
+    elif name == "Emoji":
         painter.drawEllipse(QRectF(3, 3, 14, 14))
-        painter.drawEllipse(QRectF(6, 3, 8, 14))
-        painter.drawLine(3, 10, 17, 10)
-    elif index == 4:
+        painter.drawPoint(7, 8)
+        painter.drawPoint(13, 8)
+        painter.drawArc(QRectF(6, 8, 8, 6), 180 * 16, 180 * 16)
+    elif name == "Setup":
         path = QPainterPath()
         path.moveTo(10, 2.5)
         path.lineTo(16, 5)
@@ -178,6 +191,23 @@ def _settings_icon(index: int) -> QIcon:
         painter.drawPath(path)
         painter.drawLine(7, 10, 9, 12)
         painter.drawLine(9, 12, 13, 7)
+    elif name == "App Settings":
+        for x in (3, 11):
+            for y in (3, 11):
+                painter.drawRoundedRect(QRectF(x, y, 6, 6), 1, 1)
+    elif name == "Battery":
+        painter.drawRoundedRect(QRectF(2, 5, 15, 10), 2, 2)
+        painter.drawLine(19, 8, 19, 12)
+        painter.fillRect(QRectF(4, 7, 9, 6), color)
+    elif name == "Statistics":
+        for x, height in ((4, 5), (9, 9), (14, 13)):
+            painter.drawRect(QRectF(x, 17 - height, 3, height))
+    elif name == "Labs":
+        painter.drawLine(7, 3, 13, 3)
+        path = QPainterPath(QPointF(8, 3))
+        for x, y in ((8, 8), (3, 17), (17, 17), (12, 8), (12, 3)):
+            path.lineTo(x, y)
+        painter.drawPath(path)
     else:
         painter.drawEllipse(QRectF(3, 3, 14, 14))
         painter.drawPoint(10, 6)
@@ -202,6 +232,42 @@ def _tray_state(status: dict, config: Config) -> str:
     if not status.get("inline_available", True):
         return "unavailable"
     return "active"
+
+
+class GhostMark(QLabel):
+    """The original Ghost Caret silhouette, colored by the native palette."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(48, 48)
+        self.setAccessibleName("BroTypist Ghost Caret")
+        self._recolor()
+
+    def _recolor(self) -> None:
+        image = QPixmap(str(asset_path("tray/active-template-48.png")))
+        painter = QPainter(image)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        painter.fillRect(image.rect(), self.palette().color(QPalette.ColorRole.WindowText))
+        painter.end()
+        self.setPixmap(image)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in {QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange}:
+            self._recolor()
+
+
+def _icon_action(parent: QWidget, title: str, symbol, callback, shortcut: str = "") -> QToolButton:
+    button = QToolButton(parent)
+    button.setIcon(parent.style().standardIcon(symbol))
+    button.setAccessibleName(title)
+    button.setToolTip(title + (f" ({shortcut})" if shortcut else ""))
+    button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    button.setAutoRaise(True)
+    if shortcut:
+        button.setShortcut(QKeySequence(shortcut))
+    button.clicked.connect(callback)
+    return button
 
 
 def _external_link(parent: QWidget, url: str) -> None:
@@ -337,19 +403,25 @@ class ShortcutRecorder(QPushButton):
         super().focusOutEvent(event)
 
 
-class ModelManager(QDialog):
+class ModelManager(QWidget):
     """Inventory and explicit download controls; no model is loaded by this UI."""
 
     def __init__(self, controller: Controller, parent=None):
         super().__init__(parent)
         self.controller = controller
         self._models: list[dict] = []
+        try:
+            self._recommended_id = recommended_preset().id
+        except ValueError:
+            self._recommended_id = ""
         self.setWindowTitle("BroTypist models")
         self.resize(580, 340)
         layout = QVBoxLayout(self)
         layout.addWidget(_label("Download verified local model weights, or select a GGUF file. Your writing is not uploaded."))
         self.models = QComboBox()
         self.models.setAccessibleName("Available local models")
+        self.models.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.models.setMinimumContentsLength(14)
         layout.addWidget(self.models)
         self.description = _label("")
         self.current = _label("")
@@ -375,19 +447,20 @@ class ModelManager(QDialog):
         files.addWidget(self.custom)
         files.addWidget(reveal)
         layout.addLayout(files)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
         self.models.currentIndexChanged.connect(self.refresh)
         self.download.clicked.connect(self._download)
         self.use.clicked.connect(self._use)
         self.cancel.clicked.connect(self.controller.cancel_download)
         self.custom.clicked.connect(self._custom)
         reveal.clicked.connect(lambda: self._call(system.reveal_models))
+        for button in (self.download, self.use, self.cancel, self.custom, reveal):
+            button.setAutoDefault(False)
+            button.setToolTip(button.text())
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(1000)
         self._refresh_timer.timeout.connect(self.refresh_inventory)
         self.refresh_inventory()
+
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -419,7 +492,13 @@ class ModelManager(QDialog):
         self.models.blockSignals(True)
         self.models.clear()
         for model in self._models:
-            self.models.addItem(f"{model['label']} — {_size(model['size_bytes'])}", model["id"])
+            badges = []
+            if model["installed"]:
+                badges.append("Installed")
+            if model["id"] == self._recommended_id:
+                badges.append("Recommended for this computer")
+            suffix = " · " + " · ".join(badges) if badges else ""
+            self.models.addItem(f"{model['label']} — {_size(model['size_bytes'])}{suffix}", model["id"])
         index = self.models.findData(selected)
         if index >= 0:
             self.models.setCurrentIndex(index)
@@ -438,7 +517,7 @@ class ModelManager(QDialog):
         if unavailable:
             details.append(unavailable)
         self.description.setText("\n\n".join(details))
-        self.current.setText(f"Selected model: {self.controller.config.model_path or 'None'}")
+        self.current.setText(f"Selected model: {_model_name(self.controller.config)}")
         self.download.setEnabled(bool(model) and not active and not unavailable)
         self.use.setEnabled(bool(model and model["installed"]) and not active and not unavailable)
         self.models.setEnabled(not active)
@@ -471,9 +550,12 @@ class ModelManager(QDialog):
             self.refresh()
 
     def _use(self) -> None:
-        model = self._models[self.models.currentIndex()]
+        index = self.models.currentIndex()
+        if not self.use.isEnabled() or not 0 <= index < len(self._models):
+            return
+        model = self._models[index]
         self._call(self.controller.set_model, str(model["path"]), model["prompt_style"])
-        self.refresh()
+        self.refresh_inventory()
 
     def _custom(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "Choose local GGUF model", "", "GGUF models (*.gguf)")
@@ -576,7 +658,7 @@ class SettingsWindow(QDialog):
         self.controller = shell.controller
         self.setWindowTitle("BroTypist Settings")
         self.resize(900, 620)
-        self.setMinimumSize(900, 620)
+        self.setMinimumSize(620, 440)
         self._bindings: dict[str, tuple] = {}
         self._baseline: dict = {}
         self._rules: dict[str, dict] = {}
@@ -590,6 +672,10 @@ class SettingsWindow(QDialog):
         columns.setSpacing(0)
         sidebar_column = QVBoxLayout()
         sidebar_column.setContentsMargins(12, 16, 12, 12)
+        brand = QHBoxLayout()
+        brand.addWidget(GhostMark())
+        brand.addWidget(_label("BroTypist"), 1)
+        sidebar_column.addLayout(brand)
         self.sidebar = QListWidget()
         self.sidebar.setAccessibleName("Settings sections")
         self.sidebar.addItems(PANES)
@@ -607,6 +693,7 @@ class SettingsWindow(QDialog):
         self.sidebar_status.setAccessibleName("Prediction and model status")
         sidebar_column.addWidget(self.sidebar_status)
         sidebar_widget = QWidget()
+        self._sidebar_widget = sidebar_widget
         sidebar_widget.setFixedWidth(210)
         sidebar_widget.setAutoFillBackground(True)
         sidebar_palette = sidebar_widget.palette()
@@ -624,9 +711,13 @@ class SettingsWindow(QDialog):
         bottom.setContentsMargins(12, 0, 12, 0)
         self.dirty_label = _label("Changes apply only after Save.")
         bottom.addWidget(self.dirty_label, 1)
-        self.revert = QPushButton("Revert")
+        self.revert = _icon_action(self, "Revert unsaved changes", QStyle.StandardPixmap.SP_BrowserReload, self.reload)
+        self.revert.setText("Revert")
+        self.revert.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.save = QPushButton("Save")
-        close = QPushButton("Close window")
+        self.save.setShortcut(QKeySequence("Ctrl+S"))
+        self.save.setToolTip("Save settings changes (Ctrl+S)")
+        close = _icon_action(self, "Close window", QStyle.StandardPixmap.SP_DialogCloseButton, self.close, "Ctrl+W")
         self.quit_button = QPushButton("Quit BroTypist")
         self.quit_button.setObjectName("quit")
         self.quit_button.setAutoDefault(False)
@@ -655,21 +746,34 @@ class SettingsWindow(QDialog):
             area.setWidget(page)
             self.pages.addWidget(area)
         self.sidebar.currentRowChanged.connect(self._pane_changed)
-        self.revert.clicked.connect(self.reload)
         self.save.clicked.connect(self.apply)
-        close.clicked.connect(self.close)
         quit_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Quit), self)
         quit_shortcut.activated.connect(self.shell.quit)
         self.reload()
         self.sidebar.setCurrentRow(0)
         for index in range(len(PANES)):
-            shortcut = QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self)
-            shortcut.activated.connect(lambda index=index: self.sidebar.setCurrentRow(index))
+            if index < 9:
+                shortcut = QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self)
+                shortcut.activated.connect(lambda index=index: self.sidebar.setCurrentRow(index))
         self.setStyleSheet(
             "QGroupBox { border: 1px solid palette(mid); border-radius: 10px; margin-top: 20px; padding: 14px; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 0 4px; }"
             "QCheckBox, QComboBox, QSpinBox, QLineEdit { min-height: 26px; }"
             "QPushButton { min-height: 26px; }")
+
+    def resizeEvent(self, event) -> None:
+        if hasattr(self, "_sidebar_widget"):
+            self._sidebar_widget.setFixedWidth(170 if self.width() < 760 else 210)
+        super().resizeEvent(event)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in {QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange} and hasattr(self, "sidebar"):
+            for index in range(len(PANES)):
+                self.sidebar.item(index).setIcon(_settings_icon(index))
+            palette = self.palette()
+            palette.setColor(QPalette.ColorRole.Window, palette.color(QPalette.ColorRole.AlternateBase))
+            self._sidebar_widget.setPalette(palette)
 
     def _group(self, layout: QVBoxLayout, title: str) -> QFormLayout:
         group = QGroupBox(title)
@@ -699,6 +803,9 @@ class SettingsWindow(QDialog):
 
     def _combo(self, form: QFormLayout, field: str, title: str, choices: tuple) -> QComboBox:
         control = QComboBox()
+        control.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        control.setMinimumContentsLength(14)
+        control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         for label, value in choices:
             control.addItem(label, value)
         form.addRow(title, control)
@@ -721,6 +828,14 @@ class SettingsWindow(QDialog):
 
     def _setup(self, layout) -> None:
         form = self._group(layout, "System access")
+        self.capabilities = {}
+        for key, title in (("native", "Native text access"), ("inline", "Same-line predictions"),
+                           ("model", "Local model"), ("context", "Optional context"),
+                           ("learning", "Encrypted learning")):
+            indicator = _label("")
+            indicator.setAccessibleName(title + " status")
+            self.capabilities[key] = indicator
+            form.addRow(title, indicator)
         self.native_diagnostic = _label("")
         form.addRow(self.native_diagnostic)
         permissions = QPushButton("Open accessibility / input permissions")
@@ -728,7 +843,7 @@ class SettingsWindow(QDialog):
         form.addRow(permissions)
         form.addRow(_label("Windows uses accessible edit controls and the native keyboard hook. Linux/X11 uses AT-SPI and replayable key grabs. KDE Wayland uses an explicitly selected native input method, not raw keyboard-device access. Only eligible, unprotected fields are used for predictions."))
         if sys.platform.startswith("linux"):
-            form.addRow(_label("KDE Wayland: BroTypist must be explicitly selected as the input method. Only one input method can occupy that slot. Password/sensitive hints, selections, excluded apps and mismatched AT-SPI fields are rejected. Ordinary inline completion is unavailable: there is no proven selection-safe, host-rendered inactive-text path. No ordinary preedit or suggestion popup is sent. KDE can place the separate manual control near an eligible caret. Quit exits BroTypist without changing KDE's selection or restarting the compositor."))
+            form.addRow(_label("KDE Wayland: explicitly select the packaged BroTypist input method; only one method can occupy that slot. Same-line text requires compositor presentation support, verified window geometry, host-font metrics and inactive composition. Unsupported fields stay silent: no ordinary preedit or suggestion popup. Passwords, selections, excluded apps and mismatched fields are rejected. Quit leaves KDE's selection unchanged."))
             install_method = QPushButton("Install KDE input-method entry…")
             install_method.clicked.connect(self._install_wayland_method)
             form.addRow(install_method)
@@ -741,7 +856,7 @@ class SettingsWindow(QDialog):
         self.setup_model = _label("")
         form.addRow(self.setup_model)
         self._check(form, "setup_completed", "Setup completed", "Check after reviewing system access and selecting a model. No permission is granted automatically.")
-        form.addRow(_label("Acceptance shortcuts are shown under Autocomplete and in Welcome. Native/system shortcuts are never replaced when no eligible suggestion is active."))
+        form.addRow(_label("Acceptance shortcuts are shown under Shortcuts and in Welcome. Native/system shortcuts are never replaced when no eligible suggestion is active."))
 
     def _install_wayland_method(self) -> None:
         try:
@@ -751,36 +866,37 @@ class SettingsWindow(QDialog):
             return
         QMessageBox.information(
             self, "KDE input-method entry installed",
-            f"Installed {path}\n\nUse Quit BroTypist, then choose BroTypist in KDE System Settings → Keyboard → Virtual Keyboard. KDE will start the native input-method instance. The selected input method was not changed. Ordinary inline completion remains unavailable on this path.")
+            f"Installed {path}\n\nUse Quit BroTypist, then choose BroTypist in KDE System Settings → Keyboard → Virtual Keyboard. KDE will start the native input-method instance. The selected input method was not changed. Check Setup for live compositor and field capabilities; installing this entry does not prove same-line support.")
 
     def _general(self, layout) -> None:
+        self._autocomplete(layout)
+        self._app_preferences(layout)
         form = self._group(layout, "Application")
-        self.login = QCheckBox("Launch BroTypist at login")
-        self.login.setToolTip("Applied immediately, only when you explicitly change this switch.")
-        self.login.toggled.connect(self._login_changed)
-        form.addRow(self.login)
-        self.login_status = _label("")
-        form.addRow(self.login_status)
         form.addRow(_label("Close window keeps BroTypist running when a system tray is available. Without a tray, closing offers Quit. Quit BroTypist below always stops typing assistance and exits; it does not change your desktop's selected input method."))
         self._check(form, "global_enabled", "Enable predictions", "Turn off to keep BroTypist running without suggesting anything.")
-        self._check(form, "enabled", "Enable in eligible apps by default", "App and website rules in Privacy can override this default.")
+        self._check(form, "enabled", "Enable in eligible apps by default", "App rules in App Settings can override this default.")
         self._check(form, "show_accessory", "Show accessory beside the text field", "Current-app predictions, temporary pause and Settings without leaving your text field.")
-        self._statistics(layout)
 
     def _ai_models(self, layout) -> None:
         form = self._group(layout, "Current local model")
         self.model_label = _label("")
         self.model_label.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         form.addRow("Selected model", self.model_label)
-        models = QPushButton("Manage local models…")
-        models.clicked.connect(self.open_models)
-        form.addRow(models)
-        reveal = QPushButton("Reveal model files")
-        reveal.clicked.connect(lambda: self._call(system.reveal_models))
-        form.addRow(reveal)
-        self._combo(form, "prompt_style", "Model prompt style", (("Text continuation", "continuation"), ("Instruction-tuned writing", "writing")))
-        self._inference(layout)
-        self._battery(layout)
+        self.model_manager = ModelManager(self.controller, self)
+        layout.addWidget(self.model_manager)
+        advanced = QPushButton("Advanced backend and file diagnostics")
+        advanced.setCheckable(True)
+        advanced.setAccessibleName("Show advanced model configuration")
+        advanced.setAutoDefault(False)
+        layout.addWidget(advanced)
+        self.model_advanced = QWidget()
+        details = QVBoxLayout(self.model_advanced)
+        self._combo(self._group(details, "Model format"), "prompt_style", "Model prompt style",
+                    (("Text continuation", "continuation"), ("Instruction-tuned writing", "writing")))
+        self._inference(details)
+        self.model_advanced.hide()
+        advanced.toggled.connect(self.model_advanced.setVisible)
+        layout.addWidget(self.model_advanced)
 
     def _autocomplete(self, layout) -> None:
         form = self._group(layout, "Suggestions")
@@ -788,25 +904,19 @@ class SettingsWindow(QDialog):
         self._combo(form, "completion_length", "Maximum completion length", (("Current word only", "word"), ("Short", "short"), ("Medium", "medium"), ("Long", "long")))
         self._spin(form, "debounce_ms", "Typing pause before completion", 100, 5000, " ms")
         self._spin(form, "min_chars", "Minimum typed characters", 1, 1000)
-        self._shortcuts(layout)
-        self._emoji(layout)
-        self._labs(layout)
 
-    def _languages(self, layout) -> None:
-        layout.addWidget(_label("Language support comes from the selected local model. BroTypist does not expose a separate language detector or language-quality selector. Use instructions to request your preferred language; results depend on the model."))
-        self.language_model = _label("")
-        layout.addWidget(self.language_model)
-        self._personalization(layout)
-
-    def _privacy(self, layout) -> None:
-        layout.addWidget(_label("Predictions run on this computer. Local GGUF inference does not upload writing. Optional local servers must use loopback URLs; their own logging and model residency are managed by that server. Downloads fetch model weights."))
-        self._setup(layout)
-        self._context(layout)
-        self._history_controls(layout)
-        self._app_settings(layout)
+    def _app_preferences(self, layout) -> None:
+        form = self._group(layout, "Application")
+        self.login = QCheckBox("Launch BroTypist at login")
+        self.login.setToolTip("Applied immediately, only when you explicitly change this switch.")
+        self.login.toggled.connect(self._login_changed)
+        form.addRow(self.login)
+        self.login_status = _label("")
+        form.addRow(self.login_status)
 
     def _context(self, layout) -> None:
         layout.addWidget(_label("Additional context is optional. It is read only for an eligible completion, never saved as an image or uploaded. Leave these switches off when working with sensitive content."))
+        layout.addWidget(_label("Predictions run on this computer. Optional local servers must use loopback URLs; their own logging is managed by that server. Downloads fetch model weights."))
         form = self._group(layout, "Optional local context")
         clipboard = self._check(form, "clipboard_context", "Include clipboard text")
         screen = self._check(form, "screen_context", "Include focused-window Accessibility text",
@@ -827,6 +937,7 @@ class SettingsWindow(QDialog):
         self.instructions.setPlaceholderText("For example: concise sentences; British English.")
         form.addRow(self.instructions)
         self._bind("custom_instructions", self.instructions, self.instructions.toPlainText, self.instructions.setPlainText, self.instructions.textChanged)
+        self._history_controls(layout)
 
     def _history_controls(self, layout) -> None:
         form = self._group(layout, "Encrypted local writing learning")
@@ -855,7 +966,7 @@ class SettingsWindow(QDialog):
         form.addRow(_label("Choose a numbered suggestion with its number key while the chooser is visible. Escape dismisses it according to your shortcut settings."))
         if sys.platform.startswith("linux"):
             form.parentWidget().setEnabled(False)
-            layout.addWidget(_label("Emoji and emoticon conversion are unavailable on Linux: AT-SPI does not provide atomic typed-suffix replacement. Ordinary text completions and alternative continuations remain available."))
+            layout.addWidget(_label("Emoji and emoticon conversion are unavailable on Linux: AT-SPI does not provide atomic typed-suffix replacement. Other features remain governed by the native bridge's safety checks; see Setup for this desktop's capabilities."))
         elif sys.platform == "win32":
             layout.addWidget(_label("Typed-suffix conversion requires a native Windows Edit control. Other UI Automation controls are left unchanged when exact atomic replacement is unavailable."))
 
@@ -881,6 +992,7 @@ class SettingsWindow(QDialog):
 
     def _battery(self, layout) -> None:
         layout.addWidget(_label("These limits apply while the system reports battery power. They do not change your normal model or completion preferences."))
+        layout.addWidget(self.shell.power_ui.make_card("pane"))
         form = self._group(layout, "While on battery")
         self._check(form, "battery_on_demand", "Generate only when requested")
         self._combo(form, "battery_model", "Model on battery", (("Same as usual", "same"),) + tuple((preset.label, preset.id) for preset in PRESETS))
@@ -931,12 +1043,15 @@ class SettingsWindow(QDialog):
         self._spin(form, "synonyms_delay_ms", "Selection delay", 100, 10000, " ms")
         if sys.platform.startswith("linux"):
             form.parentWidget().setEnabled(False)
-            layout.addWidget(_label("Selected-text synonyms are unavailable on Linux because AT-SPI has no atomic selection-replacement API. Alternative continuations remain available."))
+            layout.addWidget(_label("Selected-text synonyms are unavailable on Linux because AT-SPI has no atomic selection-replacement API. Alternative continuations require verified native insertion and are not an ordinary-completion fallback."))
         elif sys.platform == "win32":
             layout.addWidget(_label("Selected-text synonyms require a native Edit control or a UI Automation control with an exact, replaceable selection. Unsupported controls remain unchanged."))
 
     def _inference(self, layout) -> None:
         form = self._group(layout, "Local inference configuration")
+        self.model_path_diagnostic = _label("")
+        self.model_path_diagnostic.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        form.addRow("Selected GGUF file", self.model_path_diagnostic)
         self._combo(form, "backend", "Backend", (("Local GGUF process", "gguf"), ("Local Ollama server", "ollama"), ("Local OpenAI-compatible server", "openai")))
         self._text(form, "endpoint", "Loopback server URL")
         self._text(form, "model", "Local server model name")
@@ -1006,21 +1121,16 @@ class SettingsWindow(QDialog):
         self.update_progress = QProgressBar()
         self.update_progress.setAccessibleName("Software update download progress")
         updates.addRow(self.update_progress)
-        buttons = QHBoxLayout()
-        self.update_check = QPushButton("Check for Updates…")
-        self.update_check.clicked.connect(self.shell.check_updates)
-        self.update_download = QPushButton("Download Update")
-        self.update_download.clicked.connect(lambda: self.shell._update_action(self.shell.updates.start_download))
-        self.update_cancel = QPushButton("Cancel")
-        self.update_cancel.clicked.connect(lambda: self.shell._update_action(self.shell.updates.cancel))
-        self.update_install = QPushButton("Install & Relaunch")
-        self.update_install.clicked.connect(self.shell.install_update)
-        for name, button in (("update_check", self.update_check), ("update_download", self.update_download),
-                             ("update_cancel", self.update_cancel), ("update_install", self.update_install)):
-            button.setObjectName(name)
-            button.setAutoDefault(False)
-            buttons.addWidget(button)
-        updates.addRow(buttons)
+        self.update_progress.setVisible(False)
+        self.update_primary = QPushButton()
+        self.update_primary.setObjectName("update_primary")
+        self.update_primary.setAutoDefault(False)
+        self.update_primary.setAccessibleName("Software update action")
+        updates.addRow(self.update_primary)
+        self._update_intent = ""
+        self._pressed_update_intent = None
+        self.update_primary.pressed.connect(self._capture_update_intent)
+        self.update_primary.clicked.connect(self._perform_primary_update)
         self.refresh_updates()
 
     def refresh_updates(self, snapshot: dict | None = None) -> None:
@@ -1042,15 +1152,17 @@ class SettingsWindow(QDialog):
                                 "macOS may require approval of the replacement app and review of system access.")
         self.update_installation.setText(explanation)
         shutting_down = self.shell._shutdown_pending or self.shell._stopping or self.shell._stopped
-        busy = state in {"checking", "downloading", "installing"}
-        self.update_check.setEnabled(not busy and not shutting_down)
         can_install = bool(status.get("installable")) or kind == "linux_debian"
-        self.update_download.setEnabled(state == "available" and can_install and not shutting_down)
-        self.update_cancel.setVisible(state in {"checking", "downloading"})
-        self.update_cancel.setEnabled(not shutting_down)
-        self.update_install.setText("Open System Installer" if kind == "linux_debian" else "Install & Relaunch")
-        self.update_install.setVisible(can_install)
-        self.update_install.setEnabled(state == "ready" and can_install and not shutting_down)
+        intent, title = (
+            ("cancel", "Cancel") if state in {"checking", "downloading"} else
+            ("releases", "Open Releases…") if state in {"available", "ready"} and not can_install else
+            ("download", "Download Update") if state == "available" and can_install else
+            ("install", "Open System Installer" if kind == "linux_debian" else "Install & Relaunch")
+            if state == "ready" and can_install else ("check", "Check for Updates…"))
+        self._update_intent = intent
+        self.update_primary.setText(title)
+        self.update_primary.setToolTip(title)
+        self.update_primary.setEnabled(not shutting_down and state != "installing")
         self.update_progress.setVisible(state == "downloading")
         received, total = int(status.get("received") or 0), int(status.get("total") or 0)
         if total > 0:
@@ -1059,6 +1171,16 @@ class SettingsWindow(QDialog):
             self.update_progress.setFormat(f"{_size(received)} / {_size(total)} · %p%")
         else:
             self.update_progress.setRange(0, 0)
+
+    def _capture_update_intent(self) -> None:
+        self._pressed_update_intent = self._update_intent
+
+    def _perform_primary_update(self) -> None:
+        # Intent belongs to the user's press, not the service's release-time
+        # state. A completed transfer cannot turn a held Cancel into Install.
+        intent, self._pressed_update_intent = self._pressed_update_intent, None
+        if intent is not None:
+            self.shell.perform_update_intent(intent)
 
     def _reveal_settings(self) -> None:
         from PySide6.QtCore import QUrl
@@ -1077,15 +1199,17 @@ class SettingsWindow(QDialog):
 
     def _pane_changed(self, index: int) -> None:
         self.pages.setCurrentIndex(index)
-        if 0 <= index < len(PANES) and PANES[index] == "General":
+        if 0 <= index < len(PANES) and PANES[index] == "Statistics":
             self.refresh_stats()
+        self.shell.power_ui.set_visibility(pane=0 <= index < len(PANES) and PANES[index] == "Battery" and self.isVisible())
 
     def show_pane(self, pane: str = "General") -> None:
         for index, name in enumerate(PANES):
-            if name.casefold() == pane.casefold():
+            if name.casefold().replace(" ", "") == pane.casefold().replace(" ", ""):
                 self.sidebar.setCurrentRow(index)
                 break
         self.show()
+        self.shell.power_ui.set_visibility(pane=PANES[self.pages.currentIndex()] == "Battery")
         self.raise_()
         self.activateWindow()
 
@@ -1105,6 +1229,10 @@ class SettingsWindow(QDialog):
         self.save.setEnabled(bool(count))
         self.revert.setEnabled(bool(count))
         self.dirty_label.setText("Unsaved changes" if count else "All changes saved")
+
+    def hideEvent(self, event) -> None:
+        self.shell.power_ui.set_visibility(pane=False)
+        super().hideEvent(event)
 
     def reload(self) -> None:
         self._loading = True
@@ -1226,19 +1354,23 @@ class SettingsWindow(QDialog):
         self._delete_history(app_id=key[4:])
 
     def _refresh_rules(self) -> None:
+        selected = self._selected_rule()
+        vertical = self.rule_table.verticalScrollBar().value()
+        horizontal = self.rule_table.horizontalScrollBar().value()
         self.rule_table.setRowCount(len(self._rules))
         for row, (key, rule) in enumerate(sorted(self._rules.items())):
             values = [key] + ["Default" if name not in rule else "Enabled" if rule[name] else "Disabled" for name in ("enabled", "tab_enabled", "record_history")]
             for column, value in enumerate(values):
                 self.rule_table.setItem(row, column, QTableWidgetItem(value))
+            if key == selected:
+                self.rule_table.setCurrentCell(row, 0)
+        self.rule_table.verticalScrollBar().setValue(vertical)
+        self.rule_table.horizontalScrollBar().setValue(horizontal)
 
     def open_models(self) -> None:
-        if self.model_manager is None:
-            self.model_manager = ModelManager(self.controller, self)
+        self.show_pane("AI Models")
         self.model_manager.refresh_inventory()
-        self.model_manager.show()
-        self.model_manager.raise_()
-        self.model_manager.activateWindow()
+        self.model_manager.models.setFocus()
 
     def refresh_stats(self, *_args) -> None:
         try:
@@ -1263,14 +1395,24 @@ class SettingsWindow(QDialog):
         self.window_context_status.setText(str(status.get("context_message") or "Context not requested"))
         self.notice.setText(self.shell.tray_notice or message)
         self.native_diagnostic.setText(str(status.get("native_status", "Native bridge status unavailable.")))
-        model = self.controller.config.model_path or "None selected — choose or download a model."
+        model = _model_name(self.controller.config)
         self.model_label.setText(model)
+        self.model_path_diagnostic.setText(self.controller.config.model_path or "None selected")
         self.setup_model.setText(f"Selected model: {model}")
-        self.language_model.setText(f"Current model: {_model_name(self.controller.config)}\nNo language list is imposed by BroTypist. Consult the model's documentation for supported languages.")
+        self.setup_model.setAccessibleName("Selected local model")
+        self.capabilities["native"].setText(str(status.get("native_status") or "Not verified"))
+        self.capabilities["inline"].setText(str(status.get("inline_message") or
+            ("Available in this field" if status.get("inline_available") is True else "Not verified in this field")))
+        ready = bool(self.controller.config.model_path and Path(self.controller.config.model_path).is_file())
+        self.capabilities["model"].setText("Configured local server — availability checked on request" if self.controller.config.backend != "gguf" else
+            "Installed and selected" if ready else "Choose an installed model or request a download")
+        self.capabilities["context"].setText(str(status.get("context_message") or "Not requested"))
+        self.capabilities["learning"].setText("Enabled by explicit consent" if self.controller.config.record_history else "Off by default — app recording overrides remain separate")
         state = _tray_state(status, self.controller.config)
         self.sidebar_status.setText(f"{state.capitalize()} · {_model_name(self.controller.config)}")
         self.current_app.setText(f"Current application: {status.get('current_app') or 'No eligible application'}\nSession completions: {'Enabled' if status.get('current_app_enabled', self.controller.config.enabled) else 'Disabled'}\nObservable website: {status.get('current_domain') or 'Unknown / not available'}")
-        self.battery_status.setText("Currently on battery power." if status.get("on_battery") else "System is not reporting battery power.")
+        presentation = self.shell.power_ui.presentation
+        self.battery_status.setText(f"{presentation.title}\n{presentation.detail}")
         try:
             info = self.controller.history_info()
             self.history_status.setText(f"{info['count']:,} encrypted records · {info['bytes']:,} bytes" if info["available"] else f"Secure history unavailable: {info.get('error') or 'OS secret storage is not available.'}")
@@ -1346,7 +1488,7 @@ class WelcomeWindow(QDialog):
         self._finishing = False
         self.setWindowTitle("Welcome to BroTypist")
         self.resize(760, 580)
-        self.setMinimumSize(760, 580)
+        self.setMinimumSize(560, 420)
         self.setObjectName("welcome")
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1427,9 +1569,9 @@ class WelcomeWindow(QDialog):
         layout.addWidget(_label("Text before cursor → local model → suggestion"))
         layout.addWidget(_label("BroTypist reads eligible focused fields through the native bridge. Protected fields and excluded applications are skipped. Some applications cannot provide safe text access or geometry and remain unsupported."))
         layout.addWidget(_label("Local GGUF predictions do not upload your writing. Alternative server backends are restricted to loopback addresses. Model downloads use the network; a local server's own logging and network behavior are controlled by that server."))
-        layout.addWidget(_label("Clipboard and focused-window Accessibility context are optional. Protected or hidden controls are excluded and unavailable providers return no context. Optional personalization history stores typing in OS-backed encrypted local storage; per-app recording overrides can enable it even when the global default is off. Review and delete it in Privacy."))
-        privacy = QPushButton("Review Privacy settings…")
-        privacy.clicked.connect(lambda: self.shell.show_settings("Privacy"))
+        layout.addWidget(_label("Clipboard and focused-window Accessibility context are optional. Protected or hidden controls are excluded and unavailable providers return no context. Optional personalization history uses OS-backed encrypted local storage. Review context and learning separately in Settings."))
+        privacy = QPushButton("Review optional context…")
+        privacy.clicked.connect(lambda: self.shell.show_settings("Context"))
         layout.addWidget(privacy)
 
     def _step_2(self, layout) -> None:
@@ -1440,7 +1582,7 @@ class WelcomeWindow(QDialog):
         permissions.clicked.connect(lambda: self.shell._call(system.open_permissions, "accessibility"))
         layout.addWidget(permissions)
         if sys.platform.startswith("linux"):
-            layout.addWidget(_label("KDE Wayland requires explicitly selecting BroTypist as the native input method in Virtual Keyboard settings. Only one method can occupy that slot. Manual controls are supported for eligible text inputs; ordinary inline completion is unavailable, with no preedit or suggestion popup substituted. Quit leaves KDE's selection unchanged and does not restart the compositor."))
+            layout.addWidget(_label("KDE Wayland requires explicitly selecting the packaged BroTypist input method in Virtual Keyboard settings. Only one method can occupy that slot. Same-line predictions require verified compositor, window, typography and composition state; unsupported fields stay silent, without preedit or a suggestion popup. Quit leaves KDE's selection unchanged."))
             install = QPushButton("Install KDE input-method entry…")
             install.clicked.connect(self._install_wayland)
             layout.addWidget(install)
@@ -1452,25 +1594,22 @@ class WelcomeWindow(QDialog):
         layout.addWidget(self.access_reviewed)
 
     def _install_wayland(self) -> None:
-        self.shell.show_settings("General")
+        self.shell.show_settings("Setup")
         self.shell.settings._install_wayland_method()
 
     def _step_3(self, layout) -> None:
         layout.addWidget(_label("Choose from the existing local model catalog or a GGUF file. Downloads and model changes happen only when you explicitly request them. Your current model and cache stay unchanged until then."))
         self.model_status = _label("")
         layout.addWidget(self.model_status)
-        models = QPushButton("Choose or download a local model…")
-        models.clicked.connect(self._models)
-        layout.addWidget(models)
+        self.model_manager = ModelManager(self.controller, self)
+        layout.addWidget(self.model_manager)
         layout.addWidget(_label("Local server configuration is available in Settings → AI Models. A configured server must already be running; Welcome does not start or download one."))
 
     def _models(self) -> None:
         self._close_preview()
-        if self.model_manager is None:
-            self.model_manager = ModelManager(self.controller, self)
-        self.model_manager.show()
-        self.model_manager.raise_()
-        self.model_manager.activateWindow()
+        self._select(3)
+        self.model_manager.refresh_inventory()
+        self.model_manager.models.setFocus()
 
     def _step_4(self, layout) -> None:
         layout.addWidget(_label("Type below to ask your actual configured local model. Suggestions use only this field; nothing is inserted into another app or saved as personalization history."))
@@ -1692,6 +1831,8 @@ class WelcomeWindow(QDialog):
 class CaretOverlay(QWidget):
     """Transparent, mouse-through ghost text; never an editable/focused window."""
 
+    presented = Signal(object, str, str)
+
     def __init__(self):
         super().__init__(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -1700,6 +1841,12 @@ class CaretOverlay(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setAccessibleName("BroTypist completion suggestion")
         self._ghost = None
+        self._presentation = None
+        self._painted = False
+        self._pending_ack = None
+        self._ack_timer = QTimer(self)
+        self._ack_timer.setSingleShot(True)
+        self._ack_timer.timeout.connect(self._acknowledge_paint)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.surface = QFrame()
@@ -1720,8 +1867,9 @@ class CaretOverlay(QWidget):
             "QFrame#suggestion_chip QLabel { color: palette(toolTipText); background: transparent; border: none; }")
 
     def present(self, event: dict, point: QPoint) -> None:
+        self.hide()
         if event.get("mode", "completion") == "completion" or not event.get("choices"):
-            self.hide()
+            self.presented.emit(event.get("key"), "", event.get("mode", "completion"))
             return
         self._ghost = None
         self.surface.show()
@@ -1738,12 +1886,21 @@ class CaretOverlay(QWidget):
             if point.y() + self.height() > bounds.bottom() - 40:
                 point.setY(point.y() - self.height() - int(event.get("line_height", 20)) - 12)
             point.setY(max(bounds.top(), min(point.y(), bounds.bottom() - self.height() + 1)))
+            if self.width() > bounds.width() or self.height() > bounds.height():
+                self.presented.emit(event.get("key"), "", event.get("mode", "completion"))
+                return
+        else:
+            self.presented.emit(event.get("key"), "", event.get("mode", "completion"))
+            return
+        self._presentation = (event.get("key"), "\n".join(choices[:9]), event.get("mode", "completion"))
+        self._painted = False
         self.move(point)
         self.show()
 
 
     def present_inline(self, event: dict, point: QPoint, *, ratio: float) -> None:
         self.hide()
+        self.presented.emit(event.get("key"), "", "completion")
         try:
             render = InlineRender(**event["render"])
             if not event.get("inline") or not render.valid(event.get("rect")):
@@ -1760,7 +1917,18 @@ class CaretOverlay(QWidget):
             text = str(event.get("text") or "").split("\n", 1)[0].split("\r", 1)[0]
             x, y, width, height = render.clip_rect
             available = (x + width - float(event["rect"][0])) / ratio
-            width = min(metrics.horizontalAdvance(text), available)
+            # Draw and acknowledge only complete graphemes that fit. Merely
+            # clipping a longer candidate would arm invisible acceptance text.
+            boundaries = QTextBoundaryFinder(QTextBoundaryFinder.BoundaryType.Grapheme, text)
+            visible = ""
+            utf16 = text.encode("utf-16-le")
+            while (end := boundaries.toNextBoundary()) >= 0:
+                prefix = utf16[:end * 2].decode("utf-16-le")
+                if metrics.horizontalAdvance(prefix) > available:
+                    break
+                visible = prefix
+            text = visible
+            width = metrics.horizontalAdvance(text)
             if not text or width < 1:
                 return
             import math
@@ -1771,21 +1939,42 @@ class CaretOverlay(QWidget):
             screen = QApplication.screenAt(point)
             if screen is None or not screen.geometry().contains(self.geometry()):
                 return
+            self._presentation = (event.get("key"), text, "completion")
+            self._painted = False
             self.show()
             self.update()
         except (KeyError, TypeError, ValueError):
             self._ghost = None
 
+    def hideEvent(self, event):
+        previous, self._presentation = self._presentation, None
+        self._painted = False
+        self._ack_timer.stop()
+        self._pending_ack = None
+        if previous is not None:
+            self.presented.emit(previous[0], "", previous[2])
+        super().hideEvent(event)
+
+    def _acknowledge_paint(self) -> None:
+        presentation, self._pending_ack = self._pending_ack, None
+        if presentation is not None and self.isVisible() and self._presentation is presentation:
+            self.presented.emit(*presentation)
+
     def paintEvent(self, event):
         if self._ghost is None:
-            return super().paintEvent(event)
-        text, font, baseline = self._ghost
-        painter = QPainter(self)
-        painter.setFont(font)
-        painter.setPen(QColor("#909299"))
-        painter.setClipRect(self.rect())
-        painter.drawText(QPointF(0, baseline), text)
-        painter.end()
+            super().paintEvent(event)
+        else:
+            text, font, baseline = self._ghost
+            painter = QPainter(self)
+            painter.setFont(font)
+            painter.setPen(self.palette().color(QPalette.ColorRole.PlaceholderText))
+            painter.setClipRect(self.rect())
+            painter.drawText(QPointF(0, baseline), text)
+            painter.end()
+        if self._presentation is not None and not self._painted:
+            self._painted = True
+            self._pending_ack = self._presentation
+            self._ack_timer.start(0)
 
 
 class Accessory(QWidget):
@@ -1838,7 +2027,14 @@ class MenuAgent:
         self._clipboard_reader = ClipboardReader(app)
         self.controller.set_clipboard_reader(self._clipboard_reader.read)
         self.controller.set_screen_reader(system.screen_text)
-        self.controller.set_battery_reader(system.on_battery)
+        self.power_sampler = PowerSampler(app)
+        self.power_ui = QtPowerUI(app)
+        self.power_ui.shell = self
+        self._power_reading = dict(self.power_sampler.reading)
+        self.controller.set_battery_reader(
+            lambda: not (self._power_reading.get("available") is True
+                         and self._power_reading.get("on_battery") is False))
+        self.power_sampler.readingReady.connect(self._power_changed)
         self._tray_requested = not no_tray
         self.tray_available = not no_tray and QSystemTrayIcon.isSystemTrayAvailable()
         self.tray_notice = "" if self.tray_available else (
@@ -1847,6 +2043,7 @@ class MenuAgent:
         self.settings: SettingsWindow | None = None
         self.welcome: WelcomeWindow | None = None
         self.overlay = CaretOverlay()
+        self.overlay.presented.connect(self.controller.presentation_result)
         self.accessory = Accessory(self)
         self.choices: list[str] = []
         self._stopped = False
@@ -1887,9 +2084,10 @@ class MenuAgent:
             self.controller.start()
         except Exception as exc:
             # Native backend failure must leave a recoverable settings surface.
-            self.tray_notice = f"Global typing could not start: {exc}. Review General and system access."
-            self.show_settings("General")
+            self.tray_notice = f"Global typing could not start: {exc}. Review Setup and system access."
+            self.show_settings("Setup")
         self.timer.start()
+        self.power_sampler.start()
         # background means no unnecessary foreground activation, never bypassing
         # first-run setup or hiding all controls when the tray is unavailable.
         if not self.tray_available:
@@ -1906,52 +2104,35 @@ class MenuAgent:
         self._watch_menu(menu)
         # Plain QActions are intentionally the complete menu: KDE's SNI/DBus
         # exporter cannot display essential controls hidden in QWidgetActions.
-        status = menu.addAction("BroTypist")
-        status.setEnabled(False)
-        status.setObjectName("status")
-        for name in ("context", "model", "detail"):
-            action = menu.addAction("")
-            action.setObjectName(name)
-            action.setEnabled(False)
-        menu.addSeparator()
-        enabled = menu.addAction("Predictions")
+        enabled = menu.addAction("Enable predictions")
         enabled.setCheckable(True)
         enabled.setChecked(bool(self.controller.config.global_enabled))
         enabled.setObjectName("enabled")
         enabled.triggered.connect(lambda checked: self._menu_action(self._set_predictions, checked))
-        resume = menu.addAction("Resume now", lambda: self._invoke("toggle"))
-        resume.setObjectName("resume")
         pause = menu.addMenu("Pause")
         pause.menuAction().setObjectName("pause")
         self._watch_menu(pause)
-        for minutes in (5, 15, 60):
-            title = "Pause for 1 hour" if minutes == 60 else f"Pause for {minutes} minutes"
-            pause.addAction(title, lambda _checked=False, minutes=minutes: self._menu_action(self.controller.pause, minutes))
-        pause.addAction("Pause until tomorrow", lambda: self._menu_action(self._pause_until_tomorrow))
-        app_toggle = menu.addAction("Turn off in current application (this session)")
+        pause.addAction("For 1 hour", lambda: self._menu_action(self.controller.pause, 60)).setObjectName("pause_hour")
+        pause.addAction("Until tomorrow", lambda: self._menu_action(self._pause_until_tomorrow)).setObjectName("pause_tomorrow")
+        pause.addAction("Resume now", lambda: self._menu_action(self.controller.pause, 0)).setObjectName("resume")
+        app_toggle = menu.addAction("Predictions in Current App")
         app_toggle.setObjectName("app_toggle")
         app_toggle.setCheckable(True)
-        current = self.controller.status()
-        app_toggle.setChecked(bool(current.get("current_app_enabled", self.controller.config.enabled)))
-        app_toggle.setEnabled(bool(current.get("current_app")))
-        app_toggle.triggered.connect(lambda _checked: self._invoke("app_toggle"))
+        app_toggle.setToolTip("Changes predictions for this app for the current session only.")
+        app_toggle.triggered.connect(
+            lambda _checked: self._menu_action(self._toggle_field_app, *app_toggle.data()))
         menu.addSeparator()
-        menu.addAction("Request completion", lambda: self._invoke("force")).setObjectName("force")
-        menu.addAction("Alternative words", lambda: self._invoke("alternatives")).setObjectName("alternatives")
-        synonyms = menu.addAction("Selected-text synonyms", lambda: self._invoke("synonyms"))
-        synonyms.setObjectName("synonyms")
-        if sys.platform.startswith("linux"):
-            synonyms.setEnabled(False)
-            synonyms.setToolTip("Unavailable: AT-SPI cannot atomically replace selected text.")
-        menu.addSeparator()
-        menu.addAction("Settings…", lambda: self._menu_action(self.show_settings, "General"))
-        menu.addAction("Welcome…", lambda: self._menu_action(self.show_welcome))
-        menu.addAction("Models…", lambda: self._menu_action(self.open_models))
+        settings = menu.addAction("Settings…", lambda: self._menu_action(self.show_settings, "General"))
+        if sys.platform == "darwin":
+            settings.setShortcut(QKeySequence("Ctrl+,"))
         menu.addAction("Check for Updates…", lambda: self._menu_action(self.check_updates)).setObjectName("check_updates")
         menu.addSeparator()
         # DBus tray exporters need not emit QMenu.aboutToHide when an exported
         # action is invoked. Quit must not depend on that menu-tracking fence.
-        menu.addAction("Quit BroTypist", self.quit).setObjectName("quit")
+        quit_action = menu.addAction("Quit BroTypist", self.quit)
+        quit_action.setObjectName("quit")
+        if sys.platform == "darwin":
+            quit_action.setShortcut(QKeySequence.StandardKey.Quit)
         self.refresh_menu(menu)
         return menu
 
@@ -2000,8 +2181,13 @@ class MenuAgent:
         self._native_refresh_pending = False
         self.tick()
 
-    def _native_action(self, identifier: str) -> None:
+    def _native_action(self, identifier: str, payload: dict | None = None) -> None:
         if self._stopped:
+            return
+        if identifier == "presentation":
+            if isinstance(payload, dict):
+                self.controller.presentation_result(payload.get("key"), payload.get("text", ""),
+                                                    payload.get("mode", "completion"))
             return
         if identifier == "context_changed":
             if not self._native_refresh_pending:
@@ -2054,10 +2240,12 @@ class MenuAgent:
         self._tracking_menus.add(menu)
         self._menu_session = True
         self._sync_shortcuts()
+        self.power_ui.set_visibility(menu=True)
 
     def _menu_closed(self, menu: QMenu) -> None:
         self._tracking_menus.discard(menu)
         if not self._tracking_menus:
+            self.power_ui.set_visibility(menu=False)
             # QAction.triggered can follow aboutToHide. Keep capture and native
             # interception suspended until the whole selection event unwinds.
             QTimer.singleShot(0, self._finish_menu_session)
@@ -2105,9 +2293,6 @@ class MenuAgent:
             self.show_settings("General")
             _error(self.settings, exc)
 
-    def _invoke(self, action: str) -> None:
-        self._menu_action(self.controller.invoke, action)
-
     def _activated(self, reason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.show_settings("General")
@@ -2119,42 +2304,28 @@ class MenuAgent:
     def refresh_menu(self, menu: QMenu | None = None) -> None:
         status = self.controller.status()
         config = self.controller.config
-        state = _tray_state(status, config)
-        paused = state == "paused"
-        remaining = max(0, float(status.get("paused_until", 0)) - time.monotonic())
-        resume_at = datetime.fromtimestamp(time.time() + remaining).strftime("%H:%M")
-        app_name = str(status.get("current_app") or "No eligible application")
-        backend = {"gguf": "GGUF process", "ollama": "local Ollama", "openai": "local compatible server"}.get(config.backend, config.backend)
+        paused = float(status.get("paused_until", 0)) > time.monotonic()
+        app = str(status.get("current_app") or "")
+        domain = str(status.get("current_domain") or "")
+        app_name = app[:29] + "…" if len(app) > 30 else app or "Current App"
         for action in (menu or self.menu).actions():
             name = action.objectName()
-            if name == "status":
-                label = "Needs attention" if status.get("state") == "error" else {
-                    "active": "Active", "paused": "Paused", "loading": "Loading model",
-                    "unavailable": "Unavailable here", "off": "Predictions off"}[state]
-                action.setText(f"BroTypist — {label}")
-                action.setIcon(tray_icon("active" if state == "unavailable" else state))
-            elif name == "context":
-                action.setText((f"Resumes at {resume_at}" if paused else
-                                "Warming up model…" if state == "loading" else
-                                str(status.get("inline_message") or "Inline unavailable here") if not status.get("inline_available", True) else
-                                f"Predicting in {app_name}" if status.get("current_app") else app_name).replace("&", "&&"))
-            elif name == "model":
-                action.setText(f"Model: {_model_name(config)} · {backend}".replace("&", "&&"))
-            elif name == "detail":
-                download = status.get("download") or {}
-                action.setText(str(download.get("error") or status.get("message") or "Local predictions").replace("&", "&&"))
-            elif name == "enabled":
+            if name == "enabled":
                 action.setChecked(bool(config.global_enabled))
-            elif name == "resume":
-                action.setVisible(paused)
-                action.setEnabled(paused)
             elif name == "pause":
-                action.setEnabled(bool(config.global_enabled) and not paused)
+                action.setEnabled(bool(config.global_enabled) or paused)
+                for child in action.menu().actions():
+                    if child.objectName() == "resume":
+                        child.setVisible(paused)
+                        child.setEnabled(paused)
+                    else:
+                        child.setEnabled(bool(config.global_enabled))
             elif name == "app_toggle":
                 allowed = bool(status.get("current_app_enabled", config.enabled))
-                action.setText(f"Turn {'off' if allowed else 'on'} in {app_name[-70:]} (this session)".replace("&", "&&"))
-                action.setChecked(allowed)
-                action.setEnabled(bool(status.get("current_app")))
+                action.setText(f"Predictions in {app_name}".replace("&", "&&"))
+                action.setChecked(allowed and bool(app))
+                action.setEnabled(bool(app))
+                action.setData((app, domain))
 
     def show_settings(self, pane: str = "General") -> None:
         if isinstance(pane, str) and pane.casefold() == "welcome":
@@ -2175,9 +2346,33 @@ class MenuAgent:
         self.welcome.raise_()
         self.welcome.activateWindow()
 
-    def open_models(self) -> None:
-        self.show_settings("AI Models")
-        self.settings.open_models()
+    def _power_changed(self, reading: dict) -> None:
+        self._power_reading = dict(reading)
+        if self._stopping or self._stopped or self._shutdown_pending:
+            return
+        self.power_ui.present(reading, allow_help=True)
+        self.tray.setToolTip(f"{self.tray.toolTip().splitlines()[0]}\n{self.power_ui.presentation.title}")
+        if self.settings and self.settings.isVisible():
+            self.settings.refresh_status()
+
+    def perform_update_intent(self, intent: str) -> None:
+        if self._shutdown_pending or self._stopping or self._stopped:
+            return
+        status = self.updates.snapshot()
+        state = status.get("state", "idle")
+        if intent == "cancel":
+            if state in {"checking", "downloading"}:
+                self._update_action(self.updates.cancel)
+        elif intent == "download":
+            if state == "available":
+                self._update_action(self.updates.start_download)
+        elif intent == "install":
+            if state == "ready":
+                self.install_update()
+        elif intent == "check" and state not in {"checking", "downloading", "installing"}:
+            self.check_updates()
+        elif intent == "releases" and state in {"available", "ready"}:
+            _external_link(self.settings, REPOSITORY_URL + "/releases")
 
     def check_updates(self) -> None:
         if self._shutdown_pending or self._stopped:
@@ -2268,6 +2463,16 @@ class MenuAgent:
             self.clear_overlay()
             return
         if self._native_surface:
+            if event.get("mode", "completion") == "completion":
+                self.overlay.hide()
+                self.accessory.hide()
+                self._last_overlay = event
+                self.choices = []
+                self._native_anchor = str(event.get("native_anchor") or "")
+                if not self.controller.bridge.present_inline_native(event):
+                    self.controller.presentation_result(event.get("key"), "", "completion")
+                    self._last_overlay = None
+                return
             self._last_overlay = event
             self.choices = list(event.get("choices") or [])
             self._native_anchor = str(event.get("native_anchor") or "")
@@ -2286,6 +2491,7 @@ class MenuAgent:
             payload = event.get("render")
             if not isinstance(payload, dict):
                 self.overlay.hide()
+                self.controller.presentation_result(event.get("key"), "", "completion")
                 self._caret(event)
                 return
             screen = self.app.screenAt(point)
@@ -2309,6 +2515,12 @@ class MenuAgent:
             self.clear_overlay()
             return
         if self._native_surface:
+            if (self._last_overlay is not None
+                    and self._last_overlay.get("mode", "completion") == "completion"):
+                # The old input-panel accessory can obscure the native row.
+                # Do not remap it (or requeue a frame) on ordinary caret events.
+                self.accessory.hide()
+                return
             self._native_anchor = str(event.get("native_anchor") or "")
             text = str((self._last_overlay or {}).get("text") or "")
             if self.controller.config.show_accessory or text:
@@ -2412,11 +2624,11 @@ class MenuAgent:
                 if state == "paused":
                     remaining = max(0, float(status.get("paused_until", 0)) - time.monotonic())
                     description = "Resumes at " + datetime.fromtimestamp(time.time() + remaining).strftime("%H:%M")
-                self.tray.setToolTip(f"BroTypist, {state} — {description}")
+                self.tray.setToolTip(f"BroTypist, {state} — {description}\n{self.power_ui.presentation.title}")
                 self.refresh_menu()
                 if self.settings and self.settings.isVisible():
                     self.settings.refresh_status()
-                    if self.settings.sidebar.currentItem() and self.settings.sidebar.currentItem().text() == "General":
+                    if self.settings.sidebar.currentItem() and self.settings.sidebar.currentItem().text() == "Statistics":
                         self.settings.refresh_stats()
                 if not self.controller.config.show_accessory:
                     self.accessory.hide()
@@ -2443,11 +2655,31 @@ class MenuAgent:
         self.overlay.hide()
         self.accessory.hide()
         try:
-            try:
-                if self.welcome:
-                    self.welcome._close_preview()
-            finally:
-                self.controller.stop()
+            # Attempt every owner even if one still unwinds; update approval is
+            # fenced behind successful release of all owned background work.
+            pending = None
+            failure = None
+            for close in (
+                self.welcome._close_preview if self.welcome else lambda: None,
+                self.controller.stop, self.power_sampler.close, self.power_ui.close,
+            ):
+                try:
+                    close()
+                except ShutdownPending as exc:
+                    pending = exc
+                except Exception as exc:
+                    failure = exc
+            if self._update_handoff is None:
+                try:
+                    self.updates.close()
+                except ShutdownPending as exc:
+                    pending = exc
+                except Exception as exc:
+                    failure = exc
+            if failure is not None:
+                raise failure
+            if pending is not None:
+                raise pending
             for window in (self.welcome, self.settings):
                 if window and window.model_manager:
                     window.model_manager._refresh_timer.stop()
@@ -2457,7 +2689,7 @@ class MenuAgent:
                 # a helper. Approval is only sent after all controller-owned
                 # work has stopped; its pipe stays open until actual exit.
                 self._update_handoff.commit()
-            self.updates.close()
+                self.updates.close()
         except ShutdownPending:
             self.timer.start()
             raise
