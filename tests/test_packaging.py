@@ -1,4 +1,8 @@
-"""Packaging safety scenarios: local://inklow-packaging-test-design.json."""
+"""Constrain build ownership, private-payload exclusion and relocated resources.
+
+Temporary trees also model Linux desktop registration and portable export;
+these filesystem assertions do not establish compositor authorization.
+"""
 import configparser
 import json
 from pathlib import Path
@@ -14,6 +18,7 @@ BUILD = runpy.run_path(str(Path(__file__).resolve().parents[1] / "tools" / "buil
 
 
 def mark(bundle, platform="linux"):
+    """Mark a temporary tree as build-owned without constructing a frozen binary."""
     path = BUILD["marker_path"](bundle, platform)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"application": resources.APP_ID, "platform": platform}))
@@ -38,6 +43,7 @@ def test_asset_lookup_uses_relocated_package_and_refuses_escape(tmp_path, monkey
 
 @pytest.fixture
 def macos_relocated_assets(tmp_path, monkeypatch):
+    """Model the macOS resource-root symlink plus a forbidden link outside assets."""
     contents = tmp_path / "BroTypist.app" / "Contents"
     package = contents / "Frameworks" / "inklow"
     assets = contents / "Resources" / "inklow" / "assets"
@@ -160,6 +166,7 @@ def test_private_payload_is_rejected_but_native_libraries_are_allowed(tmp_path, 
 
 
 def desktop_entry(path):
+    """Parse literal desktop-entry fields without expanding percent placeholders."""
     parser = configparser.ConfigParser(interpolation=None)
     parser.read(path, encoding="utf-8")
     return parser["Desktop Entry"]
@@ -167,6 +174,7 @@ def desktop_entry(path):
 
 @pytest.fixture
 def frozen_wayland_application(tmp_path, monkeypatch):
+    """Model a frozen Wayland payload with registration confined to temporary XDG data."""
     bundle = tmp_path / "Portable app"
     executable = bundle / "BroTypist"
     package = bundle / "_internal" / "inklow"
@@ -272,6 +280,7 @@ def test_linux_payload_desktop_identity_is_executable_and_export_is_relocatable(
         assert shlex.split(metadata["Exec"])[0] == str(bundle / "BroTypist")
         assert metadata["X-KDE-Wayland-Interfaces"] == "org_kde_plasma_window_management"
     package = runpy.run_path(str(Path(__file__).resolve().parents[1] / "tools/package_linux.py"))
+    # Export strips build-location desktop files rather than publishing stale paths.
     exported = tmp_path / "Portable export"
     package["copy_application"](bundle, exported)
     assert (exported / "BroTypist").read_bytes() == b"application payload"

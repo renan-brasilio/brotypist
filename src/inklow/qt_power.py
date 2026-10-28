@@ -1,4 +1,9 @@
-"""Native Qt power cards and nonactivating help; all OS sampling stays off-main."""
+"""Render Qt power feedback from worker-owned OS samples.
+
+PowerSampler publishes copies on the GUI thread; QtPowerUI owns cards, finite
+animations and a nonactivating help panel. Unknown session/display preferences
+keep feedback static, and help delivery is recorded only after a panel is shown.
+"""
 from __future__ import annotations
 
 import threading
@@ -35,12 +40,14 @@ class PowerSampler(QObject):
         self._sampleReady.connect(self._accept, Qt.ConnectionType.QueuedConnection)
 
     def start(self):
+        """Start the single non-daemon sampler unless already started or closed."""
         if self._closed or self._worker is not None:
             return
         self._worker = threading.Thread(target=self._run, name="inklow-power", daemon=False)
         self._worker.start()
 
     def _run(self):
+        """Sample off-main, checking cancellation before publishing session facts."""
         while not self._cancel.is_set():
             try:
                 reading = system.power_status()
@@ -57,11 +64,13 @@ class PowerSampler(QObject):
 
     @Slot(dict)
     def _accept(self, reading):
+        """Publish detached readings on the GUI thread, ignoring late closed samples."""
         if not self._closed:
             self.reading = dict(reading)
             self.readingReady.emit(dict(reading))
 
     def close(self):
+        """Cancel sampling without blocking; raise ShutdownPending until it exits."""
         self._closed = True
         self._cancel.set()
         worker = self._worker
@@ -123,6 +132,8 @@ class _PowerGlyph(QWidget):
 
 
 class _PowerCard(QFrame):
+    """Own one rendered card; hiding it tells the owner to stop its animation."""
+
     def __init__(self, owner, name, compact):
         super().__init__()
         self.owner = owner
@@ -159,6 +170,8 @@ class _PowerCard(QFrame):
 
 
 class _HelpPanel(QFrame):
+    """Report native hiding so timeout and dismiss controls share one state."""
+
     hidden = Signal()
 
     def hideEvent(self, event):
@@ -167,6 +180,8 @@ class _HelpPanel(QFrame):
 
 
 class QtPowerUI(QObject):
+    """Manage GUI-thread power presentation separately from sampling and policy."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.shell = None  # MenuAgent is not QObject; assigned by its integration owner.
@@ -210,6 +225,11 @@ class QtPowerUI(QObject):
 
     def apply_display_preferences(self, *, reduce_motion=None, increase_contrast=None,
                                   reduce_transparency=None):
+        """Merge requested preferences with native hints and stop existing motion.
+
+        Unknown motion preferences remain static; explicit permission alone
+        cannot override a zero native animation duration or high-contrast mode.
+        """
         self._requested_motion = reduce_motion
         self._requested_contrast = increase_contrast
         app = QApplication.instance()
@@ -237,6 +257,7 @@ class QtPowerUI(QObject):
         box.setAutoFillBackground(True)
 
     def make_card(self, name="pane", compact=False):
+        """Replace the named owned card and return its freshly rendered widget."""
         self.release_card(name)
         card = _PowerCard(self, name, compact)
         self.cards[name] = card
@@ -244,6 +265,7 @@ class QtPowerUI(QObject):
         return card
 
     def release_card(self, name):
+        """Stop motion before scheduling the named card's Qt deletion."""
         self._stop_card_motion(name)
         card = self.cards.pop(name, None)
         if card is not None:
@@ -276,6 +298,7 @@ class QtPowerUI(QObject):
             card.opacity.setOpacity(1.0)
 
     def _charge_motion(self, name):
+        """Run a finite charging pulse only for a visible, unlocked, permitted card."""
         card = self.cards[name]
         if (self.reduce_motion or self.increase_contrast or self._closed
                 or self.reading.get("session_unlocked") is not True or not card.isVisible()):
@@ -292,6 +315,7 @@ class QtPowerUI(QObject):
         animation.start()
 
     def set_visibility(self, *, menu=None, pane=None):
+        """Track host surfaces and stop motion when their cards cease being relevant."""
         if menu is not None:
             self._menu_visible = bool(menu)
         if pane is not None:
@@ -304,6 +328,11 @@ class QtPowerUI(QObject):
                 self._charge_motion(name)
 
     def present(self, reading, *, allow_help=False):
+        """Render a sample and optionally deliver policy-approved charging help.
+
+        Return the current presentation. Preview calls leave delivery policy
+        untouched; actual delivery requires an unlocked session and visible panel.
+        """
         if self._closed:
             return self.presentation
         previous = self.presentation
@@ -333,6 +362,7 @@ class QtPowerUI(QObject):
         return self.presentation
 
     def _help_anchor(self):
+        """Return a visible tray/card anchor and screen, or None when unsafe to show."""
         if self.reading.get("session_unlocked") is not True:
             return None
         tray = getattr(self.shell, "tray", None)
@@ -352,6 +382,7 @@ class QtPowerUI(QObject):
         return None
 
     def _show_help(self):
+        """Show help inside the anchor screen's work area without taking focus."""
         target = self._help_anchor()
         if target is None:
             return False
@@ -403,6 +434,7 @@ class QtPowerUI(QObject):
         return self.help_showing
 
     def dismiss_help(self):
+        """Clear help state and controls without resetting discharge-delivery policy."""
         self._help_timer.stop()
         self.help_showing = False
         if self._help_panel is not None:
@@ -415,6 +447,7 @@ class QtPowerUI(QObject):
             self._stop_card_motion(name)
 
     def close(self):
+        """Idempotently stop timers/motion and schedule owned surfaces for deletion."""
         if self._closed:
             return
         self._closed = True

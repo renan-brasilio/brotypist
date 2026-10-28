@@ -15,6 +15,7 @@ from inklow.runtime import ShutdownPending
 
 
 def reading(**changes):
+    """Build an explicitly unlocked low-battery sample, overriding only named fields."""
     sample = dict(available=True, has_battery=True, on_battery=True,
                   charging=False, percent=19, session_unlocked=True)
     sample.update(changes)
@@ -28,6 +29,7 @@ def app():
 
 @pytest.fixture
 def ui(app):
+    """Own the power UI and drain deferred widget disposal after closing it."""
     owner = QtPowerUI(app)
     yield owner
     owner.close()
@@ -243,6 +245,8 @@ def test_sampler_close_is_nonblocking_and_keeps_shutdown_pending_until_real_exit
     sampler.start()
     try:
         assert entered.wait(2)
+        # The worker is inside the blocked OS boundary: close must request
+        # cancellation without reporting ownership released before its real exit.
         before = time.monotonic()
         with pytest.raises(ShutdownPending):
             sampler.close()
