@@ -13,6 +13,7 @@ def reading(*, available=True, has_battery=True, on_battery=False, charging=Fals
 
 @pytest.fixture
 def power_ui():
+    """Own native power observers and close any help panel even if cleanup fails."""
     A.NSApplication.sharedApplication()
     ui = NativePowerUI.alloc().init().configure()
     try:
@@ -103,6 +104,23 @@ def test_power_card_renders_truthful_native_title_and_accessibility(power_ui, sa
     else:
         assert "%" not in title.stringValue()
         assert "%" not in result.compact
+
+
+@pytest.mark.parametrize("sample", [
+    reading(percent=100),
+    reading(charging=True, percent=54),
+    reading(on_battery=True, percent=19),
+    reading(available=False, has_battery=False, charging=None, percent=None),
+])
+def test_power_updates_keep_the_resident_button_icon_only(power_ui, sample):
+    button = A.NSButton.buttonWithTitle_target_action_("100%", None, None)
+    image = A.NSImage.imageWithSystemSymbolName_accessibilityDescription_("sparkles", "BroTypist")
+    button.setImage_(image)
+    power_ui.status_item = SimpleNamespace(button=lambda: button, isVisible=lambda: False)
+    power_ui.present(sample, allow_help=False)
+    assert button.title() == ""
+    assert button.imagePosition() == A.NSImageOnly
+    assert button.image() == image
 
 
 @pytest.mark.parametrize("percent,state,symbol", [

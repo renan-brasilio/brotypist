@@ -5,6 +5,13 @@
 - Package the current Linux development source for private testing only; this snapshot is not a GitHub release.
 - Same-line Wayland prediction proof remains absent: missing caret-end geometry, font attributes and direction stay fail-closed. Rapid cross-toolkit protocol disconnects and KWin SensitiveData mapping remain unresolved; packaging and private X11 checks do not establish positive Wayland rendering.
 
+### Documentation and shared macOS correction
+
+- Rewrite the README around purpose, implemented features, installation, privacy, development and contribution rather than internal delivery history.
+- Review all first-party code and build contracts; add purpose headers, Python API docstrings, C ownership/ABI comments and explanations for complex lifecycle, cancellation, privacy and rendering decisions without changing executable behavior.
+- Keep the macOS status item icon-only, with no battery percentage or power-state text; preserve battery details in Settings and accessibility descriptions.
+- Remove the environment-dependent model-default assertion while retaining saved custom-model/instruction preservation. Consolidated checks passed 1,556 Linux tests (21 platform skips); the separately scoped Mac tree passed 1,408 tests (23 platform/session skips).
+
 ### Compact resident menus
 
 - Replace dashboard-style menu content with six native action groups on macOS and Linux: global predictions, Pause, current-app predictions, Settings, Updates and Quit. Model, battery, recording and statistics detail remains in Settings.

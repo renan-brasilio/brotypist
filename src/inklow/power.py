@@ -15,6 +15,8 @@ class LowBatteryHelpPolicy:
 
         Existing immediate presenters use the default. Fallible presenters first
         probe with ``delivered=False`` and commit only after showing their surface.
+        A true result with ``delivered=True`` latches the request until a known
+        external-power sample arrives; probing does not reserve a request.
         """
         if reading.get("available") is not True or reading.get("has_battery") is not True:
             return False
@@ -37,6 +39,8 @@ class LowBatteryHelpPolicy:
 
 @dataclass(frozen=True)
 class PowerPresentation:
+    """Immutable labels and symbol name shared by native and portable surfaces."""
+
     state: str
     title: str
     detail: str
@@ -45,7 +49,12 @@ class PowerPresentation:
 
 
 def power_presentation(reading: dict) -> PowerPresentation:
-    """Keep unknown, absent, discharging, charging and externally powered distinct."""
+    """Keep unknown, absent, discharging, charging and externally powered distinct.
+
+    Only literal booleans establish availability, battery presence and source.
+    Percentages must be integers in 0..100; invalid values remain unavailable
+    instead of being clamped or inferred from charging state.
+    """
     percent = reading.get("percent")
     percent = percent if type(percent) is int and 0 <= percent <= 100 else None
     level = f"{percent}%" if percent is not None else "Battery level unavailable"
@@ -70,6 +79,7 @@ def power_presentation(reading: dict) -> PowerPresentation:
 
 
 def charging_help_text(locale: str) -> tuple[str, str]:
+    """Return Brazilian Portuguese help for pt-BR locales, English otherwise."""
     if str(locale).replace("_", "-").lower().startswith("pt-br"):
         return "Me coloca na tomada?", "A bateria está baixinha. Uma carga ajuda a gente a continuar escrevendo."
     return "Could you plug me in?", "The battery is getting low. A little charge will keep us writing."

@@ -41,10 +41,16 @@ PREFIX = "The three steps for planting a tree are to"
 
 
 class ProofUnavailable(RuntimeError):
+    """Mark missing native evidence as incomplete rather than a passing fallback."""
     pass
 
 
 def isolation(*, display: bool = False) -> tuple[Path, Path]:
+    """Return fixture/evidence roots after checking private state and socket scope.
+
+    The launcher supplies the bus and environment. This checks its ownership
+    marker and path containment; it does not authenticate an arbitrary bus address.
+    """
     root = Path(os.environ["INKLOW_SMOKE_ROOT"]).resolve(strict=True)
     marker = json.loads((root / "owner.json").read_text())
     if marker != {"token": os.environ.get("INKLOW_SMOKE_TOKEN"), "uid": os.getuid()}:
@@ -81,6 +87,11 @@ def owned_x11(root):
 
 
 def start_xvfb(root, output, env):
+    """Start authenticated Xvfb, record its capability and update the child env.
+
+    Return the live process for session-owned cleanup. Startup failures terminate
+    that process; absence of a usable server raises ProofUnavailable.
+    """
     executable = env.get("INKLOW_SMOKE_XVFB")
     if not executable:
         raise ProofUnavailable("scene-readback: Xvfb is not installed in the guest")
@@ -187,6 +198,11 @@ def prepare_identities(root, output, fixture, env):
 
 
 def session() -> int:
+    """Launch installed KWin capabilities and reap the owned compositor/Xvfb.
+
+    Unsupported prerequisites produce an incomplete session receipt. The outer
+    launcher owns the enclosing process group, including activated bus services.
+    """
     root, output = isolation()
     fixture = Path(__file__).resolve()
     env = dict(os.environ)
@@ -332,6 +348,7 @@ class WaylandRegistry:
     """Real public-socket registry observation, without binding privileged globals."""
 
     def __init__(self, role):
+        """Connect as a copied role identity and persist its filtered registry."""
         root, output = isolation(display=True)
         identity = json.loads((root / "identities.json").read_text())[role]
         actual = str(Path("/proc/self/exe").resolve(strict=True))
@@ -357,19 +374,23 @@ class WaylandRegistry:
             raise
 
     def allocate(self):
+        """Reserve an object ID for this connection without reusing deleted IDs."""
         identifier = self.next_id
         self.next_id += 1
         return identifier
 
     @staticmethod
     def string(text):
+        """Encode a NUL-terminated UTF-8 Wayland string with four-byte padding."""
         data = text.encode() + b"\0"
         return struct.pack("=I", len(data)) + data + b"\0" * (-len(data) % 4)
 
     def send(self, identifier, opcode, payload=b""):
+        """Send one native-endian request with its byte size in the header."""
         self.socket.sendall(struct.pack("=II", identifier, ((8 + len(payload)) << 16) | opcode) + payload)
 
     def receive(self, count):
+        """Read exactly count bytes or fail when the owned connection closes."""
         result = bytearray()
         while len(result) < count:
             data = self.socket.recv(count - len(result))
@@ -379,6 +400,7 @@ class WaylandRegistry:
         return bytes(result)
 
     def sync(self):
+        """Collect registry announcements until this connection's sync callback."""
         callback = self.allocate()
         self.send(1, 0, struct.pack("=I", callback))
         deadline = time.monotonic() + 2
@@ -400,6 +422,7 @@ class WaylandRegistry:
         raise ProofUnavailable("Owned Wayland sync deadline expired")
 
     def close(self):
+        """Release the owned socket; callers retain any persisted evidence."""
         self.socket.close()
 
 
@@ -407,6 +430,7 @@ class FakeInput(WaylandRegistry):
     """Send real key requests; actual target delivery remains a separate gate."""
 
     def __init__(self):
+        """Bind advertised keyboard-v4 fake input and request fixture authentication."""
         super().__init__("target")
         try:
             advertised = self.globals.get("org_kde_kwin_fake_input")
@@ -423,9 +447,11 @@ class FakeInput(WaylandRegistry):
             raise
 
     def key(self, code, pressed):
+        """Send a Linux evdev key edge; this alone is not proof of target delivery."""
         self.send(self.proxy, 10, struct.pack("=II", code, int(pressed)))
 
     def chord(self, code, modifiers=()):
+        """Press modifiers/key, release in reverse order and roundtrip the requests."""
         for modifier in modifiers:
             self.key(modifier, True)
         self.key(code, True)
@@ -437,6 +463,11 @@ class FakeInput(WaylandRegistry):
 
 
 def im() -> int:
+    """Run production input-method startup with observation hooks in this process.
+
+    The private D-Bus observer exposes test operations only on the owned session;
+    captured client frames remain distinct from compositor-scene evidence.
+    """
     _, output = isolation(display=True)
     registry = WaylandRegistry("im")
     registry.close()
@@ -460,7 +491,9 @@ def im() -> int:
 
     @ClassInfo(**{"D-Bus Interface": INTERFACE})
     class Observer(QObject):
+        """Retain production observations and saved snapshots for refusal probes."""
         def __init__(self, agent):
+            """Attach event histories without substituting native results."""
             super().__init__(agent.app)
             self.agent = agent
             self.saved = {}
@@ -479,6 +512,7 @@ def im() -> int:
             original_call = bridge._native_call
 
             def observe_call(name, *arguments):
+                """Copy transient frame memory and record real native call results."""
                 # Copy the actual production frame before it goes out of scope;
                 # never generate an imitation prediction or alter the result.
                 image = None
@@ -533,6 +567,7 @@ def im() -> int:
             self.presentation_count = 0
 
             def observe_ui(action, *arguments):
+                """Record presentation acknowledgements before forwarding UI events."""
                 if action == "presentation":
                     payload = arguments[0]
                     self.presentation_count += 1
@@ -549,6 +584,7 @@ def im() -> int:
             original_invoke = agent.controller.invoke
 
             def observe_invoke(action):
+                """Record controller decisions while returning the original result."""
                 result = original_invoke(action)
                 self.decisions.append({"action": action, "accepted": bool(result)})
                 self.decisions[:] = self.decisions[-128:]
@@ -557,6 +593,7 @@ def im() -> int:
             agent.controller.invoke = observe_invoke
 
         def state(self):
+            """Capture current bridge/controller state and retain the worker handle."""
             controller = self.agent.controller
             bridge = controller.bridge
             snapshot = bridge.capture()
@@ -586,6 +623,12 @@ def im() -> int:
 
         @Slot(str, result=str)
         def request(self, payload):
+            """Dispatch token-checked fixture RPC and return JSON success/error data.
+
+            Saved inline insertions retain their exact presented text; manual
+            refusal probes use the sentinel instead. Pending shutdown is returned
+            to the driver for bounded retries rather than reported as stopped.
+            """
             try:
                 data = json.loads(payload)
                 if data.pop("token", None) != os.environ["INKLOW_SMOKE_TOKEN"]:
@@ -644,6 +687,7 @@ def im() -> int:
                 return json.dumps({"ok": False, "error": f"{type(error).__name__}: {error}"})
 
     def observed_init(agent, *args, **kwargs):
+        """Construct production state first, then retain/register its private observer."""
         original_init(agent, *args, **kwargs)
         observer = Observer(agent)
         bus = QDBusConnection.sessionBus()
@@ -653,6 +697,7 @@ def im() -> int:
         agent._smoke_observer = observer
 
     def observed_start(agent, *args, **kwargs):
+        """Start production behavior before hiding this fixture's settings window."""
         original_start(agent, *args, **kwargs)
         if agent.settings is not None:
             agent.settings.hide()  # Only our isolated app's settings window.
@@ -664,6 +709,11 @@ def im() -> int:
 
 
 def target() -> int:
+    """Drive synthetic Qt fields while preserving native input and evidence boundaries.
+
+    Scenario generators yield delays so Qt can service AT-SPI, D-Bus and input
+    events. Only real compositor delivery can satisfy physical-shortcut checks.
+    """
     root, output = isolation(display=True)
     registry = WaylandRegistry("target")
     registry.close()
@@ -698,7 +748,9 @@ def target() -> int:
     compositions = []
 
     class Field(QLineEdit):
+        """Record delivered keys/commits while keeping Tab from changing test focus."""
         def event(self, event):
+            """Observe real key edges and consume only target-side Tab navigation."""
             if event.type() in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
                 events.append({"field": self.objectName(), "type": "press" if event.type() == QEvent.Type.KeyPress else "release",
                                "key": int(event.key()), "modifiers": int(event.modifiers().value),
@@ -711,6 +763,7 @@ def target() -> int:
             return super().event(event)
 
         def inputMethodEvent(self, event):
+            """Record composition and commit payloads before normal widget handling."""
             compositions.append({"field": self.objectName(), "preedit": event.preeditString(),
                                  "commit": event.commitString()})
             if event.commitString():
@@ -738,8 +791,10 @@ def target() -> int:
 
     @ClassInfo(**{"D-Bus Interface": INTERFACE})
     class SceneSink(QObject):
+        """Receive metadata from scripts loaded into the private compositor."""
         @Slot(str, result=str)
         def Scene(self, payload):
+            """Append one compositor metadata observation, not a screenshot."""
             value = json.loads(payload)
             report["scenes"].append(value)
             return "recorded"
@@ -750,6 +805,7 @@ def target() -> int:
         raise RuntimeError("Cannot register target scene sink on private bus")
 
     def bus_call(service, path, interface, method, *arguments):
+        """Wait for a D-Bus reply while servicing all target GUI/AT-SPI events."""
         message = QDBusMessage.createMethodCall(service, path, interface, method)
         message.setArguments(list(arguments))
         # The observer reads our AT-SPI endpoint while replying. BlockWithGui
@@ -769,6 +825,7 @@ def target() -> int:
     watchers = set()
 
     def send_rpc(op, arguments, completed):
+        """Retain an async watcher until completed(value, error) consumes its reply."""
         payload = {"token": os.environ["INKLOW_SMOKE_TOKEN"], "op": op, **arguments}
         message = QDBusMessage.createMethodCall(IM_SERVICE, "/Smoke", INTERFACE, "request")
         message.setArguments([json.dumps(payload)])
@@ -793,6 +850,7 @@ def target() -> int:
         watcher.finished.connect(replied)
 
     def poll_state():
+        """Allow one state poll at a time and suspend polling around mutations."""
         if ipc["polling"] or ipc["command"] or ipc["closing"]:
             return
         ipc["polling"] = True
@@ -809,6 +867,7 @@ def target() -> int:
     poll_timer.start(100)
 
     def command(op, arguments):
+        """Yield until prior polling and this command finish, then return its value."""
         ipc["command"] = True
         result = {}
         try:
@@ -824,6 +883,7 @@ def target() -> int:
             ipc["command"] = False
 
     def rpc(op, **arguments):
+        """Return cached state immediately or a yielding command for other operations."""
         # State predicates use actual asynchronous observations; commands yield
         # the target GUI thread so the agent can read its AT-SPI endpoint.
         return ipc["state"] if op == "state" else command(op, arguments)
@@ -832,11 +892,13 @@ def target() -> int:
         return ipc["state"]
 
     def check(name, condition, **evidence):
+        """Persist an assertion's evidence before raising on its failed condition."""
         report["checks"].append({"name": name, "passed": bool(condition), **evidence})
         if not condition:
             raise AssertionError(name)
 
     def wait_for(predicate, label, seconds=12):
+        """Yield 0.1-second delays until a predicate is truthy, returning that value."""
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             value = predicate()
@@ -846,6 +908,7 @@ def target() -> int:
         raise AssertionError("Deadline: " + label)
 
     def eligible(expected, field=writing):
+        """Match observed native text/caret to the currently focused synthetic field."""
         state = state_or_none()
         if (state and state["snapshot"] and state["snapshot"]["text"] == expected
                 and state["snapshot"]["caret"] == len(expected) and field.hasFocus()):
@@ -853,6 +916,7 @@ def target() -> int:
         return None
 
     def prepare(text=PREFIX, field=writing):
+        """Establish widget context and await native/AT-SPI agreement, not key proof."""
         writing.setEchoMode(QLineEdit.EchoMode.Normal)
         writing.setInputMethodHints(Qt.InputMethodHint.ImhNone)
         field.setText(text[:-1])
@@ -868,6 +932,7 @@ def target() -> int:
         return (yield from wait_for(lambda: eligible(text, field), "matching safe native + AT-SPI context"))
 
     def offer(*, force=True):
+        """Await a real generation whose painted prefix has matching presentation ACKs."""
         def inline_context():
             state = state_or_none()
             snapshot = state.get("snapshot") if state else None
@@ -917,6 +982,7 @@ def target() -> int:
                                                  "frames": state["frames"][-2:]})) from error
 
     def scene(label, im_pid):
+        """Run/stop a private KWin script and return owned window/output metadata."""
         before = len(report["scenes"])
         script = root / ("scene-" + label + ".js")
         # The private socket may attribute an input-panel client to KWin's PID.
@@ -967,6 +1033,7 @@ callDBus(%s, '/Smoke', %s, 'Scene', JSON.stringify({label:%s, rows:rows, outputs
             bus_call("org.kde.KWin", path, "org.kde.kwin.Script", "stop")
 
     def capture(label):
+        """Capture the owned compositor framebuffer or record why proof is unavailable."""
         if os.environ.get("INKLOW_SMOKE_SCENE") != "x11-windowed":
             gap = "scene-readback: owned X11-windowed KWin inside Xvfb unavailable"
             if gap not in report["limits"]:
@@ -997,6 +1064,7 @@ callDBus(%s, '/Smoke', %s, 'Scene', JSON.stringify({label:%s, rows:rows, outputs
         return receipt
 
     def literal_tab(label):
+        """Require one unconsumed Tab pair with unchanged synthetic field state."""
         if injector is None:
             return
         start = len(events)
@@ -1010,6 +1078,7 @@ callDBus(%s, '/Smoke', %s, 'Scene', JSON.stringify({label:%s, rows:rows, outputs
               events=delivered, host_before=before, host_after=writing.text())
 
     def output_transition():
+        """Change the owned output scale, observe frame revocation, then restore it."""
         executable = shutil.which("kscreen-doctor")
         if executable is None:
             gap = "stale-output: guest kscreen-doctor unavailable for live compositor scale change"
@@ -1071,6 +1140,7 @@ callDBus(%s, '/Smoke', %s, 'Scene', JSON.stringify({label:%s, rows:rows, outputs
               ghost=restored_offer["ghost"])
 
     def desktop_transition():
+        """Show/restore the private desktop and reject acceptance of its old scene."""
         yield from prepare(PREFIX)
         before = yield from offer()
         yield from rpc("save", name="desktop")
@@ -1110,6 +1180,7 @@ callDBus(%s, '/Smoke', %s, 'Scene', JSON.stringify({label:%s, rows:rows, outputs
               before=before["ghost"], after=restored["ghost"])
 
     def stop_agent():
+        """Retry reported pending shutdown for up to eight seconds, retaining attempts."""
         deadline = time.monotonic() + 8
         attempts = []
         while True:
@@ -1126,6 +1197,7 @@ callDBus(%s, '/Smoke', %s, 'Scene', JSON.stringify({label:%s, rows:rows, outputs
     injector = None
 
     def scenarios():
+        """Sequence native evidence gates; missing capabilities cannot become passes."""
         nonlocal injector
         # Observe each role's actual filtered registry, not the compositor's
         # version string or a generic interpreter's advertised privileges.
@@ -1254,6 +1326,8 @@ callDBus(%s, '/Smoke', %s, 'Scene', JSON.stringify({label:%s, rows:rows, outputs
             report["unresolved_primitives"].append(gap)
         visible_scene = capture("offer")
         if baseline and visible_scene and mapped and len(mapped.get("outputs", [])) == 1:
+            # Compare compositor pixels only within the projected ghost bounds.
+            # Client buffers and scene metadata alone cannot satisfy this oracle.
             a = QImage(str(output / baseline["file"]))
             b = QImage(str(output / visible_scene["file"]))
             output_geometry = mapped["outputs"][0]["geometry"]
@@ -1541,6 +1615,7 @@ callDBus(%s, '/Smoke', %s, 'Scene', JSON.stringify({label:%s, rows:rows, outputs
     finished = False
 
     def finish(error=None):
+        """Stop polling once, classify failure and persist after a shutdown attempt."""
         nonlocal finished
         if finished:
             return
@@ -1558,6 +1633,7 @@ callDBus(%s, '/Smoke', %s, 'Scene', JSON.stringify({label:%s, rows:rows, outputs
             injector.close()
 
         def persist(value=None, stop_error=None):
+            """Write terminal evidence before closing the target event loop."""
             if value is not None:
                 report["failure_stop"] = value
             if stop_error is not None:
@@ -1573,6 +1649,7 @@ callDBus(%s, '/Smoke', %s, 'Scene', JSON.stringify({label:%s, rows:rows, outputs
             deadline = time.monotonic() + 8
 
             def stopped(value=None, stop_error=None):
+                """Keep pending shutdown bounded without claiming that it completed."""
                 if stop_error is None and value is not None and value.get("pending"):
                     report.setdefault("failure_stop_attempts", []).append(value)
                     if time.monotonic() < deadline:
@@ -1586,6 +1663,7 @@ callDBus(%s, '/Smoke', %s, 'Scene', JSON.stringify({label:%s, rows:rows, outputs
             persist()
 
     def step():
+        """Resume one scenario step on the GUI thread and schedule its yielded delay."""
         try:
             delay = next(generator)
             QTimer.singleShot(max(1, round(delay * 1000)), step)

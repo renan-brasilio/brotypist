@@ -6,7 +6,12 @@ from PySide6.QtDBus import QDBusConnection, QDBusMessage, QDBusPendingCallWatche
 
 
 class DesktopWatch(QObject):
-    """One compositor lifetime; loss of evidence is terminal, never a typing retry."""
+    """Track one compositor lifetime on the owning Qt event-loop thread.
+
+    ``changed`` receives -1 for unknown/lost evidence, 0 for normal windows,
+    and 1 for showing the desktop. Loss is terminal; create a new watch rather
+    than retrying against a potentially different compositor identity.
+    """
 
     def __init__(self, compositor_pid: int, changed):
         super().__init__()
@@ -23,6 +28,7 @@ class DesktopWatch(QObject):
         self._deadline.timeout.connect(self.stop)
 
     def start(self) -> None:
+        """Subscribe before resolving KWin, with a 200 ms bootstrap deadline."""
         self._changed(-1)
         if self._stopped:
             return
@@ -54,6 +60,7 @@ class DesktopWatch(QObject):
         return True
 
     def _request(self, service, path, interface, method, arguments, completed) -> None:
+        """Own an async reply watcher and discard replies superseded by signals."""
         if self._stopped:
             return
         revision = self._revision
@@ -95,6 +102,7 @@ class DesktopWatch(QObject):
                       "org.freedesktop.DBus", "GetConnectionUnixProcessID", [self._owner], self._authenticated)
 
     def _authenticated(self, arguments) -> None:
+        """Bind property reads and signals to the compositor's verified bus owner."""
         if len(arguments) != 1 or type(arguments[0]) is not int or arguments[0] != self._pid:
             self.stop()
             return
@@ -122,6 +130,7 @@ class DesktopWatch(QObject):
 
     @Slot(QDBusMessage)
     def desktopChanged(self, message) -> None:
+        """Apply a signal only from the authenticated unique bus owner."""
         if self._stopped or message.service() != self._owner:
             return
         self._revision += 1
@@ -144,6 +153,7 @@ class DesktopWatch(QObject):
         self.stop()
 
     def stop(self) -> None:
+        """Publish unknown once, disconnect subscriptions, and defer Qt deletion."""
         if self._stopped:
             return
         self._stopped = True

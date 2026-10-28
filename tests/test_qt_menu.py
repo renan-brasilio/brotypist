@@ -1,7 +1,7 @@
 """Qt-only settings contracts; no native hooks, real credentials or model loads.
 
-Run with QT_QPA_PLATFORM=offscreen and an isolated INKLOW_HOME. The integration
-owner executes these after the shared Controller and system helpers land.
+Run with QT_QPA_PLATFORM=offscreen and an isolated INKLOW_HOME. Menu and Quit
+tests pump the Qt event loop; synthetic controller actions expose dispatch order.
 """
 from dataclasses import replace
 import sys
@@ -77,6 +77,7 @@ class UIController:
                 "current_app": "test.app", "current_domain": "", "download": None}
 
     def update_config(self, config, persist=True):
+        """Validate and record preferences in memory without writing a profile."""
         config.validate()
         self.config = config
         self.saved.append(config)
@@ -110,6 +111,7 @@ class UIController:
 
 @pytest.fixture
 def shell(monkeypatch, tmp_path, request):
+    """Own an isolated shell, its signal connection, timers, and deferred widgets."""
     app = QApplication.instance() or QApplication([])
     app.setQuitOnLastWindowClosed(False)
     monkeypatch.setenv("INKLOW_HOME", str(tmp_path))
@@ -630,6 +632,7 @@ def test_verified_host_suffix_is_transparent_same_line_and_does_not_take_focus(s
 
 
 def run_until_quit(shell, action):
+    """Run a queued Quit action with a nonzero timeout exit and assert owner cleanup."""
     timeout = QTimer()
     timeout.setSingleShot(True)
     timeout.timeout.connect(lambda: shell.app.exit(87))
@@ -874,6 +877,8 @@ def test_overlay_acknowledges_only_painted_prefix_and_clearing_disarms_it(shell)
              "render": asdict(render), "inline": True}
     shell._suggestion(event)
     assert not any(shown for _key, shown, _mode in shell.controller.presentations)
+    # A presentation offer is not proof of visibility: only later paint events
+    # may acknowledge the fitting prefix.
     shell.app.processEvents()
     shell.app.processEvents()
     shown = [value for key, value, mode in shell.controller.presentations if value]

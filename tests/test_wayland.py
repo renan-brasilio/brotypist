@@ -2,9 +2,11 @@
 
 R1: pre-read privacy and stale-context rejection; R2: stable context identity;
 R3: exact shortcut consumption; R5: last-frame delivery and menu closure.
-Only OS/protocol peers are fake; capture, insertion, key routing and rendering
-are production methods. C transport bounds/physical key forwarding need the
-isolated native smoke, not a Python reimplementation of the C validation.
+Capture, insertion, key routing and rendering use production methods against
+synthetic OS/protocol peers. The ghost fixture supplies measured Qt font data
+at the host-metric boundary; it does not prove a toolkit exposes those metrics.
+C transport bounds/physical key forwarding need the isolated native smoke,
+not a Python reimplementation of the C validation.
 """
 import ctypes
 from types import SimpleNamespace
@@ -18,6 +20,8 @@ from inklow.runtime import Controller
 
 
 class Accessible:
+    """Mutable AT-SPI node; children share parent links for ancestry checks."""
+
     def __init__(self, *, children=(), flags=(), role="window", path="/field"):
         self.children = children
         self.parent = None
@@ -36,6 +40,7 @@ class Accessible:
         return self.children[index]
 
     def clearCache(self):
+        """Leave the directly mutable model unchanged; it has no remote cache."""
         pass
 
     def getState(self):
@@ -102,6 +107,7 @@ class NativePeer:
         return self.selection
 
     def getText(self, start, end):
+        """Record a full-field read, then inject any configured capture race."""
         self.reads += 1
         text = self.text
         if self.after_read:
@@ -109,6 +115,7 @@ class NativePeer:
         return text
 
     def inklow_wl_state(self, client, revision, serial):
+        """Populate ctypes output arguments with the peer's current anchor."""
         revision._obj.value = self.revision
         serial._obj.value = self.serial
         return int(self.ready)
@@ -117,6 +124,7 @@ class NativePeer:
         return self.context
 
     def inklow_wl_matches(self, client, revision, serial, text, length, cursor):
+        """Compare UTF-8 text and cursor bytes, leaving freshness to the bridge."""
         encoded = self.surrounding.encode("utf-8")
         return int(text == encoded and length == len(encoded)
                    and cursor == len(self.text[:self.caret].encode("utf-8")))
@@ -142,6 +150,7 @@ class NativePeer:
         return 1
 
     def inklow_wl_present(self, client, pixels, width, height, stride, scale):
+        """Copy submitted bytes before the caller's pixel buffer can expire."""
         self.frames.append(ctypes.string_at(pixels, stride * height))
         return self.present_result
 
@@ -164,6 +173,7 @@ class NativePeer:
         return self.ghost_scale
 
     def inklow_wl_ghost_present(self, client, scene, frame, pixels, width, height, stride):
+        """Record scene/frame identity with an owned copy of submitted pixels."""
         self.ghost_frames.append((scene, frame, width, height, ctypes.string_at(pixels, stride * height)))
         return self.present_result
 
@@ -186,6 +196,11 @@ class NativePeer:
 
 @pytest.fixture
 def native(monkeypatch):
+    """Pair a production bridge with synthetic accessibility and transport.
+
+    Bypass native startup and provide no socket notifiers or live connection.
+    Tests that start controllers, watches or socketpairs own their teardown.
+    """
     peer = NativePeer()
     bridge = WaylandBridge.__new__(WaylandBridge)
     BridgeBase.__init__(bridge)
@@ -222,6 +237,7 @@ def native(monkeypatch):
 
 
 def event(bridge, **values):
+    """Deliver one ABI-shaped event synchronously and return consumption."""
     return bridge._event(None, ctypes.pointer(_Event(**values)))
 
 
@@ -390,6 +406,7 @@ def test_filtered_numbered_choice_leaves_digit_unconsumed_and_statistics_empty(n
 
 @pytest.fixture
 def qt_app(monkeypatch):
+    """Reuse or create Qt offscreen with a bounded synthetic primary screen."""
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     widgets = pytest.importorskip("PySide6.QtWidgets")
     app = widgets.QApplication.instance() or widgets.QApplication([])
@@ -401,6 +418,7 @@ def qt_app(monkeypatch):
 
 
 def click_region(bridge, peer, action):
+    """Send a press/release pair inside an enabled production hit region."""
     region = next(rect for rect, name, enabled in bridge._regions if name == action and enabled)
     x, y, _, _ = region
     for pressed in (1, 0):
@@ -498,6 +516,7 @@ def test_initial_context_resync_preserves_capture_isolation(native, qt_app, monk
     monkeypatch.setattr(QtDBus, "QDBusPendingCallWatcher", Watcher)
     bridge._sync_context_state()
     replies = 0
+    # Replies are released explicitly so focus loss can precede completion.
     while pending:
         watcher = pending.pop(0)
         if replies == 0:
@@ -563,6 +582,7 @@ class DesktopBus:
         return message
 
     def watcher(self, message, parent):
+        """Queue a manually completed watcher without scheduling a real call."""
         class Signal:
             def connect(self, callback):
                 self.callback = callback
@@ -587,6 +607,7 @@ class DesktopBus:
         return watcher
 
     def reply(self, arguments, *, error=False):
+        """Complete the oldest request, including callbacks retired by teardown."""
         watcher = self.pending.pop(0)
         message_type = self.qt_dbus.QDBusMessage.MessageType
         watcher.response = SimpleNamespace(
@@ -597,6 +618,7 @@ class DesktopBus:
         return watcher
 
     def emit(self, service, name, arguments):
+        """Deliver a synthetic signal only to matching active subscriptions."""
         for sender, _path, _interface, signal, receiver, slot in tuple(self.subscriptions):
             if signal == name and sender in ("", service):
                 message = SimpleNamespace(service=lambda: service, arguments=lambda: arguments)
@@ -605,6 +627,7 @@ class DesktopBus:
 
 @pytest.fixture
 def desktop_bus(native, qt_app, monkeypatch):
+    """Install a controllable session bus and stop its bridge after each case."""
     qt_dbus = pytest.importorskip("PySide6.QtDBus")
     from inklow.native import _kwin_desktop
     bus = DesktopBus(qt_dbus)
@@ -615,6 +638,7 @@ def desktop_bus(native, qt_app, monkeypatch):
 
 
 def identify_desktop(bridge, peer, bus):
+    """Resolve owner and PID while leaving the visibility property pending."""
     bridge._start_desktop_watch()
     assert peer.desktop_states == [-1]
     assert bus.pending[0].message.member() == "GetNameOwner"
@@ -919,6 +943,7 @@ def test_x11_stop_waits_for_hook_owned_socket_and_grab_release():
     bridge._wake_write.setblocking(False)
     read, write = socket.socketpair()
     entered, released = threading.Event(), threading.Event()
+    # Wait for hook entry, not a sleep; release is observed independently.
     class Connection:
         def screen(self):
             return SimpleNamespace(root=object())
@@ -957,7 +982,12 @@ def test_x11_stop_waits_for_hook_owned_socket_and_grab_release():
 
 @pytest.fixture
 def ghost_native(native, qt_app, monkeypatch):
-    """Synthetic OS metric boundary; production geometry, paint and ACK paths."""
+    """Supply Qt-measured font data while keeping production paint/ACK paths.
+
+    The 1.25-scale image and matching peer scale make fractional pixel sizing
+    observable. This bypasses host font discovery, not the geometry or
+    presentation checks; returned payloads capture a fresh snapshot each time.
+    """
     from PySide6.QtGui import QFontInfo, QFontMetricsF, QImage
     from PySide6.QtWidgets import QApplication
     from inklow.core import InlineRender

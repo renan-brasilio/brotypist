@@ -1,5 +1,15 @@
 # Observed verification
 
+## Documentation refresh and Linux desktop installation — 2026-10-28
+
+- Reviewed all **102 code files and 9 build/configuration contracts**, including independently differing Mac/Linux source trees. Before test-portability follow-ups, all 189 existing Python files had equivalent ASTs after removing docstrings; all 22 changed non-Python files retained executable/configuration tokens. Upstream protocol files were not rewritten.
+- Consolidated verification: scoped Mac **1,408 passed / 23 skipped in 24.15s**; Linux **1,556 passed / 21 skipped in 30.42s**. Mac's native-session-only case was skipped because the console was locked. The actual documented Mac CLI ran against a disposable profile and correctly reported Secure Input instead of claiming typing readiness.
+- Installed Linux test source `e94fc9dddb4788611fdee44e98fa0d7afe9f24a7`, version **0.4.12**, on the authorized CachyOS/KWin 6.8.1 desktop. The portable archive SHA-256 was `93205867ee8ec3f058bba0e3cbaa20cba8a938495e83eb675a995b7e28a4560f`. No existing normal profile or installation was found; integration is per-user and login startup was not enabled.
+- Copied existing public Gemma 4 E2B weights over LAN and verified catalogue SHA-256 `8e30dff3ac4c8434c49a7036fa15564bdbb6044e42bf04550bf1a096ad7e6a52`. The installed CLI reused that cache without another model download.
+- Actual KDE StatusNotifier/DBusMenu actions opened PID-verified native Settings and invoked **Quit BroTypist**, which exited with code 0. A fresh instance was left open. Direct AT-SPI D-Bus observation supplied compatible window evidence after the first GI observer could not establish it; the failed observation is retained, not counted as a pass.
+- Actual installed Gemma CPU inference continued synthetic `The deployment update is ready` with ` for your review.` and exited normally in **25.714s**, including cold startup. This is one execution, not a grammar evaluation, warmed latency measurement or performance claim.
+- **Limits:** the input-method entry was registered but the selected KDE input method was not changed. No positive same-line Wayland typing proof. Fontconfig compatibility warnings were observed on this newer distribution and were not suppressed. Mac's icon-only build awaits unlocked-desktop verification and installation; publication is not claimed.
+
 ## Compact resident menus — macOS 0.4.11 and Linux source
 
 - **Scoped macOS source:** `ea05a502682796ba54d5032691027c62161d2d06` on `fix/minimal-native-menu-0.4.11` isolates the menu correction from unfinished Linux work. Its full suite passed **1,405 / 22 skipped** in **24.34 seconds**. The broader development checkout separately passed **1,483 / 92 skipped**; unavailable Qt paths on that Mac environment are not counted as Linux passes.

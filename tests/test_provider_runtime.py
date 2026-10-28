@@ -1,4 +1,7 @@
-"""Ephemeral context and utility choices retain safe role/stream boundaries."""
+"""Constrain prompt trust, context budgets and native-model/stream lifetimes.
+
+SDK doubles expose allocation, tokenization and closure without loading weights.
+"""
 from dataclasses import replace
 import json
 import threading
@@ -49,6 +52,7 @@ def test_failed_native_warmup_releases_model_and_recovers_on_retry(tmp_path, mon
     created = []
 
     class Model:
+        """Fail warmup on the first allocation only, making retry ownership observable."""
         def __init__(self, **options):
             self.bad = not created
             self.closed = False
@@ -155,6 +159,7 @@ class ControlTokenizer(ByteTokenizer):
         self.metadata = {"general.architecture": family}
 
     def tokenize(self, data, *, add_bos=True, special=False):
+        """Encode literal bytes or negative structural IDs according to ``special``."""
         tokens = [self.controls["<bos>"]] if add_bos else []
         index = 0
         while index < len(data):
@@ -169,6 +174,7 @@ class ControlTokenizer(ByteTokenizer):
         return tokens
 
     def text(self, tokens):
+        """Render both ID kinds for assertions without hiding structural-token counts."""
         controls = {token: text.encode() for text, token in self.controls.items()}
         return b"".join(controls[token] if token < 0 else bytes([token])
                         for token in tokens).decode("utf-8")
@@ -340,6 +346,7 @@ def native_provider(tmp_path, monkeypatch):
             pieces = settings["responses"].pop(0) if settings["responses"] else settings["pieces"]
 
             def chunks():
+                # Closure is observable even when the consumer stops before EOF.
                 try:
                     for text, reason in pieces:
                         yield {"choices": [{"text": text, "finish_reason": reason}]}
@@ -398,6 +405,7 @@ def test_unsupported_guided_architecture_closes_weights_with_useful_error(native
 
 
 def alternatives(provider, prefix, anchor="", cancel=None):
+    """Collect the alternatives stream, preserving a caller-supplied cancellation event."""
     options = {"alternatives": True, "anchor": anchor}
     return list(provider.stream(prefix, "", cancel or threading.Event(), options=options))
 

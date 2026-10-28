@@ -1,3 +1,10 @@
+/*
+ * Single-event-loop Wayland input-method bridge for the native ABI.
+ * The private socket owns context text, key forwarding and the manual panel;
+ * the optional authenticated public renderer owns only ghost geometry/pixels.
+ * Revision fences, privacy metadata and observed compose state gate operations.
+ * Public ownership/return-value contracts are declared in wayland_client.h.
+ */
 #define _GNU_SOURCE
 #include "wayland_client.h"
 #include "wayland_ghost.h"
@@ -26,6 +33,8 @@
 #define MAX_IMAGE (64u * 1024u * 1024u)
 #define MAX_KEY 768u
 
+/* EXPECTED retains the old excerpt until an exact composed splice is observed
+ * and committed; UNKNOWN is not positive evidence that composition is idle. */
 enum composition_state { COMPOSITION_UNKNOWN, COMPOSITION_IDLE, COMPOSITION_PENDING, COMPOSITION_EXPECTED };
 
 struct image_buffer {
@@ -74,6 +83,7 @@ struct inklow_wl {
     int32_t pointer_x, pointer_y;
 };
 
+/* Use volatile stores when retiring retained text or pixel contents. */
 static void wipe(void *data, size_t length)
 {
     volatile unsigned char *p = data;
@@ -90,6 +100,7 @@ static void clear_text(struct inklow_wl *w)
     w->surrounding = false;
 }
 
+/* Zero remains the sentinel; even repeated host serials get a new local fence. */
 static void next_generation(struct inklow_wl *w)
 {
     if (++w->generation == 0) ++w->generation;
@@ -109,6 +120,7 @@ static void ghost_event(void *data, int type, uint32_t state, uint64_t scene, ui
     emit(w, &event);
 }
 
+/* Forget compose output without treating an uncertain sequence as safely idle. */
 static void composition_reset(struct inklow_wl *w, bool fresh)
 {
     if (w->compose) xkb_compose_state_reset(w->compose);
@@ -149,6 +161,7 @@ void inklow_wl_hide(struct inklow_wl *w)
     if (w->display && !w->failed) inklow_wl_flush(w);
 }
 
+/* Revoke snapshot authorization before hiding can synchronously notify callers. */
 static void invalidate(struct inklow_wl *w, bool erase_text)
 {
     w->ready = false;
@@ -177,6 +190,7 @@ static void drop_keyboard(struct inklow_wl *w)
     memset(w->consumed, 0, sizeof(w->consumed));
 }
 
+/* Fail once: erase private state and release the grab before notifying the owner. */
 static void connection_error(struct inklow_wl *w)
 {
     if (w->failed) return;
@@ -203,6 +217,7 @@ int inklow_wl_flush(struct inklow_wl *w)
     return -1;
 }
 
+/* Validate a bounded UTF-8 span, rejecting embedded NULs and invalid scalars. */
 static bool utf8(const char *text, size_t length)
 {
     const unsigned char *s = (const unsigned char *)text;
@@ -226,6 +241,7 @@ static bool utf8(const char *text, size_t length)
     return true;
 }
 
+/* Accept the end offset or a byte that does not continue a UTF-8 code point. */
 static bool boundary(const char *text, size_t length, size_t offset)
 {
     return offset <= length && (offset == length || ((unsigned char)text[offset] & 0xc0) != 0x80);
@@ -274,6 +290,7 @@ static uint32_t canonical_modifiers(struct inklow_wl *w)
     return result;
 }
 
+/* Consume the compositor-owned keymap fd on every path, including invalid maps. */
 static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t format, int32_t fd, uint32_t size)
 {
     (void)keyboard;
@@ -346,6 +363,7 @@ static bool composition_starter(xkb_keysym_t sym)
            (sym >= XKB_KEY_Kanji && sym <= XKB_KEY_PreviousCandidate);
 }
 
+/* Track local XKB compose evidence; host surrounding-text readback confirms it. */
 static void composition_key(struct inklow_wl *w, xkb_keysym_t sym)
 {
     if (modifier_keysym(sym)) return;
@@ -398,6 +416,7 @@ static void composition_key(struct inklow_wl *w, xkb_keysym_t sym)
     if (w->composition != COMPOSITION_IDLE) inklow_wl_hide(w);
 }
 
+/* Pair consumed presses/releases while forwarding every unhandled host event. */
 static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                          uint32_t time, uint32_t key, uint32_t state)
 {
@@ -415,6 +434,8 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
     if (w->ready && w->keys && key < MAX_KEY && !w->compose_blocked &&
         (state == WL_KEYBOARD_KEY_STATE_RELEASED || (!consume && state == WL_KEYBOARD_KEY_STATE_PRESSED))) {
         char name[128];
+        /* Shortcut identity uses the unshifted alphanumeric key; compose tracking
+         * above keeps the actual keysym so layout output is not misclassified. */
         const xkb_keysym_t *base = NULL;
         xkb_layout_index_t layout = xkb_state_key_get_layout(w->keys, key + 8);
         if (layout != XKB_LAYOUT_INVALID &&
@@ -480,6 +501,7 @@ static void ensure_keyboard(struct inklow_wl *w)
     }
 }
 
+/* Keep only safe, unselected UTF-8 excerpts; never send text through callbacks. */
 static void context_surrounding(void *data, struct zwp_input_method_context_v1 *context,
                                 const char *text, uint32_t cursor, uint32_t anchor)
 {
@@ -597,6 +619,7 @@ static const struct zwp_input_method_context_v1_listener context_listener = {
     .commit_state = context_commit, .preferred_language = context_language,
 };
 
+/* Retire the old context before accepting any replacement activation. */
 static void release_context(struct inklow_wl *w)
 {
     invalidate(w, true);
@@ -803,6 +826,7 @@ uint32_t inklow_wl_compositor_pid(struct inklow_wl *w)
     return w && !w->failed ? w->compositor_pid : 0;
 }
 
+/* Pair prepare_read with read/cancel; a readiness callback must never block. */
 int inklow_wl_dispatch(struct inklow_wl *w)
 {
     if (!w || !w->display || w->failed) return -1;
@@ -893,6 +917,7 @@ int inklow_wl_ghost_present(struct inklow_wl *w, uint64_t scene, uint64_t frame,
 void inklow_wl_ghost_hide(struct inklow_wl *w)
 { if (w) inklow_ghost_hide(w->ghost); }
 
+/* Native surrounding text may be an excerpt rather than the entire field. */
 int inklow_wl_matches(struct inklow_wl *w, uint32_t generation, uint32_t serial,
                       const char *text, size_t length, size_t cursor)
 {
@@ -920,6 +945,7 @@ int inklow_wl_commit(struct inklow_wl *w, uint32_t generation, uint32_t serial, 
 }
 
 
+/* Only compositor release makes a busy buffer safe to erase or overwrite. */
 static void buffer_release(void *data, struct wl_buffer *buffer)
 {
     (void)buffer;
@@ -946,6 +972,7 @@ static void destroy_buffer(struct image_buffer *b)
     memset(b, 0, sizeof(*b));
 }
 
+/* Called only after present validates dimensions and selects a non-busy slot. */
 static bool allocate_buffer(struct inklow_wl *w, struct image_buffer *b, int width, int height, int stride)
 {
     size_t size = (size_t)stride * (size_t)height;
@@ -983,6 +1010,8 @@ int inklow_wl_present(struct inklow_wl *w, const void *pixels, int width, int he
         inklow_wl_hide(w);
         return 0;
     }
+    /* Prefer a reusable matching allocation, but never overwrite compositor-owned
+     * pixels. A busy result leaves the caller responsible for retrying its frame. */
     struct image_buffer *b = NULL;
     for (size_t i = 0; i < 2; ++i) {
         if (!w->buffers[i].busy) {

@@ -1,3 +1,10 @@
+/*
+ * Optional click-through Wayland ghost renderer on an authenticated public display.
+ * Plasma frame observations and output metadata authorize a scene; configure,
+ * fractional scale and presentation feedback separately fence each paint.
+ * The owning private input-method client remains usable when this helper fails.
+ * All state and callbacks stay on its event-loop thread; titles are discarded.
+ */
 #define _GNU_SOURCE
 #include "wayland_ghost.h"
 #include "wlr-layer-shell-client-protocol.h"
@@ -24,6 +31,7 @@
 #define GHOST_MAX_DIMENSION 16384
 #define GHOST_MAX_SCALE (16u * 120u)
 
+/* A complete logical-output batch is required before geometry can authorize paint. */
 struct ghost_output {
     struct ghost_output *next;
     struct inklow_ghost *owner;
@@ -43,6 +51,7 @@ struct ghost_window {
     bool initial, geometry, state, mapped;
 };
 
+/* busy belongs to compositor release; dirty/erase track deferred pixel retirement. */
 struct ghost_buffer {
     struct inklow_ghost *owner;
     struct wl_buffer *proxy;
@@ -94,6 +103,7 @@ static void notify(struct inklow_ghost *g, int type, uint32_t state,
     if (g->notify) g->notify(g->userdata, type, state, scene, frame);
 }
 
+/* Clear frame identity before notification so reentrant hides cannot revoke twice. */
 static void revoke_frame(struct inklow_ghost *g)
 {
     if (g->feedback) {
@@ -149,6 +159,7 @@ void inklow_ghost_hide(struct inklow_ghost *g)
     g->hiding = false;
 }
 
+/* Scene changes retire all geometry-dependent work, including presented frames. */
 static void scene_changed(struct inklow_ghost *g)
 {
     if (++g->scene == 0) ++g->scene;
@@ -189,6 +200,7 @@ int inklow_ghost_flush(struct inklow_ghost *g)
     return -1;
 }
 
+/* External desktop state is mandatory; protocol state is an additional veto. */
 static bool capable(struct inklow_ghost *g)
 {
     return g && !g->failed && !g->hiding && g->compositor && g->shm && g->layers && g->windows &&
@@ -197,6 +209,7 @@ static bool capable(struct inklow_ghost *g)
            (!g->desktop_known || !g->desktop);
 }
 
+/* Widen sums to avoid signed-coordinate overflow during containment checks. */
 static bool contains(int32_t x, int32_t y, int32_t width, int32_t height,
                      int32_t left, int32_t top, int32_t w, int32_t h)
 {
@@ -205,6 +218,7 @@ static bool contains(int32_t x, int32_t y, int32_t width, int32_t height,
            (int64_t)top + h <= (int64_t)y + height;
 }
 
+/* Never infer a target from PID alone: require exactly one observed active window. */
 int inklow_ghost_window(struct inklow_ghost *g, uint32_t pid, struct inklow_wl_ghost_window *result)
 {
     if (!capable(g) || !pid || !result) return 0;
@@ -225,6 +239,7 @@ int inklow_ghost_window(struct inklow_ghost *g, uint32_t pid, struct inklow_wl_g
     return 1;
 }
 
+/* Reject incomplete, overlapping, spanning or transformed output geometry. */
 static struct ghost_output *rectangle_output(struct inklow_ghost *g, int x, int y, int width, int height)
 {
     struct ghost_output *found = NULL;
@@ -251,6 +266,7 @@ static bool current_rectangle(struct inklow_ghost *g)
            g->target_output && rectangle_output(g, g->x, g->y, g->width, g->height) == g->target_output;
 }
 
+/* Invalidate immediately, then wait for the protocol's output completion fence. */
 static void output_dirty(struct ghost_output *o)
 {
     o->done = false;
@@ -334,6 +350,7 @@ static const struct zxdg_output_v1_listener logical_listener = {
     .name = logical_string, .description = logical_string,
 };
 
+/* Registry announcements may arrive in either manager/output order. */
 static void add_logical(struct inklow_ghost *g, struct ghost_output *o)
 {
     if (g->outputs && !o->logical) {
@@ -421,6 +438,7 @@ static void window_parent(void *data, struct org_kde_plasma_window *proxy, struc
     if (w->flags & 1u) scene_changed(w->owner);
 }
 
+/* Remove the window before revocation callbacks can query active-window uniqueness. */
 static void window_unmapped(void *data, struct org_kde_plasma_window *proxy)
 {
     struct ghost_window *w = data;
@@ -508,6 +526,7 @@ static void surface_leave(void *data, struct wl_surface *surface, struct wl_outp
 }
 static const struct wl_surface_listener surface_listener = {.enter = surface_enter, .leave = surface_leave};
 
+/* The first matching configure unlocks readiness; later ones invalidate anchoring. */
 static void layer_configure(void *data, struct zwlr_layer_surface_v1 *layer,
                             uint32_t serial, uint32_t width, uint32_t height)
 {
@@ -538,6 +557,7 @@ static void preferred_scale(void *data, struct wp_fractional_scale_v1 *proxy, ui
 }
 static const struct wp_fractional_scale_v1_listener fractional_listener = {.preferred_scale = preferred_scale};
 
+/* Create a fresh noninteractive role, then wait for configure and fractional scale. */
 int inklow_ghost_prepare(struct inklow_ghost *g, uint32_t pid, uint64_t scene,
                          int x, int y, int width, int height)
 {
@@ -551,6 +571,8 @@ int inklow_ghost_prepare(struct inklow_ghost *g, uint32_t pid, uint64_t scene,
     }
     struct ghost_output *output = rectangle_output(g, x, y, width, height);
     if (!output) { inklow_ghost_hide(g); return 0; }
+    /* Reuse only an identical prepared rectangle. Moving it needs a new role and
+     * configure fence, not a buffer commit against stale placement metadata. */
     if (g->surface && g->target_pid == pid && g->target_output == output &&
         g->x == x && g->y == y && g->width == width && g->height == height)
         return g->configured && g->scale ? 1 : 2;
@@ -616,6 +638,7 @@ static void destroy_buffer(struct ghost_buffer *b)
     memset(b, 0, sizeof(*b));
 }
 
+/* Allocate only validated dimensions in an idle slot; retain no backing fd. */
 static bool allocate_buffer(struct inklow_ghost *g, struct ghost_buffer *b, int width, int height, int stride)
 {
     size_t size = (size_t)stride * (size_t)height;
@@ -644,6 +667,7 @@ static void feedback_output(void *data, struct wp_presentation_feedback *feedbac
     g->feedback_output = true;
 }
 
+/* Presentation proof requires this frame, its expected output and current geometry. */
 static void feedback_presented(void *data, struct wp_presentation_feedback *feedback,
                                uint32_t hi, uint32_t lo, uint32_t nsec, uint32_t refresh,
                                uint32_t seq_hi, uint32_t seq_lo, uint32_t flags)
@@ -673,6 +697,7 @@ static const struct wp_presentation_feedback_listener feedback_listener = {
     .sync_output = feedback_output, .presented = feedback_presented, .discarded = feedback_discarded,
 };
 
+/* Queue one monotonically identified frame; a successful flush is not visibility. */
 int inklow_ghost_present(struct inklow_ghost *g, uint64_t scene, uint64_t frame,
                          const void *pixels, int width, int height, int stride)
 {
@@ -685,6 +710,8 @@ int inklow_ghost_present(struct inklow_ghost *g, uint64_t scene, uint64_t frame,
         inklow_ghost_hide(g);
         return 0;
     }
+    /* Backpressure is distinct from refusal: busy buffers can be retried after
+     * release without allocating an unbounded stream of shared-memory images. */
     struct ghost_buffer *b = NULL;
     for (size_t i = 0; i < 2; ++i) {
         struct ghost_buffer *candidate = &g->buffers[i];
@@ -863,6 +890,7 @@ int inklow_ghost_dispatch(struct inklow_ghost *g)
     return inklow_ghost_flush(g);
 }
 
+/* Suppress notifications before teardown can revoke frames or encounter errors. */
 void inklow_ghost_close(struct inklow_ghost *g)
 {
     if (!g) return;

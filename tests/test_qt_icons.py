@@ -1,4 +1,4 @@
-"""Small and large logical icon requests must retain different visible artwork."""
+"""Constrain logical-size artwork, palette recoloring, and accessible icon actions."""
 import pytest
 
 pytest.importorskip("PySide6")
