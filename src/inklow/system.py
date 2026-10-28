@@ -112,24 +112,40 @@ def set_launch_at_login(enabled: bool) -> bool:
 
 
 def install_wayland_input_method() -> Path:
-    """Install only this user's launcher; never select it or alter KWin settings."""
+    """Register the current frozen executable; never select it or change KWin."""
     if not sys.platform.startswith("linux"):
         raise RuntimeError("KDE Wayland input-method setup is available on Linux only.")
     if os.environ.get("INKLOW_HOME"):
         raise RuntimeError("Desktop integration cannot be installed from an isolated profile.")
+    if not getattr(sys, "frozen", False):
+        raise RuntimeError(
+            "KDE Wayland registration requires the frozen BroTypist application. "
+            "Source Python shares an interpreter identity and cannot safely receive "
+            "window metadata permission. Build with python tools/build_app.py, then "
+            "run the resulting launch-brotypist wayland install.")
+    executable = Path(sys.executable).resolve(strict=True)
+    # KWin matches QProcess::splitCommand(Exec).first() against /proc/PID/exe.
+    # It does not undo shell quoting or desktop Exec percent field expansion.
+    if any(character in str(executable) for character in '\\\\"`$%\n\r\t'):
+        raise RuntimeError(
+            "KDE cannot safely match this executable path. Move the intact BroTypist "
+            "directory to a path without backslashes, quotes, backticks, dollar or "
+            "percent signs, or control whitespace, then run wayland install again.")
     native = Path(__file__).parent / "native" / "libinklow_wayland.so"
     if not native.is_file():
-        raise RuntimeError("The native Wayland client is missing. Build it with python tools/build_wayland.py, or install a package containing it.")
+        raise RuntimeError("The native Wayland client is missing. Rebuild or install a complete BroTypist application.")
     path = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "applications" / (_INPUT_METHOD_ID + ".desktop")
     if path.is_symlink() or (path.exists() and "X-Inklow-Owned=true" not in path.read_text(encoding="utf-8")):
         raise RuntimeError(f"A different input-method entry already exists at {path}; it was not overwritten.")
-    command = _desktop_command([*_launch_arguments(), "--wayland-input-method"])
+    command = _desktop_command([str(executable), "--wayland-input-method", "--background"])
     icon = str(Path(__file__).parent / "assets/icons/app-256.png").replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
     content = ("[Desktop Entry]\nType=Application\nName=BroTypist\n"
                "GenericName=Predictive typing input method\n"
-               "Comment=Manual controls for supported KDE Wayland text inputs; ordinary inline completion unavailable\n"
+               "Comment=Local predictions for supported KDE Wayland text inputs\n"
                f"Exec={command}\nIcon={icon}\nTerminal=false\nNoDisplay=true\n"
-               "X-KDE-Wayland-VirtualKeyboard=true\nX-Inklow-Owned=true\n")
+               "X-KDE-Wayland-VirtualKeyboard=true\n"
+               "X-KDE-Wayland-Interfaces=org_kde_plasma_window_management\n"
+               "X-Inklow-Owned=true\n")
     _atomic_write(path, content.encode("utf-8"))
     return path
 
@@ -190,7 +206,7 @@ def open_permissions(kind: str = "accessibility") -> None:
     elif sys.platform == "win32":
         _open("ms-settings:privacy")
     else:
-        raise RuntimeError("Enable desktop accessibility. X11 uses AT-SPI keyboard access; KDE Wayland requires explicitly selecting BroTypist as the native input method in Privacy or Welcome. OS access is never granted automatically.")
+        raise RuntimeError("Enable desktop accessibility. X11 uses AT-SPI keyboard access; KDE Wayland requires explicitly selecting the packaged BroTypist input method through Setup or Welcome. OS access is never granted automatically.")
 
 
 def reveal_models() -> None:
@@ -296,15 +312,39 @@ def _sample_power_status() -> dict:
                 if status.BatteryLifePercent <= 100:
                     reading["percent"] = int(status.BatteryLifePercent)
         return reading
-    supplies = Path("/sys/class/power_supply")
-    if not supplies.exists():
+    return _linux_power_status(Path("/sys/class/power_supply"))
+
+
+def _linux_power_status(supplies: Path) -> dict:
+    """Read system batteries, never peripherals or an invented multi-pack average."""
+    reading = _unknown_power_status()
+    if not supplies.is_dir():
         return reading
     batteries = []
+    external = []
     incomplete = False
     for supply in supplies.iterdir():
         try:
-            if (supply / "type").read_text().strip() != "Battery":
+            kind = (supply / "type").read_text().strip()
+            if kind != "Battery":
+                online = supply / "online"
+                if kind in {"Mains", "USB", "USB_C", "USB_PD", "Wireless"} and online.is_file():
+                    value = online.read_text().strip()
+                    if value not in {"0", "1"}:
+                        incomplete = True
+                    else:
+                        external.append(value == "1")
                 continue
+            scope = supply / "scope"
+            if scope.is_file() and scope.read_text().strip() == "Device":
+                continue
+            present = supply / "present"
+            if present.is_file():
+                value = present.read_text().strip()
+                if value == "0":
+                    continue
+                if value != "1":
+                    incomplete = True
             reading["has_battery"] = True
             state = (supply / "status").read_text().strip()
             batteries.append((supply, state))
@@ -312,19 +352,90 @@ def _sample_power_status() -> dict:
                 reading["on_battery"] = True
         except (OSError, UnicodeError):
             incomplete = True
-    reading["available"] = not incomplete and all(
-        state in {"Discharging", "Charging", "Full", "Not charging"}
-        for _, state in batteries)
-    if batteries and reading["available"]:
-        reading["charging"] = any(state == "Charging" for _, state in batteries)
-        if len(batteries) == 1:
-            try:
-                percent = int((batteries[0][0] / "capacity").read_text().strip())
-                if 0 <= percent <= 100:
-                    reading["percent"] = percent
-            except (OSError, UnicodeError, ValueError):
-                pass
+    if incomplete or len(batteries) > 1:
+        return reading
+    if not batteries:
+        reading["available"] = True
+        return reading
+    battery, state = batteries[0]
+    ac = any(external) if external else None
+    if state not in {"Discharging", "Charging", "Full", "Not charging"}:
+        return reading
+    if (state == "Discharging" and ac is True
+            or state in {"Charging", "Full"} and ac is False
+            or state == "Not charging" and ac is None):
+        return reading
+    reading["available"] = True
+    reading["on_battery"] = state == "Discharging" or ac is False
+    reading["charging"] = state == "Charging"
+    try:
+        percent = int((battery / "capacity").read_text().strip())
+        if 0 <= percent <= 100:
+            reading["percent"] = percent
+    except (OSError, UnicodeError, ValueError):
+        pass
     return reading
+
+
+def linux_session_display_preferences(*, cancel=None) -> dict:
+    """Bounded, read-only facts for a background sampler; absence is not consent.
+
+    The logind active graphical local user session must explicitly be unlocked.
+    Desktop preferences are optional; callers retain a static motion fallback.
+    No DBus activation, permission request or setting mutation is performed.
+    """
+    facts = {"session_unlocked": None, "reduce_motion": None,
+             "increase_contrast": None, "reduce_transparency": None}
+    if not sys.platform.startswith("linux"):
+        return facts
+    deadline = time.monotonic() + 1.0
+
+    def query(arguments):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or cancel is not None and cancel.is_set():
+            return None
+        executable = shutil.which(arguments[0])
+        if not executable:
+            return None
+        try:
+            result = subprocess.run([executable, *arguments[1:]], capture_output=True,
+                                    text=True, timeout=min(.35, remaining), check=True)
+            return result.stdout.strip()
+        except (OSError, UnicodeError, subprocess.SubprocessError):
+            return None
+
+    session = os.environ.get("XDG_SESSION_ID", "self")
+    # Refuse option-like/unbounded environment values rather than changing scope.
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session) and not session.startswith("-"):
+        output = query(["loginctl", "show-session", session, "--no-pager",
+                        "--property=Active,LockedHint,Remote,Type,Class"])
+        if output is not None:
+            fields = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+            required = {"Active", "LockedHint", "Remote", "Type", "Class"}
+            if required <= fields.keys():
+                facts["session_unlocked"] = (
+                    fields["Active"] == "yes" and fields["LockedHint"] == "no"
+                    and fields["Remote"] == "no" and fields["Type"] in {"x11", "wayland"}
+                    and fields["Class"] == "user")
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+    if "gnome" in desktop:
+        animations = query(["gsettings", "get", "org.gnome.desktop.interface", "enable-animations"])
+        if animations in {"true", "false"}:
+            facts["reduce_motion"] = animations == "false"
+        theme = query(["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"])
+        if theme:
+            facts["increase_contrast"] = "highcontrast" in theme.replace("-", "").lower()
+    elif "kde" in desktop:
+        factor = query(["kreadconfig6", "--file", "kdeglobals", "--group", "KDE",
+                        "--key", "AnimationDurationFactor"])
+        if factor:
+            try:
+                value = float(factor)
+                if 0 <= value < float("inf"):
+                    facts["reduce_motion"] = value == 0
+            except ValueError:
+                pass
+    return facts
 
 
 def power_status() -> dict:

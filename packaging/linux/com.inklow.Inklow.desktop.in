@@ -7,5 +7,6 @@ Exec=@EXEC@
 Icon=@ICON@
 Terminal=false
 Categories=Utility;Office;
+X-KDE-Wayland-Interfaces=org_kde_plasma_window_management
 StartupNotify=true
 StartupWMClass=BroTypist

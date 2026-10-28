@@ -113,35 +113,29 @@ def test_reference_tokens_are_capped_without_discarding_recent_draft_or_provenan
     assert options["context"] == context
 
 
-def test_overfull_prompt_removes_optional_context_before_trimming_the_draft():
+@pytest.mark.parametrize("optional,omitted_marker", [
+    ({"context": "zeta_optional_reference " + "mission " * 100}, "zeta_optional_reference"),
+    ({"personalization": '{"recurring_words":["lexical_evidence_marker","observability","instrumentation","reproducibility","interoperability","idempotency","consistency"]}'},
+     "lexical_evidence_marker"),
+])
+def test_context_capacity_preserves_mandatory_writing_before_optional_evidence(optional, omitted_marker):
     config = Config(prompt_style="writing", context_chars=2000, max_tokens=32)
-    draft = "newest mission update"
-    baseline = writing_prompt(draft, "", "")
-    instructions = "x" * (4096 - config.max_tokens - 8 - len(baseline.encode("utf-8")) - len("\nWriting preferences: ".encode("utf-8")) - 10)
-    tokens = _prompt_tokens(ByteTokenizer(), config, draft, "", {
-        "instructions": instructions,
-        "context": "Focused-window Accessibility (untrusted reference data): " + "mission " * 100,
-    })
-    prompt = bytes(tokens).decode("utf-8")
-    assert len(tokens) <= 4096 - config.max_tokens - 8
-    assert prompt.endswith(draft)
+    draft, suffix = "The deployment update is ready", " after your review."
+    instructions = "Use natural Brazilian Portuguese and English; keep proper names unchanged."
+    required = _prompt_tokens(ByteTokenizer(context_size=16384), config, draft, suffix,
+                              {"instructions": instructions})
+    # Model capacity leaves a small spare window, not enough for either
+    # optional reference. No prompt heading or platform language hint is pinned.
+    model = ByteTokenizer(context_size=len(required) + config.max_tokens + 64)
+    options = {"instructions": instructions, **optional}
 
-
-def test_optional_learned_evidence_never_displaces_current_draft_suffix_or_preferences():
-    config = Config(prompt_style="writing", context_chars=2000, max_tokens=32)
-    draft, suffix = "newest mission update", " tomorrow."
-    budget = 4096 - config.max_tokens - 8
-    baseline = _prompt_tokens(ByteTokenizer(), config, draft, suffix, {})
-    instructions = "x" * (budget - len(baseline) - len("\nWriting preferences: ") - 10)
-    learned = '{"recurring_words":["observability","instrumentation"]}'
-    options = {"instructions": instructions, "personalization": learned}
-    tokens = _prompt_tokens(ByteTokenizer(), config, draft, suffix, options)
+    tokens = _prompt_tokens(model, config, draft, suffix, options)
     rendered = bytes(tokens).decode("utf-8")
-    assert len(tokens) <= budget
-    assert rendered.endswith(draft)
-    assert json.dumps(suffix) in rendered and instructions in rendered
-    assert json.dumps(learned) not in rendered
-    assert options["personalization"] == learned
+
+    assert len(tokens) + config.max_tokens <= model.n_ctx()
+    assert draft in rendered and suffix in rendered and instructions in rendered
+    assert omitted_marker not in rendered
+    assert options == {"instructions": instructions, **optional}
 
 
 def test_instructions_that_alone_exceed_context_fail_instead_of_losing_role_boundary():

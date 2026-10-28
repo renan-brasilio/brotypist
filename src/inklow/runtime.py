@@ -1409,7 +1409,10 @@ class Controller:
         if claimed is not None:
             claimed_kind, entry = claimed
             return entry if claimed_kind == kind and entry[0] == key else ()
-        if not self._fast_keys:
+        inline_ack = kind == "completion" and (
+            getattr(self.bridge, "requires_inline_presentation", False)
+            or getattr(self.bridge, "strict_visible_acceptance", False))
+        if not self._fast_keys and not inline_ack:
             return None
         entry = self._presented.get(kind)
         return entry if entry is not None and entry[0] == key else ()
@@ -1488,11 +1491,13 @@ class Controller:
         text = self._suggestion.accept(
             current, full=full, trailing_space=self.config.trailing_space,
             trailing_punctuation=include_punctuation(self.config.punctuation_mode, full),
-            visible=drawn[1] if drawn else None)
+            visible=drawn[1] if drawn else None,
+            exact_visible=bool(getattr(self.bridge, "strict_visible_acceptance", False)))
         updated = self._suggestion.snapshot
         # Compute the pure state transition under the decision lock, but commit
         # no statistics/history until the native adapter confirms insertion.
-        if not text or updated is None or not self.bridge.insert(current, text):
+        insert = getattr(self.bridge, "insert_inline", self.bridge.insert)
+        if not text or updated is None or not insert(current, text):
             self._clear()
             return False
         self._client.cancel()

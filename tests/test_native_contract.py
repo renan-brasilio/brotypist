@@ -1696,3 +1696,26 @@ def test_mac_browser_focus_window_mismatch_never_reads_the_detached_field():
     attributes[("application", "AXFocusedWindow")] = "other-window"
     assert bridge.capture() is None
     assert ("field", "AXValue") not in reads
+
+
+@pytest.mark.parametrize("attributes,native_inactive,reads_metrics", [
+    ({}, False, False),
+    ({"composing": "false"}, False, True),
+    ({"composing": "true"}, False, False),
+    ({}, True, True),
+    ({"composition-active": "true"}, True, False),
+    ({"composing": "unknown"}, True, False),
+])
+def test_linux_host_metric_composition_proof_preserves_x11_default(
+        attributes, native_inactive, reads_metrics):
+    bridge = LinuxBridge.__new__(LinuxBridge)
+    bridge.atspi = SimpleNamespace(DESKTOP_COORDS=0)
+    reads = []
+    def attribute_run(*args):
+        reads.append(args)
+        raise NotImplementedError("OS font boundary")
+    interface = SimpleNamespace(getAttributeRun=attribute_run)
+    assert bridge._inline_metrics(
+        None, interface, "Hello", 5, (100, 40, 1, 20), attributes,
+        composition_inactive=native_inactive) is None
+    assert bool(reads) is reads_metrics

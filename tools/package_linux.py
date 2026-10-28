@@ -69,8 +69,9 @@ def validate_bundle(bundle: Path, version: str) -> None:
 
 def copy_application(bundle: Path, target: Path) -> None:
     shutil.copytree(bundle, target, symlinks=True)
-    # build_app's entries point to its original destination. Portable users run
-    # launch-brotypist directly; .deb integration is rendered for installed paths.
+    # Never export build-machine executable paths. Portable users explicitly run
+    # launch-brotypist wayland install after extraction (and again after moving).
+    # The .deb's own desktop entries are rendered for the installed ELF path.
     for entry in (target / "BroTypist.desktop", target / "share/applications" / f"{APP_ID}.desktop",
                   target / "share/applications" / f"{APP_ID}.InputMethod.desktop"):
         entry.unlink(missing_ok=True)
@@ -156,10 +157,10 @@ def package(bundle: Path, output: Path, version: str) -> tuple[Path, Path]:
         applications = root / "usr/share/applications"
         applications.mkdir(parents=True)
         template = (ROOT / "packaging/linux" / f"{APP_ID}.desktop.in").read_text(encoding="utf-8")
-        entry = template.replace("@EXEC@", "/usr/bin/brotypist").replace("@ICON@", APP_ID)
+        entry = template.replace("@EXEC@", "/opt/brotypist/BroTypist").replace("@ICON@", APP_ID)
         (applications / f"{APP_ID}.desktop").write_text(entry, encoding="utf-8")
         method_template = (ROOT / "packaging/linux" / f"{APP_ID}.InputMethod.desktop.in").read_text(encoding="utf-8")
-        method_entry = method_template.replace("@EXEC@", "/usr/bin/brotypist").replace("@ICON@", APP_ID)
+        method_entry = method_template.replace("@EXEC@", "/opt/brotypist/BroTypist").replace("@ICON@", APP_ID)
         (applications / f"{APP_ID}.InputMethod.desktop").write_text(method_entry, encoding="utf-8")
         icons = root / "usr/share/icons/hicolor"
         icons.parent.mkdir(parents=True)

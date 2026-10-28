@@ -93,3 +93,33 @@ def test_acceptance_respects_displayed_word_boundary_and_allowed_whitespace(
     else:
         assert state.snapshot == snapshot
         assert state.generation == generation
+
+
+@pytest.mark.parametrize("suggestion,visible,full,accepted,remainder", [
+    (" arrive tomorrow", " arrive", False, " arrive", " tomorrow"),
+    (" arrive tomorrow", " arrive", True, " arrive", " tomorrow"),
+    (" arrive", " arrive", False, " arrive", ""),
+    (" arrive  tomorrow", " arrive ", False, " arrive ", " tomorrow"),
+    (" café amanhã", " café", False, " café", " amanhã"),
+    (" arrive tomorrow", " arr", True, " arr", "ive tomorrow"),
+])
+def test_exact_visible_acceptance_never_adds_or_consumes_an_unpainted_separator(
+        suggestion, visible, full, accepted, remainder):
+    snapshot = Snapshot("writer", "body", "We will", 7)
+    state = SuggestionState()
+    state.offer(state.generation, snapshot, suggestion)
+
+    assert state.accept(snapshot, full=full, visible=visible, exact_visible=True) == accepted
+    assert state.snapshot.text == snapshot.text + accepted
+    assert state.text == remainder
+
+
+@pytest.mark.parametrize("visible", [None, " arr"])
+def test_exact_word_acceptance_refuses_missing_presentation_or_hidden_word_tail(visible):
+    snapshot = Snapshot("writer", "body", "We will", 7)
+    state = SuggestionState()
+    state.offer(state.generation, snapshot, " arrive tomorrow")
+
+    assert state.accept(snapshot, visible=visible, exact_visible=True) == ""
+    assert state.snapshot == snapshot
+    assert state.text == " arrive tomorrow"

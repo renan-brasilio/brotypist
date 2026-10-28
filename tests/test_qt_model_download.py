@@ -1,4 +1,4 @@
-"""The model dialog must observe verified completion independently of Settings."""
+"""The model panel observes verified downloads independently of the resident tick."""
 from hashlib import sha256
 import sys
 import threading
@@ -10,7 +10,7 @@ if sys.platform == "darwin":
     pytest.skip("macOS uses the native AppKit shell", allow_module_level=True)
 
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from inklow import models
 from inklow.config import Config
@@ -21,7 +21,7 @@ from inklow.runtime import Controller
 
 
 @pytest.mark.parametrize("license_required", [False, True])
-def test_download_becomes_usable_without_visible_parent_or_agent_tick(monkeypatch, tmp_path, license_required):
+def test_download_becomes_usable_without_agent_tick(monkeypatch, tmp_path, license_required):
     app = QApplication.instance() or QApplication([])
     app.setQuitOnLastWindowClosed(False)
     monkeypatch.setenv("INKLOW_HOME", str(tmp_path / "profile"))
@@ -62,12 +62,11 @@ def test_download_becomes_usable_without_visible_parent_or_agent_tick(monkeypatc
 
     monkeypatch.setattr(models.urllib.request, "build_opener", lambda *args: Source())
     controller = Controller(Config(global_enabled=False, statistics_enabled=False), BridgeBase())
-    parent = QWidget()
-    dialog = ModelManager(controller, parent)
+    dialog = ModelManager(controller)
     try:
         dialog.show()
         app.processEvents()
-        assert dialog.isVisible() and not parent.isVisible()
+        assert dialog.isVisible()
         prompts = []
         if license_required:
             monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.No)
@@ -95,7 +94,7 @@ def test_download_becomes_usable_without_visible_parent_or_agent_tick(monkeypatc
         while time.monotonic() < deadline and not dialog.use.isEnabled():
             QTest.qWait(20)
         # No calls to Controller.tick(), Settings.refresh_status() or the
-        # model dialog's refresh methods after the verified transfer finishes.
+        # model panel's refresh methods after the verified transfer finishes.
         assert dialog.use.isEnabled()
         assert dialog.progress.value() == dialog.progress.maximum()
         assert not dialog.cancel.isEnabled()
@@ -104,7 +103,6 @@ def test_download_becomes_usable_without_visible_parent_or_agent_tick(monkeypatc
         controller.stop()
         dialog.close()
         dialog.deleteLater()
-        parent.deleteLater()
         app.processEvents()
 
 

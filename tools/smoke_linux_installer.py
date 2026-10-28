@@ -7,11 +7,13 @@ interactive typing proof, real home mutation, or accessibility grants.
 from __future__ import annotations
 
 import argparse
+import configparser
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -162,7 +164,6 @@ def inspect_atspi_window(pid: int, *, quit_app: bool = False) -> dict:
             children = int(window.childCount)
             if children <= 0:
                 raise RuntimeError("Own-process settings AT-SPI window has no accessible controls")
-            native = ""
             sections = False
             quit_button = None
             stack = [window]
@@ -172,24 +173,22 @@ def inspect_atspi_window(pid: int, *, quit_app: bool = False) -> dict:
                 remaining -= 1
                 name = str(element.name or "")
                 sections = sections or element.getRole() == pyatspi.ROLE_LIST
-                if name.startswith("Linux AT-SPI/X11 ready."):
-                    native = name
                 if name == "Quit BroTypist" and element.getRole() == pyatspi.ROLE_PUSH_BUTTON:
                     button_state = element.getState()
                     if all(button_state.contains(flag) for flag in
                            (pyatspi.STATE_VISIBLE, pyatspi.STATE_SHOWING, pyatspi.STATE_ENABLED)):
                         quit_button = element
-                if native and sections and quit_button is not None:
+                if sections and quit_button is not None:
                     break
                 for index in range(min(element.childCount, 128)):
                     descendant = element.getChildAtIndex(index)
                     if descendant is not None:
                         stack.append(descendant)
-            if not native or not sections or quit_button is None:
+            if not sections or quit_button is None:
                 continue  # A first-run Welcome window is not the settings window.
             receipt = {"pid": pid, "title": window.name, "role": window.getRoleName(),
                        "accessible_children": children, "visible_showing_enabled": True,
-                       "settings_sections": sections, "native_bridge": native,
+                       "settings_sections": sections,
                        "visible_quit_button": True}
             if quit_app:
                 action = quit_button.queryAction()
@@ -322,10 +321,17 @@ def smoke(deb: Path, archive: Path, version: str, report: Path) -> dict:
             for path, checksum in sentinels.items():
                 if digest(path) != checksum:
                     raise RuntimeError(f"Installation modified external user state: {path}")
-            desktop = Path(f"/usr/share/applications/{APP_ID}.desktop").read_text(encoding="utf-8")
-            if "Exec=/usr/bin/brotypist\n" not in desktop or f"Icon={APP_ID}\n" not in desktop:
-                raise RuntimeError("Installed desktop entry does not target installed integration")
-            command(["desktop-file-validate", f"/usr/share/applications/{APP_ID}.desktop"])
+            for suffix, arguments in (("", []), (".InputMethod", ["--wayland-input-method", "--background"])):
+                desktop = Path(f"/usr/share/applications/{APP_ID}{suffix}.desktop")
+                entry = configparser.ConfigParser(interpolation=None)
+                entry.read(desktop, encoding="utf-8")
+                values = entry["Desktop Entry"]
+                executable, *actual_arguments = shlex.split(values["Exec"])
+                if (Path(executable).resolve(strict=True) != Path("/opt/brotypist/BroTypist")
+                        or actual_arguments != arguments or values["Icon"] != APP_ID
+                        or values.get("X-KDE-Wayland-Interfaces") != "org_kde_plasma_window_management"):
+                    raise RuntimeError(f"Installed desktop identity does not target its actual executable: {desktop}")
+                command(["desktop-file-validate", str(desktop)])
             if not Path(f"/usr/share/icons/hicolor/256x256/apps/{APP_ID}.png").is_file():
                 raise RuntimeError("Installed application icon is missing")
             receipt["installed"] = exercise(Path("/usr/bin/brotypist"), home, report.with_name("linux-installed"), version)
@@ -342,7 +348,9 @@ def smoke(deb: Path, archive: Path, version: str, report: Path) -> dict:
                 command(["sudo", "-n", "dpkg", "--purge", "brotypist"])
         if Path("/opt/brotypist").exists() or Path("/usr/bin/brotypist").exists():
             raise RuntimeError("Uninstall left application paths behind")
-        for relative in (f"/usr/share/applications/{APP_ID}.desktop", f"/usr/share/icons/hicolor/256x256/apps/{APP_ID}.png"):
+        for relative in (f"/usr/share/applications/{APP_ID}.desktop",
+                         f"/usr/share/applications/{APP_ID}.InputMethod.desktop",
+                         f"/usr/share/icons/hicolor/256x256/apps/{APP_ID}.png"):
             if Path(relative).exists():
                 raise RuntimeError(f"Uninstall left owned desktop integration: {relative}")
         for path, checksum in sentinels.items():

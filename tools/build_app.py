@@ -76,13 +76,13 @@ def prepare_linux(bundle: Path, destination: Path) -> None:
         shutil.copy2(ROOT / "src" / "inklow" / "assets" / "icons" / f"app-{size}.png", target)
     template = (ROOT / "packaging" / "linux" / f"{APP_ID}.desktop.in").read_text(encoding="utf-8")
     icon = destination / "share" / "icons" / "hicolor" / "256x256" / "apps" / f"{APP_ID}.png"
-    entry = template.replace("@EXEC@", desktop_exec(destination / "launch-brotypist"))
+    entry = template.replace("@EXEC@", desktop_exec(destination / "BroTypist"))
     entry = entry.replace("@ICON@", desktop_value(str(icon)))
     applications = bundle / "share" / "applications"
     applications.mkdir(parents=True, exist_ok=True)
     (applications / f"{APP_ID}.desktop").write_text(entry, encoding="utf-8")
     method_template = (ROOT / "packaging/linux" / f"{APP_ID}.InputMethod.desktop.in").read_text(encoding="utf-8")
-    method_entry = method_template.replace("@EXEC@", desktop_exec(destination / "launch-brotypist"))
+    method_entry = method_template.replace("@EXEC@", desktop_exec(destination / "BroTypist"))
     method_entry = method_entry.replace("@ICON@", desktop_value(str(icon)))
     (applications / f"{APP_ID}.InputMethod.desktop").write_text(method_entry, encoding="utf-8")
     (bundle / "BroTypist.desktop").write_text(entry, encoding="utf-8")
@@ -203,7 +203,8 @@ def main(argv: list[str] | None = None) -> int:
     if sys.platform == "linux":
         print(f"Launch: {result / 'launch-brotypist'}")
         print(f"Desktop entry: {result / 'share' / 'applications' / (APP_ID + '.desktop')}")
-        print("Keep the directory intact. Rebuild its desktop entry if you move it.")
+        print("Keep the directory intact. After moving it, run ./launch-brotypist wayland install")
+        print("from its new location to refresh opt-in KDE registration; selection stays manual.")
     elif sys.platform == "win32":
         print("Keep BroTypist.exe, BroTypist-cli.exe and their _internal directory together.")
     return 0
