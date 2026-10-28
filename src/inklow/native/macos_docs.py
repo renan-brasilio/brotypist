@@ -45,6 +45,8 @@ class _Hidden(_Unknown):
 
 @dataclass
 class _Target:
+    """Retain one expiring capability and its native handles; never serialize it."""
+
     token: str
     created: float
     app_id: str
@@ -80,11 +82,13 @@ class DocsHelper:
         return self.bridge._attribute(element, name)
 
     def _pid(self, element, expected):
+        """Reject handles whose owning process cannot be confirmed."""
         error, actual = self.bridge.ax.AXUIElementGetPid(element, None)
         if error or actual != expected:
             raise _Unknown("native_owner_unverified")
 
     def _safe(self, element, *, allow_hidden=False, allow_disabled=False):
+        """Reject protected controls, optionally tolerating transient UI state."""
         enabled = self._get(element, "AXEnabled")
         if (self._get(element, "AXProtectedContent")
                 or self._get(element, "AXSubrole") == "AXSecureTextField"
@@ -97,6 +101,7 @@ class DocsHelper:
             raise _Hidden("native_control_hidden")
 
     def _ancestry(self, element, *, allow_hidden=False):
+        """Return a bounded safe parent chain or raise a content-free reason."""
         result = []
         for _ in range(MAX_ANCESTORS):
             if element is None:
@@ -109,6 +114,7 @@ class DocsHelper:
         raise _Unknown("native_ancestry_unbounded")
 
     def _document_id(self, window, attribute="AXDocument"):
+        """Validate a native Docs edit URL and return an instance-keyed document ID."""
         value = self._get(window, attribute)
         if value is not None and hasattr(value, "absoluteString"):
             value = str(value.absoluteString())
@@ -127,6 +133,12 @@ class DocsHelper:
             raise _Unknown("docs_url_unverified") from None
 
     def _session(self, target=None, scopes=(), *, committed=False, allow_hidden=False):
+        """Resolve current ownership or raise _Unknown on a policy/focus mismatch.
+
+        Scopes allow focus inside controls opened by this helper. After commit,
+        the editor may be rebuilt; only the recognized editor or Tools trigger
+        may replace the target's retained focus handle.
+        """
         bridge = self.bridge
         if (bridge._stopped.is_set() or not bridge.ax.AXIsProcessTrusted()
                 or bridge.secure_input_active() or getattr(bridge, "_dead_key", False)
@@ -209,6 +221,11 @@ class DocsHelper:
         return app_id, pid, document_id, window, web, focus, ancestors
 
     def _anchor(self, ancestors, identity):
+        """Locate a clipped page-margin anchor in top-left screen points.
+
+        Cached editor/page handles avoid rediscovery, not revalidation: their
+        ancestry, ownership and current geometry must still match each hint.
+        """
         # This is an accessory viewport-margin anchor, never a text caret.
         bounds = self.bridge._field_bounds(ancestors[0])
         if (bounds is None or not all(math.isfinite(v) for v in bounds)
@@ -293,6 +310,11 @@ class DocsHelper:
         return (page_bounds[0], top + 40, 1.0, 1.0)
 
     def hint(self):
+        """Return metadata with a reusable unexpired token, or None on uncertainty.
+
+        This reads geometry, not preferences. Failed observation drops both the
+        pending capability and cached handles; diagnostics contain fixed codes.
+        """
         with self.bridge._lock:
             try:
                 app_id, pid, document_id, window, web, focus, ancestors = self._session()
@@ -321,6 +343,7 @@ class DocsHelper:
             return None
 
     def _nodes(self, root):
+        """Collect only bounded AX structure; reject duplicate or excessive nodes."""
         queue, result, seen = [root], [], set()
         while queue:
             node = queue.pop()
@@ -336,6 +359,7 @@ class DocsHelper:
         return result
 
     def _named(self, root, roles, label, *, allow_hidden=False, allow_disabled=False):
+        """Find one exact named control in allowed roles, rejecting ambiguity."""
         found = []
         for node in self._nodes(root):
             if self._get(node, "AXRole") not in roles:
@@ -357,6 +381,7 @@ class DocsHelper:
         return found[0]
 
     def _wait_named(self, target, root, roles, label, scopes):
+        """Wait briefly for a control while rechecking ownership, never retry actions."""
         deadline = time.monotonic() + UI_TIMEOUT
         while True:
             try:
@@ -389,6 +414,7 @@ class DocsHelper:
             time.sleep(0.03)
 
     def _press(self, target, control, scopes, *, unchecked=False):
+        """Issue one AXPress only after final target, ancestry and state checks."""
         self._session(target, scopes)
         self._pid(control, target.pid)
         ancestors = self._ancestry(control)
@@ -409,6 +435,7 @@ class DocsHelper:
             raise _Unknown("docs_native_action_failed")
 
     def _open_settings(self, target):
+        """Open the recognized settings dialog and return its verified controls."""
         deadline = time.monotonic() + UI_TIMEOUT
         while True:
             self._session(target)
@@ -466,6 +493,7 @@ class DocsHelper:
         return dialog, checkbox, braille, default
 
     def _checked(self, target, dialog, checkbox):
+        """Return an owned, enabled checkbox's exact Boolean state or raise."""
         self._session(target, (dialog,))
         self._pid(checkbox, target.pid)
         self._safe(checkbox)
@@ -482,6 +510,7 @@ class DocsHelper:
         return bool(value)
 
     def _enable_checkbox(self, target, dialog, checkbox):
+        """Enable once and await checked readback; return whether a toggle occurred."""
         if self._checked(target, dialog, checkbox):
             return False
         self._press(target, checkbox, (dialog,), unchecked=True)
@@ -493,6 +522,7 @@ class DocsHelper:
         return True
 
     def _wait_braille(self, target, dialog, braille):
+        """Wait for the owned braille checkbox to enable after reader activation."""
         deadline = time.monotonic() + UI_TIMEOUT
         while True:
             self._session(target, (dialog,))
@@ -511,6 +541,12 @@ class DocsHelper:
             time.sleep(0.03)
 
     def enable(self, token):
+        """Consume one token and enable/read back both observed Docs preferences.
+
+        Return status, diagnostic and help URL rather than native exceptions.
+        Failure is not rollback: a menu/dialog or a prior checkbox transition
+        may remain after a later observation becomes unavailable.
+        """
         with self.bridge._lock:
             target, self._target = self._target, None
             self._geometry_scope = None
