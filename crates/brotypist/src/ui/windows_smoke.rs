@@ -643,26 +643,50 @@ fn chooser_fixture(instance: HINSTANCE, output: &Path, receipt: &mut Value) -> R
         paints.lock().unwrap().len() == 1,
         "Repainting counted one chooser view twice."
     );
+    // Exercise WM_PRINTCLIENT itself on a private DC. PrintWindow may also
+    // request ordinary window painting, which is a separate native boundary.
+    unsafe {
+        let mut client = RECT::default();
+        GetClientRect(chooser.labels[0], &mut client)?;
+        let dc = CreateCompatibleDC(None);
+        ensure!(!dc.0.is_null(), "Chooser print DC is unavailable.");
+        let bitmap =
+            CreateCompatibleBitmap(dc, client.right - client.left, client.bottom - client.top);
+        if bitmap.0.is_null() {
+            let _ = DeleteDC(dc);
+            anyhow::bail!("Chooser print bitmap is unavailable.");
+        }
+        let old = SelectObject(dc, bitmap.into());
+        let _print = Capture { dc, bitmap, old };
+        ensure!(
+            !old.0.is_null() && old.0 as isize != -1,
+            "Chooser print bitmap could not be selected."
+        );
+        let painted = chooser.paint.painted.replace(0);
+        let observed_rows = chooser.paint.observed_rows.replace(0);
+        let diagnostic = chooser.paint.diagnostic.replace(Some((71, 19)));
+        SendMessageW(
+            chooser.labels[0],
+            WM_PRINTCLIENT,
+            Some(WPARAM(dc.0 as usize)),
+            None,
+        );
+        let print_preserved_authority = chooser.paint.painted.get() == 0
+            && chooser.paint.observed_rows.get() == 0
+            && chooser.paint.diagnostic.get() == Some((71, 19))
+            && chooser.paint.foreground == foreground
+            && GetForegroundWindow() == foreground
+            && paints.lock().unwrap().len() == 1;
+        chooser.paint.painted.set(painted);
+        chooser.paint.observed_rows.set(observed_rows);
+        chooser.paint.diagnostic.set(diagnostic);
+        ensure!(
+            print_preserved_authority,
+            "WM_PRINTCLIENT changed visible-paint authority or foreground."
+        );
+    }
     let path = output.join("chooser-eligible-subsequence.png");
-    // A print DC must not create visible-paint authority or consume a diagnostic.
-    let painted = chooser.paint.painted.replace(0);
-    let observed_rows = chooser.paint.observed_rows.replace(0);
-    let diagnostic = chooser.paint.diagnostic.replace(Some((71, 19)));
-    let captured = capture(chooser.window, &path, &chooser.labels[..chooser.rows]);
-    let print_preserved_authority = chooser.paint.painted.get() == 0
-        && chooser.paint.observed_rows.get() == 0
-        && chooser.paint.diagnostic.get() == Some((71, 19))
-        && chooser.paint.foreground == foreground
-        && unsafe { GetForegroundWindow() == foreground }
-        && paints.lock().unwrap().len() == 1;
-    chooser.paint.painted.set(painted);
-    chooser.paint.observed_rows.set(observed_rows);
-    chooser.paint.diagnostic.set(diagnostic);
-    captured?;
-    ensure!(
-        print_preserved_authority,
-        "Offscreen chooser printing changed visible-paint authority or foreground."
-    );
+    capture(chooser.window, &path, &chooser.labels[..chooser.rows])?;
     // Keep the frame, second row and native label text intact. Only the custom
     // renderer's first row is empty: border/background contrast must not pass.
     let row_text = std::mem::take(&mut chooser.paint.text[0]);
@@ -672,6 +696,13 @@ fn chooser_fixture(instance: HINSTANCE, output: &Path, receipt: &mut Value) -> R
         &chooser.labels[..chooser.rows],
     );
     chooser.paint.text[0] = row_text;
+    unsafe {
+        let _ = InvalidateRect(Some(chooser.labels[0]), None, false);
+        ensure!(
+            UpdateWindow(chooser.labels[0]).as_bool(),
+            "Chooser row did not repaint after the missing-text control."
+        );
+    }
     ensure!(
         missing_row
             .as_ref()
