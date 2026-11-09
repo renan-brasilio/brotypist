@@ -5,7 +5,14 @@ was redacted with maintainer approval; unchanged native downloads retain their
 original signed provenance, not the source identity of rewritten tags. Legacy
 Python-era downloads were withdrawn; their release pages remain historical records.
 
-## Unreleased
+## 0.6.0 — Native writing reliability and scoped preferences
+
+macOS Apple Silicon release from merged PR #4. Windows and Linux remain alpha.
+This release changes inference policy for the retained quality baseline; it is
+not a measured speed improvement over 0.5.4. Release verification is separate
+from the historical candidate observations below.
+
+- Make release-watermark lifecycle verification accept both valid old-worker shutdown paths: cooperative close or forced termination. Revoked-request, replacement-worker and newly authorized stream checks remain unchanged.
 
 - Fix the Windows native CI compilation errors against `windows` 0.62.2: import the static-control `SS_NOPREFIX` style from `SystemServices` and supply optional region/message handles with their existing values. Clipping, literal-label rendering and paint-refusal behavior are unchanged.
 - Capture Windows smoke GDI windows with the documented whole-window `PrintWindow` mode, and synchronize DIB access with `GdiFlush`. Chooser `WM_PRINTCLIENT` uses the same row renderer without granting visible-paint authority, checked directly on a private memory DC rather than assuming `PrintWindow` cannot request ordinary painting. Require text contrast inside every visible row's client rectangle and reject an intentionally missing row even when the frame and another row remain. Retain rejected bitmaps for diagnosis, never rendering proof.

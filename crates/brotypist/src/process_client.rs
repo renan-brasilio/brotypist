@@ -2331,9 +2331,14 @@ mod tests {
         assert!(latest > obsolete);
         drop(gate);
         let events = complete(&mut client, latest);
-        // A killed worker need not run cooperative close. The only additional
-        // control events are a new allocation and the authorized stream.
-        harness.control.stage("create");
+        // The old worker may close cooperatively before termination, or be
+        // killed without close. Neither changes the release watermark.
+        let mut event = harness.control.next();
+        if event["stage"] == "close" {
+            assert_eq!(event["allocation"], 1);
+            event = harness.control.next();
+        }
+        assert_eq!(event["stage"], "create", "{event}");
         assert_eq!(
             harness.control.stage("stream")["prefix"],
             "newly authorized"

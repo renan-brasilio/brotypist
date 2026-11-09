@@ -20,13 +20,11 @@ use. Accept what fits, dismiss what doesn't, and keep writing—without moving
 your draft into a chatbot. It lives in the menu bar or system tray, with
 OS-native Settings and local model inference.
 
-**Native Rust, with macOS first.** **[0.5.4 is the Latest macOS-only stable
-release](https://github.com/renan-brasilio/brotypist/releases/tag/v0.5.4);
-Windows and Linux remain ALPHA.** It contains Apple Silicon DMG/ZIP assets only,
-bound to original signed-build source `cdf10e5b442e6ea1ac33043d504e2a3d1e4c72c2`,
-not the rewritten tag's source identity or this unreleased working candidate.
-This patch improves prediction responsiveness and TextEdit inline placement,
-and documents safe macOS unknown-developer launch troubleshooting.
+**Native Rust, with macOS first.** **[0.6.0 macOS release](https://github.com/renan-brasilio/brotypist/releases/tag/v0.6.0);
+Windows and Linux remain ALPHA.** Apple Silicon DMG/ZIP assets only.
+This release brings native writing reliability, scoped language/privacy settings,
+transactional model selection, encrypted-learning controls and request diagnostics.
+Its inference policy differs from 0.5.4; no measured speed improvement is claimed.
 Model relevance and text-field compatibility still vary: stable does not mean
 every app is supported or establish three-platform parity. The
 [migration and acceptance record](docs/rust-migration/README.md) separates
@@ -56,7 +54,7 @@ source-bound observations from final release proof and remaining platform gates.
 
 | Platform | Current native status | Installation |
 | --- | --- | --- |
-| **macOS 15+, Apple Silicon** | **0.5.4 stable channel.** Prediction responsiveness and TextEdit inline placement improvements; polished AppKit Settings retained. Compatibility varies by text field. | Mac-only DMG/ZIP in Releases; Apple Development signed, **not notarized**. |
+| **macOS 15+, Apple Silicon** | **0.6.0 stable channel.** Native writing reliability and scoped preferences; compatibility varies by text field. | Mac-only DMG/ZIP in Releases; Apple Development signed, **not notarized**. |
 | **Linux x86-64, X11** | **ALPHA.** Packaging, inference and native UI have evidence; desktop typing compatibility is limited. Emoji/synonym/typo rewrites are unavailable. | Alpha DEB or portable test bundle when supplied; not part of the macOS stable release. |
 | **Linux x86-64, Wayland** | **ALPHA. Ordinary inline completion is unavailable.** Manual preview only; experimental KDE input-method controls require explicit selection and are not general inline support. | Alpha test bundles; installation does not enable an input method. |
 | **Windows x86-64** | **ALPHA.** Unsigned portable testing; inference and owned-window GUI checks do not establish full physical typing, upgrade or rollback acceptance. **MSI distribution is held.** | Authorized portable test bundle only; not part of the macOS stable release. |
