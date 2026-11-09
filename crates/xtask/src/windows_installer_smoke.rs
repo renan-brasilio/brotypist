@@ -391,8 +391,8 @@ mod tests {
     fn bounded_policy_and_real_write_rollback_evidence_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("bounded-installer-fixture.ps1");
-        // Parse/extract pure guards only. This test never touches HKLM, launches
-        // MSI, or promotes its synthetic logs to native lifecycle evidence.
+        // Extract guards and exercise only owned temporary directories. Never
+        // touch HKLM, create accounts, launch MSI, or claim native installer proof.
         fs::write(
             &script,
             r#"
@@ -410,9 +410,40 @@ function Load-Guards([string]$File, [string[]]$Names) {
         $definition.Extent.Text
     }
 }
-foreach ($definition in @(Load-Guards 'windows-installer-client.ps1' @('Require', 'Assert-DisableMsiPolicy', 'Assert-NativeQuiescence', 'Initialize-InstallerNative'))) { . ([scriptblock]::Create($definition)) }
+foreach ($definition in @(Load-Guards 'windows-installer-client.ps1' @('Require', 'Assert-DisableMsiPolicy', 'Assert-NativeQuiescence', 'Initialize-InstallerNative', 'Private-DirectoryAcl', 'New-PrivateDirectory', 'Remove-OwnedTree', 'Remove-CreatedTree'))) { . ([scriptblock]::Create($definition)) }
 # Compile owned P/Invoke declarations without calling any token/registry API.
 Initialize-InstallerNative
+$unowned = Join-Path $Work 'unowned-tree'
+[void][IO.Directory]::CreateDirectory($unowned)
+$sentinel = Join-Path $unowned 'preserve.txt'
+[IO.File]::WriteAllText($sentinel, 'unowned data must survive')
+Remove-CreatedTree (Join-Path $Work 'never-created') $false
+$refused = $false
+try { Remove-CreatedTree $unowned $false } catch { $refused = $true }
+if (-not $refused -or [IO.File]::ReadAllText($sentinel) -cne 'unowned data must survive') { throw 'Unconfirmed tree ownership did not preserve its data' }
+$created = Join-Path $Work 'created-tree'
+if ($IsWindows) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try { $currentSid = $identity.User.Value } finally { $identity.Dispose() }
+    New-PrivateDirectory $created (Private-DirectoryAcl $currentSid '' '')
+    $acl = Get-Acl -LiteralPath $created
+    if (-not $acl.AreAccessRulesProtected) { throw 'Private directory inherited unrelated access' }
+    $allowed = @($currentSid, 'S-1-5-18') | Select-Object -Unique
+    $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    foreach ($rule in $rules) {
+        if ($rule.IdentityReference.Value -notin $allowed -or $rule.AccessControlType -ne 'Allow') { throw 'Private directory granted an unrelated principal access' }
+    }
+    foreach ($sid in $allowed) {
+        if (-not ($rules | Where-Object { $_.IdentityReference.Value -ceq $sid -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl })) { throw 'Private directory lost supervisor or SYSTEM access' }
+    }
+} else {
+    [void][IO.Directory]::CreateDirectory($created)
+    Write-Output 'Native Windows ACL creation is not exercised on this host.'
+}
+[void][IO.Directory]::CreateDirectory((Join-Path $created 'child'))
+[IO.File]::WriteAllText((Join-Path $created 'child\owned.txt'), 'owned temporary data')
+Remove-CreatedTree $created $true
+if ((Test-Path -LiteralPath $created) -or [IO.File]::ReadAllText($sentinel) -cne 'unowned data must survive') { throw 'Owned-tree cleanup did not preserve its boundary' }
 Assert-DisableMsiPolicy @{ present = $false; kind = $null; value = $null }
 Assert-DisableMsiPolicy @{ present = $true; kind = 'DWord'; value = 0 }
 $rejected = 0

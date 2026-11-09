@@ -18,10 +18,12 @@ $metadata = [ordered]@{
     quiescence_verified = $false; account_cleanup_verified = $false; profile_cleanup_verified = $false
     private_tree_cleanup_verified = $false; global_acl_changes = $false; alternate_credentials = $true
     stage = 'preflight'; diagnostics = [Collections.Generic.List[string]]::new()
+    failure = $null; cleanup_failure = $null
 }
 $ownedRoot = $null; $account = $null; $accountName = $null; $validationSid = $null
 $password = $null; $coreWork = $null; $profileWasAbsent = $false; $outcome = $null
 $accountCreationAttempted = $false
+$ownedRootCreated = $false
 $base = $null; $key = $null; $createdKey = $false; $createdValue = $false
 $nativeInitialized = $false
 $policyPath = 'Software\Policies\Microsoft\Windows\Installer'
@@ -354,7 +356,7 @@ function Private-DirectoryAcl([string]$Supervisor, [string]$User, [string]$UserR
 }
 function New-PrivateDirectory([string]$Path, $Acl) {
     Require (-not (Test-Path -LiteralPath $Path)) 'Existing private directory refused'
-    [void][IO.FileSystemAclExtensions]::CreateDirectory([IO.DirectoryInfo]::new($Path), $Acl)
+    [IO.FileSystemAclExtensions]::Create([IO.DirectoryInfo]::new($Path), $Acl)
 }
 function Write-NewJson([string]$Path, $Value) {
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 32) + "`n")
@@ -364,10 +366,36 @@ function Write-NewJson([string]$Path, $Value) {
 function Save-ClientReceipt {
     Write-NewJson (Join-Path $Work 'client-observations.json') $metadata
 }
+function Failure-Facts([Management.Automation.ErrorRecord]$ErrorRecord, [string]$Stage) {
+    $exceptions = [Collections.Generic.List[object]]::new()
+    $exception = $ErrorRecord.Exception
+    while ($null -ne $exception -and $exceptions.Count -lt 4) {
+        $exceptions.Add(@{
+            type = $exception.GetType().FullName; hresult = $exception.HResult
+            native_error = if ($exception -is [ComponentModel.Win32Exception]) { $exception.NativeErrorCode } else { $null }
+        })
+        $exception = $exception.InnerException
+    }
+    $stack = [string]$ErrorRecord.ScriptStackTrace
+    if ($stack.Length -gt 4096) { $stack = $stack.Substring(0, 4096) }
+    $lines = @([regex]::Matches($stack, ': line (\d+)') | Select-Object -First 8 | ForEach-Object { [int]$_.Groups[1].Value })
+    # Classification and source lines only: no exception text, paths or identities.
+    return @{ stage = $Stage; category = $ErrorRecord.CategoryInfo.Category.ToString(); source_lines = $lines; exceptions = @($exceptions.ToArray()) }
+}
 function Hold-OwnedVm([string]$Reason) {
     $metadata.passed = $false
     $metadata.diagnostics.Add($Reason)
     try { Save-ClientReceipt } catch { [Console]::Error.WriteLine('Fail-closed client receipt unavailable') }
+    [Console]::Error.WriteLine((@{
+        stage = $metadata.stage; failure = $metadata.failure; cleanup_failure = $metadata.cleanup_failure
+        account_creation_attempted = $accountCreationAttempted; account_created = $null -ne $account
+        profile_absence_established = $profileWasAbsent; staging_created = $ownedRootCreated
+        quiescence_verified = $metadata.quiescence_verified
+        profile_cleanup_verified = $metadata.profile_cleanup_verified
+        account_cleanup_verified = $metadata.account_cleanup_verified
+        native_stage = if ($nativeInitialized) { [BroTypistStandardUserInstallerClient]::Stage } else { $null }
+        native_error = if ($nativeInitialized) { [BroTypistStandardUserInstallerClient]::LastNativeError } else { $null }
+    } | ConvertTo-Json -Depth 8 -Compress))
     [Console]::Error.WriteLine($Reason)
     while ($true) { [Threading.Thread]::Sleep(30000) }
 }
@@ -406,6 +434,17 @@ function Remove-OwnedTree([IO.DirectoryInfo]$Directory) {
         else { $entry.Delete() }
     }
     $Directory.Delete()
+}
+function Remove-CreatedTree([string]$Path, [bool]$Created) {
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        Require (-not $Created) 'Created tree has no owned path'
+        return
+    }
+    if (Test-Path -LiteralPath $Path) {
+        Require $Created 'Unconfirmed staging-directory creation; refusing deletion'
+        Remove-OwnedTree ([IO.DirectoryInfo]::new($Path))
+    }
+    Require (-not (Test-Path -LiteralPath $Path)) 'Owned staging tree remains'
 }
 function Invoke-StandardUserCore([string]$Executable, [string]$Client, [string]$InputPath, [string]$CoreWork, [string]$Hash) {
     foreach ($path in @($Executable, $Client, $InputPath, $CoreWork)) {
@@ -509,6 +548,7 @@ try {
     $metadata.stage = 'private_staging'
     $ownedRoot = Join-Path $env:RUNNER_TEMP ('btci-' + [Guid]::NewGuid().ToString('N'))
     New-PrivateDirectory $ownedRoot (Private-DirectoryAcl $supervisorSid '' '')
+    $ownedRootCreated = $true
     $stagedInputs = Join-Path $ownedRoot 'inputs'
     New-PrivateDirectory $stagedInputs (Private-DirectoryAcl $supervisorSid $validationSid 'ReadAndExecute')
     $coreWork = Join-Path $ownedRoot 'work'
@@ -583,6 +623,7 @@ try {
     Require ($nativeExit -eq 0) 'Standard-user native lifecycle failed'
     $metadata.passed = $true
 } catch {
+    $metadata.failure = Failure-Facts $_ $metadata.stage
     $metadata.diagnostics.Add(('Stage {0} failed ({1}); native observations and typed policy snapshots are authoritative' -f $metadata.stage, $_.Exception.GetType().Name))
     try { if ($null -ne $base) { $metadata.during = Policy-Snapshot $key } }
     catch { $metadata.diagnostics.Add('During-policy snapshot unavailable; never counted as passed') }
@@ -701,12 +742,10 @@ try {
         $metadata.account_cleanup_verified = $true
         if ($nativeInitialized) { [BroTypistStandardUserInstallerClient]::ReleaseObjects() }
         $metadata.stage = 'private_tree_cleanup'
-        if ($null -ne $ownedRoot) {
-            Remove-OwnedTree ([IO.DirectoryInfo]::new($ownedRoot))
-            Require (-not (Test-Path -LiteralPath $ownedRoot)) 'Owned staging tree remains'
-        }
+        Remove-CreatedTree $ownedRoot $ownedRootCreated
         $metadata.private_tree_cleanup_verified = $true
     } catch {
+        $metadata.cleanup_failure = Failure-Facts $_ $metadata.stage
         $metadata.diagnostics.Add(('Cleanup stage {0} failed ({1}); no exception text or identifiers retained' -f $metadata.stage, $_.Exception.GetType().Name))
         Hold-OwnedVm 'Owned account/profile/tree cleanup unverified; retaining hosted VM until teardown'
     } finally { if ($null -ne $password) { $password.Dispose(); $password = $null } }
