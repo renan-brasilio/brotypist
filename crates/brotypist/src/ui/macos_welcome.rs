@@ -676,6 +676,14 @@ impl Welcome {
         })
     }
     #[cfg(feature = "native-smoke")]
+    pub(super) fn preview_proceeded_at(&self) -> Option<std::time::Instant> {
+        if self.step != 4 || self.stopping || self.closing || self.awaiting_resume {
+            return None;
+        }
+        let current = self.editor.as_ref()?.acceptance_snapshot()?;
+        self.session.as_ref()?.smoke_proceeded_at(&current)
+    }
+    #[cfg(feature = "native-smoke")]
     pub(super) fn preview_offer(&self) -> Option<(Snapshot, String, String)> {
         if self.step != 4 || self.stopping || self.closing {
             return None;

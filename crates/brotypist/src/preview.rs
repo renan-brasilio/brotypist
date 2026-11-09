@@ -46,6 +46,7 @@ struct SmokeProgress {
     submitted: Option<Instant>,
     ready: Option<Instant>,
     proceeded: Option<Instant>,
+    authorized_key: Option<(SnapshotKey, u64)>,
     first_result: Option<Instant>,
     terminal: Option<Instant>,
 }
@@ -258,7 +259,11 @@ impl PreviewSession {
                         #[cfg(feature = "native-smoke")]
                         {
                             self.smoke.proceed_calls += 1;
-                            self.smoke.proceeded = Some(self.clock.now());
+                            if self.smoke.proceeded.is_none() {
+                                self.smoke.proceeded = Some(self.clock.now());
+                                self.smoke.authorized_key =
+                                    Some((request.key.clone(), request.generation));
+                            }
                         }
                         request.proceeded = true;
                         self.request = Some(request);
@@ -334,6 +339,7 @@ impl PreviewSession {
                         self.smoke.submitted = Some(self.clock.now());
                         self.smoke.ready = None;
                         self.smoke.proceeded = None;
+                        self.smoke.authorized_key = None;
                         self.smoke.first_result = None;
                         self.smoke.terminal = None;
                     }
@@ -395,6 +401,24 @@ impl PreviewSession {
             ("idle", "Waiting for you to type…".into())
         };
         json!({"state":state,"suggestion":suggestion,"message":message,"accepted":self.accepted})
+    }
+    /// First matching ready event authorized by the normal consumer. Retained
+    /// across final/done delivery, but never valid for a changed or revoked field.
+    #[cfg(feature = "native-smoke")]
+    pub(crate) fn smoke_proceeded_at(&self, current: &Snapshot) -> Option<Instant> {
+        let (key, generation) = self.smoke.authorized_key.as_ref()?;
+        if self.closed
+            || !self.active
+            || !self.owner_released
+            || self.expected.is_some()
+            || !self.eligible()
+            || *generation != self.suggestion.generation
+            || !key.matches(&self.snapshot)
+            || !current.same_key(&self.snapshot)
+        {
+            return None;
+        }
+        self.smoke.proceeded
     }
     /// Content-free observation only: never polls, drains reports, retries, or
     /// authorizes work. Relative timings describe consumer delivery, not GPU work.
@@ -778,5 +802,56 @@ mod tests {
         *time.borrow_mut() += Duration::from_secs(30);
         preview.poll();
         assert_eq!(state.borrow().submits, 1);
+    }
+
+    #[cfg(feature = "native-smoke")]
+    #[test]
+    fn readiness_requires_current_authority_and_survives_terminal_delivery() {
+        let (mut preview, state, time) = session();
+        preview.set_owner_released(true);
+        preview.update("Hello", 5, 0).unwrap();
+        let current = preview.snapshot.clone();
+        *time.borrow_mut() += Duration::from_secs(1);
+        preview.poll();
+        state
+            .borrow_mut()
+            .events
+            .push(event(99, "ready", "", false));
+        preview.poll();
+        assert!(preview.smoke_proceeded_at(&current).is_none());
+        assert!(state.borrow().proceeds.is_empty());
+        state.borrow_mut().events.push(event(1, "ready", "", false));
+        assert!(preview.smoke_proceeded_at(&current).is_none());
+        preview.poll();
+        let authorized = preview.smoke_proceeded_at(&current).unwrap();
+        *time.borrow_mut() += Duration::from_secs(1);
+        state.borrow_mut().events.extend([
+            event(1, "ready", "", false),
+            event(1, "result", " world", true),
+            event(1, "done", "", false),
+        ]);
+        preview.poll();
+        assert_eq!(preview.smoke_proceeded_at(&current), Some(authorized));
+        let mut changed = current.clone();
+        changed.caret = 0;
+        assert!(preview.smoke_proceeded_at(&changed).is_none());
+        preview.set_owner_released(false);
+        assert!(preview.smoke_proceeded_at(&current).is_none());
+    }
+
+    #[cfg(feature = "native-smoke")]
+    #[test]
+    fn revoked_ready_event_cannot_start_the_generation_budget() {
+        let (mut preview, state, time) = session();
+        preview.set_owner_released(true);
+        preview.update("Hello", 5, 0).unwrap();
+        let current = preview.snapshot.clone();
+        *time.borrow_mut() += Duration::from_secs(1);
+        preview.poll();
+        state.borrow_mut().events.push(event(1, "ready", "", false));
+        preview.set_active(false);
+        preview.poll();
+        assert!(preview.smoke_proceeded_at(&current).is_none());
+        assert!(state.borrow().proceeds.is_empty());
     }
 }

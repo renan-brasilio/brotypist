@@ -1197,6 +1197,12 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
                 && !unsafe { IsWindowEnabled(shell.h(W_NEXT)).as_bool() },
             "No selected model borrowed readiness."
         );
+        ensure!(
+            shell.preview.is_none()
+                && !shell.preview_suspended
+                && shell.controller.status()["preview"] == false,
+            "Welcome claimed preview ownership before the model-selection step completed."
+        );
         passed(
             receipt,
             "welcome-system-review-and-selected-model-readiness-refuse-unmet-prerequisites",
@@ -1277,6 +1283,10 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             receipt,
             "preview-english-timeout",
         )?;
+        ensure!(
+            shell.preview_suspended && shell.controller.status()["preview_suspended"] == true,
+            "Preview inference began before the main owner acknowledged its release."
+        );
         let preview_config = &shell.preview.as_ref().unwrap().config;
         ensure!(
             !preview_config.clipboard_context
@@ -1383,9 +1393,32 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             receipt,
             "portuguese-owned-preview-renders-and-confirms-visible-full-acceptance",
         );
+        click(&mut shell, W_BACK, &clipboard)?;
+        until(&mut shell, &clipboard, Duration::from_secs(30), |s| {
+            s.welcome
+                .as_ref()
+                .is_some_and(|w| w.step == 3 && w.can_continue())
+                && s.preview.is_none()
+                && !s.preview_suspended
+                && s.controller.status()["preview"] == false
+        })?;
         click(&mut shell, W_NEXT, &clipboard)?;
         until(&mut shell, &clipboard, Duration::from_secs(30), |s| {
-            s.welcome.as_ref().is_some_and(|w| w.step == 5) && s.preview.is_none()
+            s.welcome.as_ref().is_some_and(|w| w.step == 4)
+                && s.preview.is_some()
+                && s.preview_suspended
+                && s.controller.status()["preview_suspended"] == true
+        })?;
+        passed(
+            receipt,
+            "native-preview-back-releases-worker-and-reentry-reacquires-owner",
+        );
+        click(&mut shell, W_NEXT, &clipboard)?;
+        until(&mut shell, &clipboard, Duration::from_secs(30), |s| {
+            s.welcome.as_ref().is_some_and(|w| w.step == 5)
+                && s.preview.is_none()
+                && !s.preview_suspended
+                && s.controller.status()["preview"] == false
         })?;
         screenshot(&shell, output, "welcome-5", receipt)?;
         click(&mut shell, W_NEXT, &clipboard)?;

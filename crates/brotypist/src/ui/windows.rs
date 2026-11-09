@@ -227,6 +227,7 @@ struct Shell {
     welcome: Option<WelcomeState>,
     preview: Option<PreviewSession>,
     preview_closing: bool,
+    preview_suspended: bool,
     ime: bool,
     refresh_pending: bool,
     preview_navigation: Option<bool>,
@@ -334,6 +335,7 @@ impl Shell {
                 preview: None,
                 preview_ghost: None,
                 preview_closing: false,
+                preview_suspended: false,
                 ime: false,
                 refresh_pending: false,
                 preview_navigation: None,
@@ -1268,7 +1270,6 @@ impl Shell {
                             Some(AfterSave::Quit) => self.quit()?,
                             Some(AfterSave::Welcome) => {
                                 self.welcome = None;
-                                self.controller.send(Command::ResumeFromPreview)?;
                                 self.layout();
                             }
                             Some(AfterSave::OpenWelcome) => self.show_welcome()?,
@@ -1919,7 +1920,6 @@ impl Shell {
         }
         self.disarm();
         self.accessory.hide();
-        self.controller.send(Command::SuspendForPreview)?;
         self.welcome = Some(WelcomeState::default());
         let c = self.controller.config();
         let id = if c.backend != "gguf" {
@@ -2028,10 +2028,15 @@ impl Shell {
         };
         self.scroll = 0;
         if self.welcome.as_ref().unwrap().step == 4 {
-            self.preview = Some(PreviewSession::new(settings::preview_config(
+            let preview = PreviewSession::new(settings::preview_config(
                 &self.draft,
                 &self.controller.config(),
-            )?)?);
+            )?)?;
+            self.controller.send(Command::SuspendForPreview)?;
+            self.preview_suspended = true;
+            // A previous session's acknowledgement cannot release this owner.
+            self.status["preview_suspended"] = json!(false);
+            self.preview = Some(preview);
             self.preview_closing = false;
             self.seed_preview();
         }
@@ -2077,6 +2082,15 @@ impl Shell {
             } else {
                 self.preview_closing = true;
             }
+        }
+        if self.preview.is_none() && self.preview_suspended {
+            // close() has confirmed the isolated worker stopped; never resume
+            // the main owner during Quit or for Welcome's non-preview steps.
+            if !self.closing {
+                self.controller.send(Command::ResumeFromPreview)?;
+            }
+            self.preview_suspended = false;
+            self.status["preview_suspended"] = json!(false);
         }
         Ok(())
     }
@@ -2130,7 +2144,7 @@ impl Shell {
         let caret = utf16_scalar(&value, start as usize);
         let end = utf16_scalar(&value, end as usize);
         let active = unsafe { GetFocus() == h } && !self.ime && !self.preview_closing;
-        let suspended = self.status["preview_suspended"] == true;
+        let suspended = self.preview_suspended && self.status["preview_suspended"] == true;
         if let Some(p) = &mut self.preview {
             p.set_owner_released(suspended);
             p.set_active(active);
@@ -2384,7 +2398,6 @@ impl Shell {
                 self.close_pending = false;
                 self.preview_navigation = None;
                 self.welcome = None;
-                self.controller.send(Command::ResumeFromPreview)?;
                 unsafe {
                     let _ = ShowWindow(self.window, SW_HIDE);
                 }
