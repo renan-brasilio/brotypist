@@ -884,7 +884,7 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             &mut shell,
             &clipboard,
             "No system tray",
-            IDNO.0,
+            DialogButton::Id(IDNO.0),
             None,
             |s, c| {
                 owned(s.window)?;
@@ -928,7 +928,7 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             &mut shell,
             &clipboard,
             "Unsaved settings",
-            IDCANCEL.0,
+            DialogButton::Id(IDCANCEL.0),
             None,
             |s, c| {
                 owned(s.window)?;
@@ -1000,10 +1000,17 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
                 if let Some(value) = instructions {
                     edit(&mut shell, "custom_instructions", value, &clipboard)?;
                 }
-                modal(&mut shell, &clipboard, "BroTypist", IDOK.0, None, |s, c| {
-                    click(s, SAVE, c)?;
-                    until(s, c, Duration::from_secs(30), |s| s.operations.is_empty())
-                })?;
+                modal(
+                    &mut shell,
+                    &clipboard,
+                    "BroTypist",
+                    DialogButton::OperationFailureAcknowledgement,
+                    None,
+                    |s, c| {
+                        click(s, SAVE, c)?;
+                        until(s, c, Duration::from_secs(30), |s| s.operations.is_empty())
+                    },
+                )?;
                 ensure!(
                     shell.controller.config() == active,
                     "Failed persistence installed the candidate."
@@ -1098,7 +1105,7 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
                 &mut shell,
                 &clipboard,
                 "Optional local data access",
-                IDYES.0,
+                DialogButton::Id(IDYES.0),
                 None,
                 |s, c| click(s, field_id(key)?, c),
             )?;
@@ -1122,7 +1129,7 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             &mut shell,
             &clipboard,
             "Optional local data access",
-            IDYES.0,
+            DialogButton::Id(IDYES.0),
             None,
             |s, c| click(s, field_id("screen_context")?, c),
         )?;
@@ -1203,7 +1210,7 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             &mut shell,
             &clipboard,
             "Import GGUF model",
-            IDOK.0,
+            DialogButton::Id(IDOK.0),
             Some(model.clone()),
             |s, c| click(s, MODEL_IMPORT, c),
         )?;
@@ -1432,10 +1439,18 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
     scenario
 }
 
+#[derive(Clone, Copy, Debug)]
+enum DialogButton {
+    Id(i32),
+    OperationFailureAcknowledgement,
+}
+
 struct DialogRequest {
     owner: usize,
     title: String,
-    button: i32,
+    button: DialogButton,
+    operation_result: usize,
+    operation_message_matches: bool,
     path: Option<Vec<u16>>,
     responded: bool,
     emergency: bool,
@@ -1517,6 +1532,9 @@ unsafe extern "system" fn dialog(hwnd: HWND, param: LPARAM) -> BOOL {
                 LPARAM((&mut request.controls as *mut Vec<(i32, String, bool, bool)>) as isize),
             );
         }
+        if !request.foreground {
+            return BOOL(1);
+        }
         if let Some(path) = &request.path {
             let Ok(combo) = GetDlgItem(Some(hwnd), cmb13 as i32) else {
                 return BOOL(1);
@@ -1546,10 +1564,54 @@ unsafe extern "system" fn dialog(hwnd: HWND, param: LPARAM) -> BOOL {
                 return BOOL(1);
             }
         }
-        if let Ok(control) = GetDlgItem(Some(hwnd), request.button) {
+        let button = match request.button {
+            DialogButton::Id(id) => id,
+            DialogButton::OperationFailureAcknowledgement => {
+                // Shell::poll_operations copies the same failure into RESULTS and
+                // Shell::error's MB_OK message. Match that actual message, not
+                // merely another owned dialog with the generic application title.
+                let result = HWND(request.operation_result as *mut _);
+                if owned(result).is_err() {
+                    return BOOL(1);
+                }
+                let expected = text(result);
+                request.operation_message_matches = !expected.is_empty()
+                    && request.controls.iter().any(|(id, class, _, _)| {
+                        class == "Static"
+                            && GetDlgItem(Some(hwnd), *id).is_ok_and(|control| {
+                                owned(control).is_ok()
+                                    && IsWindowVisible(control).as_bool()
+                                    && text(control) == expected
+                            })
+                    });
+                if !request.operation_message_matches {
+                    return BOOL(1);
+                }
+                // MB_OK's return value is not its child control ID: the hosted
+                // Windows dialog exposes its sole OK button as IDCANCEL. Resolve
+                // only this single-button acknowledgement, never a choice dialog.
+                let mut buttons = request
+                    .controls
+                    .iter()
+                    .filter(|(_, class, _, _)| class == "Button");
+                let Some((id, _, _, _)) = buttons.next() else {
+                    return BOOL(1);
+                };
+                if buttons.next().is_some() || ![IDOK.0, IDCANCEL.0].contains(id) {
+                    return BOOL(1);
+                }
+                *id
+            }
+        };
+        if let Ok(control) = GetDlgItem(Some(hwnd), button) {
             request.button_enabled = IsWindowEnabled(control).as_bool();
-            let _ = PostMessageW(Some(control), BM_CLICK, WPARAM(0), LPARAM(0));
-            request.responded = true;
+            if owned(control).is_err()
+                || !IsWindowVisible(control).as_bool()
+                || !request.button_enabled
+            {
+                return BOOL(1);
+            }
+            request.responded = PostMessageW(Some(control), BM_CLICK, WPARAM(0), LPARAM(0)).is_ok();
         }
         BOOL(1)
     }
@@ -1558,12 +1620,13 @@ fn modal<T>(
     shell: &mut Shell,
     clipboard: &crate::system::ClipboardService,
     title: &str,
-    button: i32,
+    button: DialogButton,
     path: Option<PathBuf>,
     action: impl FnOnce(&mut Shell, &crate::system::ClipboardService) -> Result<T>,
 ) -> Result<T> {
     owned(shell.window)?;
     let owner = shell.window.0 as usize;
+    let operation_result = shell.h(RESULTS).0 as usize;
     let thread_id = unsafe { GetCurrentThreadId() };
     let title = title.to_owned();
     let path = path.map(|p| wide(&p.to_string_lossy()));
@@ -1574,6 +1637,8 @@ fn modal<T>(
             owner,
             title,
             button,
+            operation_result,
+            operation_message_matches: false,
             path,
             responded: false,
             emergency: false,
@@ -1621,6 +1686,8 @@ fn modal<T>(
         "The expected owned native dialog did not complete: {}",
         json!({
             "expected_dialog": response.title,
+            "expected_button": format!("{:?}", response.button),
+            "operation_message_matches": response.operation_message_matches,
             "owned_dialog_seen": response.owned_dialog_seen,
             "matched_dialog": response.matched_dialog,
             "foreground": response.foreground,

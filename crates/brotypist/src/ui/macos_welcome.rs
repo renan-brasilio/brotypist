@@ -670,6 +670,7 @@ impl Welcome {
             "focused": editor.as_ref().is_some_and(|editor| editor["native_focus"] == true),
             "marked": editor.as_ref().is_some_and(|editor| editor["marked"] == true),
             "last_poll": self.preview_observed,
+            "session":self.session.as_ref().map(PreviewSession::smoke_observation),
             "message": self.controls.get("preview_status").map(|label| string(label)),
             "editor": editor,
         })

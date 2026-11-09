@@ -4812,6 +4812,8 @@ fn owned_welcome_case(
     );
     let deadline = Instant::now() + Duration::from_secs(120);
     row["observations"] = json!([]);
+    row["observation_interval_ms"] = json!(250);
+    let mut next_observation = Instant::now();
     let mut offered = None;
     while Instant::now() < deadline {
         owner.pump()?;
@@ -4819,12 +4821,15 @@ fn owned_welcome_case(
         let inference_error = observed["last_poll"]["state"] == "error";
         let editor_focused = observed["focused"] == true;
         let states = row["observations"].as_array_mut().unwrap();
-        if states.last() != Some(&observed) {
+        // Session counters/ages advance even without a new offer. Keep their
+        // diagnostic sampling bounded independently of the native pump rate.
+        if Instant::now() >= next_observation || inference_error || !editor_focused {
             ensure!(
                 states.len() < 4096,
                 "Preview observation history exceeded its bound"
             );
             states.push(observed);
+            next_observation = Instant::now() + Duration::from_millis(250);
         }
         row["controller_status"] = owner.controller.status();
         ensure!(editor_focused, OwnedInterruption::EditorFocus);
@@ -6463,6 +6468,38 @@ fn choose(shell: &mut Shell, id: &str, index: isize) -> Result<()> {
     }
     settle(shell)
 }
+fn preview_progress(shell: &Shell, started: Instant, pumps: usize) -> Value {
+    let controller = shell.controller.borrow().status();
+    let mut welcome = shell.welcome.smoke_observation();
+    if let Some(poll) = welcome["last_poll"].as_object_mut() {
+        let suggestion = poll.remove("suggestion");
+        poll.remove("message");
+        poll.insert(
+            "suggestion_scalars".into(),
+            json!(
+                suggestion
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .map(|text| text.chars().count())
+            ),
+        );
+    }
+    if let Some(welcome) = welcome.as_object_mut() {
+        welcome.remove("message");
+    }
+    json!({
+        "elapsed_ms":started.elapsed().as_millis(),
+        "pump_turns":pumps,
+        "refresh_due":Instant::now() >= shell.next_refresh,
+        "menu_tracking":shell.kit.queue.borrow().tracking,
+        "welcome":welcome,
+        "controller_state":controller["state"],
+        "controller_preview":controller["preview"],
+        "controller_preview_suspended":controller["preview_suspended"],
+        "last_shell_refresh_state":shell.status["state"],
+        "last_shell_refresh_preview_suspended":shell.status["preview_suspended"],
+    })
+}
 fn welcome(shell: &mut Shell, receipt: &mut Value, output: &Path) -> Result<()> {
     navigate(shell, "setup")?;
     action(shell, "inklow.setup.welcome")?;
@@ -6540,6 +6577,7 @@ fn welcome(shell: &mut Shell, receipt: &mut Value, output: &Path) -> Result<()> 
         native_id(&editor) == "inklow.welcome.preview",
         json!({"native_id":native_id(&editor)}),
     )?;
+    receipt["preview_attempts"] = json!([]);
     for (index, language, prefix) in [
         (0isize, "en", "I was thinking we could"),
         (1isize, "pt", "Amanhã vamos nos encontrar para"),
@@ -6552,28 +6590,85 @@ fn welcome(shell: &mut Shell, receipt: &mut Value, output: &Path) -> Result<()> 
             ensure!(accepted, "Owned preview refused first responder");
         }
         insert_owned(&editor, prefix)?;
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(30);
         let config = shell.config();
+        let seed = macos_welcome::read_editor(&editor)?;
+        let mut attempt = json!({
+            "language":language,
+            "deadline_ms":30_000,
+            "input_scalars":prefix.chars().count(),
+            "seed_matches":seed.text.as_ref() == prefix
+                && seed.caret == prefix.chars().count()
+                && seed.selection_length == 0,
+            "config":{
+                "backend":config.backend,
+                "prompt_style":config.prompt_style,
+                "requested_acceleration":config.acceleration,
+                "completion_length":config.completion_length,
+                "max_tokens":config.max_tokens,
+                "context_chars":config.context_chars,
+                "min_chars":config.min_chars,
+                "debounce_ms":config.debounce_ms,
+                "trailing_space":config.trailing_space,
+                "punctuation_mode":config.punctuation_mode,
+                "instruction_scalars":config.custom_instructions.chars().count(),
+            },
+            "sampling":"read-only snapshots every 250ms; unchanged single 30s attempt; no reseeding or retry",
+            "observations":[preview_progress(shell, started, 0)],
+            "dropped_observations":0,
+        });
+        let mut next_observation = started + Duration::from_millis(250);
+        let mut pumps = 0;
         let mut offered = None;
-        while Instant::now() < deadline {
-            pump(shell, deadline)?;
-            if let Some((before, generated, visible)) = shell.welcome.preview_offer() {
-                if let Some((insertion, expected)) =
-                    preview_word_expectation(&before, &generated, &visible, &config)
-                {
-                    offered = Some((before, generated, visible, insertion, expected));
-                    break;
+        let waited = (|| -> Result<()> {
+            ensure!(
+                attempt["seed_matches"] == true,
+                "Owned preview input did not retain its exact text/caret/selection"
+            );
+            while Instant::now() < deadline {
+                pump(shell, deadline)?;
+                pumps += 1;
+                let now = Instant::now();
+                if now >= next_observation {
+                    let observations = attempt["observations"].as_array_mut().unwrap();
+                    if observations.len() < 128 {
+                        observations.push(preview_progress(shell, started, pumps));
+                    } else {
+                        let dropped = attempt["dropped_observations"].as_u64().unwrap();
+                        attempt["dropped_observations"] = json!(dropped + 1);
+                    }
+                    next_observation = now + Duration::from_millis(250);
+                }
+                if let Some((before, generated, visible)) = shell.welcome.preview_offer() {
+                    if let Some((insertion, expected)) =
+                        preview_word_expectation(&before, &generated, &visible, &config)
+                    {
+                        offered = Some((before, generated, visible, insertion, expected));
+                        break;
+                    }
                 }
             }
+            ensure!(
+                offered.is_some(),
+                "Actual {language} preview did not expose a drawn, word-acceptable suggestion before its deadline"
+            );
+            Ok(())
+        })();
+        // Record before screenshots/cleanup can pump, cancel or release the
+        // pending preview. Observation never drains or authorizes worker events.
+        attempt["at_exit"] = preview_progress(shell, started, pumps);
+        attempt["drawn_word_acceptable"] = json!(offered.is_some());
+        attempt["wait_error"] = json!(waited.as_ref().err().map(|error| format!("{error:#}")));
+        if waited.is_err() {
+            receipt["preview_failure"] = attempt["at_exit"].clone();
+            receipt["preview_failure"]["language"] = json!(language);
         }
-        if offered.is_none() {
-            receipt["preview_failure"] = json!({
-                "language": language,
-                "welcome": shell.welcome.smoke_observation(),
-                "controller_state": shell.status["state"],
-                "controller_preview": shell.status["preview"],
-                "controller_preview_suspended": shell.status["preview_suspended"],
-            });
+        receipt["preview_attempts"]
+            .as_array_mut()
+            .unwrap()
+            .push(attempt);
+        if waited.is_err() {
             snapshot(
                 shell,
                 receipt,
@@ -6582,9 +6677,9 @@ fn welcome(shell: &mut Shell, receipt: &mut Value, output: &Path) -> Result<()> 
                 &format!("preview-{language}-deadline"),
             )?;
         }
-        let (before, generated, visible, insertion, expected) = offered.with_context(|| {
-            format!("Actual {language} preview did not expose a drawn, word-acceptable suggestion before its deadline")
-        })?;
+        waited?;
+        let (before, generated, visible, insertion, expected) =
+            offered.context("Successful preview wait lost its actual drawn offer")?;
         snapshot(
             shell,
             receipt,
