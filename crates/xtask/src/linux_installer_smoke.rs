@@ -990,8 +990,17 @@ mod native {
         result
     }
     fn process_token(pid: u32) -> Result<Option<String>> {
-        match fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => {
+        let stat = match File::open(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        process_token_from_stat(stat)
+    }
+    fn process_token_from_stat(mut file: File) -> Result<Option<String>> {
+        let mut stat = String::new();
+        match file.read_to_string(&mut stat) {
+            Ok(_) => {
                 let fields = stat
                     .rsplit_once(") ")
                     .context("malformed owned process stat")?
@@ -1002,7 +1011,14 @@ mod native {
                     .context("owned process has no start-time")?;
                 Ok(Some(token.to_owned()))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            // A proc stat descriptor keeps the original identity, not the task alive.
+            // Linux returns ESRCH if that task was reaped after open and before read.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(3) =>
+            {
+                Ok(None)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -1266,6 +1282,32 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn reaped_process_stat_has_no_identity_and_preserves_exit_status() {
+            let mut child = Owned::spawn(
+                Command::new("/bin/sh")
+                    .args(["-c", "read -r gate; exit 23"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .unwrap();
+            let stat_path = format!("/proc/{}/stat", child.child.id());
+            let stale_stat = File::open(&stat_path).unwrap();
+            assert!(
+                process_token_from_stat(File::open(&stat_path).unwrap())
+                    .unwrap()
+                    .is_some(),
+                "blocked child must have a process identity"
+            );
+
+            // EOF releases the real child only after its stat descriptor is open.
+            drop(child.child.stdin.take());
+            assert_eq!(child.wait(Duration::from_secs(5)).unwrap().code(), Some(23));
+            assert!(process_token_from_stat(stale_stat).unwrap().is_none());
+            child.stop().unwrap();
+        }
+
         #[test]
         fn paths_refuse_traversal_and_absolute_targets() {
             for path in [

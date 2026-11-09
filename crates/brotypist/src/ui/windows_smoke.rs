@@ -1101,6 +1101,22 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             "terminal_completion",
         ];
         for key in consents {
+            // OCR and terminal completion are retained preferences, not Windows
+            // capabilities. Prove their native refusal instead of requesting consent.
+            if matches!(key, "screenshot_context" | "terminal_completion") {
+                let control = reveal(&mut shell, field_id(key)?, &clipboard)?;
+                ensure!(
+                    !unsafe { IsWindowEnabled(control).as_bool() }
+                        && !is_checked(control)
+                        && shell.draft.value(key) == Some(&json!(false)),
+                    "An unavailable Windows privacy source became enabled or consented."
+                );
+                receipt["not_exercised"].as_array_mut().unwrap().push(json!({
+                    "scenario": format!("{key}-consent-interaction"),
+                    "reason": "Unavailable on Windows. The native control was verified disabled and unchecked with draft consent unchanged; no click or consent dialog was attempted."
+                }));
+                continue;
+            }
             modal(
                 &mut shell,
                 &clipboard,
@@ -1123,7 +1139,7 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
         }
         passed(
             receipt,
-            "each-context-history-terminal-consent-is-independent-and-draft-only",
+            "supported-context-history-consents-independent-and-unavailable-ocr-terminal-disabled",
         );
         modal(
             &mut shell,
