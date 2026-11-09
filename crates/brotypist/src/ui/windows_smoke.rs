@@ -231,7 +231,7 @@ fn screenshot(shell: &Shell, output: &Path, name: &str, receipt: &mut Value) -> 
         "No visible owned Shell to capture."
     );
     let path = output.join(format!("{name}.png"));
-    capture(shell.window, &path)?;
+    capture(shell.window, &path, &[])?;
     receipt["screenshots"].as_array_mut().unwrap().push(json!({"file":path.file_name().unwrap().to_string_lossy(),"method":"PrintWindow-owned-hwnd","pid":std::process::id()}));
     Ok(())
 }
@@ -644,7 +644,46 @@ fn chooser_fixture(instance: HINSTANCE, output: &Path, receipt: &mut Value) -> R
         "Repainting counted one chooser view twice."
     );
     let path = output.join("chooser-eligible-subsequence.png");
-    capture(chooser.window, &path)?;
+    // A print DC must not create visible-paint authority or consume a diagnostic.
+    let painted = chooser.paint.painted.replace(0);
+    let observed_rows = chooser.paint.observed_rows.replace(0);
+    let diagnostic = chooser.paint.diagnostic.replace(Some((71, 19)));
+    let captured = capture(chooser.window, &path, &chooser.labels[..chooser.rows]);
+    let print_preserved_authority = chooser.paint.painted.get() == 0
+        && chooser.paint.observed_rows.get() == 0
+        && chooser.paint.diagnostic.get() == Some((71, 19))
+        && chooser.paint.foreground == foreground
+        && unsafe { GetForegroundWindow() == foreground }
+        && paints.lock().unwrap().len() == 1;
+    chooser.paint.painted.set(painted);
+    chooser.paint.observed_rows.set(observed_rows);
+    chooser.paint.diagnostic.set(diagnostic);
+    captured?;
+    ensure!(
+        print_preserved_authority,
+        "Offscreen chooser printing changed visible-paint authority or foreground."
+    );
+    // Keep the frame, second row and native label text intact. Only the custom
+    // renderer's first row is empty: border/background contrast must not pass.
+    let row_text = std::mem::take(&mut chooser.paint.text[0]);
+    let missing_row = capture(
+        chooser.window,
+        &output.join("chooser-missing-row-rejected.png"),
+        &chooser.labels[..chooser.rows],
+    );
+    chooser.paint.text[0] = row_text;
+    ensure!(
+        missing_row
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<MissingRowPixels>())
+            .is_some_and(|missing| missing.0 == 0),
+        "A chooser screenshot without the first row's text was not specifically rejected."
+    );
+    passed(
+        receipt,
+        "chooser-print-preserves-authority-and-rejects-missing-row",
+    );
     receipt["screenshots"].as_array_mut().unwrap().push(json!({"file":"chooser-eligible-subsequence.png","method":"PrintWindow-owned-hwnd","pid":std::process::id()}));
     unsafe {
         for (i, label) in chooser.labels.iter().enumerate() {
@@ -1566,6 +1605,19 @@ fn modal<T>(
     );
     Ok(result)
 }
+#[derive(Debug)]
+struct MissingRowPixels(usize);
+impl std::fmt::Display for MissingRowPixels {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Owned screenshot row {} has no text pixels in its client area.",
+            self.0 + 1
+        )
+    }
+}
+impl std::error::Error for MissingRowPixels {}
+
 struct Capture {
     dc: HDC,
     bitmap: HBITMAP,
@@ -1580,7 +1632,7 @@ impl Drop for Capture {
         }
     }
 }
-fn capture(hwnd: HWND, path: &Path) -> Result<()> {
+fn capture(hwnd: HWND, path: &Path, text_rows: &[HWND]) -> Result<()> {
     unsafe {
         owned(hwnd)?;
         let mut rect = RECT::default();
@@ -1619,8 +1671,10 @@ fn capture(hwnd: HWND, path: &Path) -> Result<()> {
             !bits.is_null() && !old.0.is_null() && old.0 as isize != -1,
             "The owned screenshot bitmap could not be selected."
         );
+        // These are GDI windows: use the documented whole-window WM_PRINT path,
+        // not PW_RENDERFULLCONTENT's DirectComposition capture mode.
         ensure!(
-            PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool(),
+            PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(0)).as_bool(),
             "The actual owned Shell could not render its screenshot."
         );
         // Direct DIB access must wait for the calling thread's GDI batch.
@@ -1632,6 +1686,51 @@ fn capture(hwnd: HWND, path: &Path) -> Result<()> {
         let bytes =
             std::slice::from_raw_parts_mut(bits.cast::<u8>(), width as usize * height as usize * 4);
         let nonblank = bytes.chunks_exact(4).any(|pixel| pixel[..3] != bytes[..3]);
+        let mut missing_row = None;
+        for (index, label) in text_rows.iter().enumerate() {
+            owned(*label)?;
+            ensure!(
+                IsChild(hwnd, *label).as_bool() && IsWindowVisible(*label).as_bool(),
+                "Required screenshot text is not a visible child of the owned window."
+            );
+            let mut client = RECT::default();
+            GetClientRect(*label, &mut client)?;
+            let mut corners = [
+                POINT {
+                    x: client.left,
+                    y: client.top,
+                },
+                POINT {
+                    x: client.right,
+                    y: client.bottom,
+                },
+            ];
+            MapWindowPoints(Some(*label), None, &mut corners);
+            let left = corners[0].x - rect.left;
+            let top = corners[0].y - rect.top;
+            let right = corners[1].x - rect.left;
+            let bottom = corners[1].y - rect.top;
+            ensure!(
+                0 <= left
+                    && left < right
+                    && right <= width
+                    && 0 <= top
+                    && top < bottom
+                    && bottom <= height,
+                "Required screenshot text falls outside the owned bitmap."
+            );
+            let first = ((top * width + left) * 4) as usize;
+            let varied = (top..bottom).any(|y| {
+                let start = ((y * width + left) * 4) as usize;
+                let end = ((y * width + right) * 4) as usize;
+                bytes[start..end]
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[..3] != bytes[first..first + 3])
+            });
+            if !varied && missing_row.is_none() {
+                missing_row = Some(index);
+            }
+        }
         // PrintWindow's BI_RGB DIB has BGRA color bytes with unspecified alpha.
         // Convert this owned offscreen bitmap in place; no desktop pixels are read.
         for pixel in bytes.chunks_exact_mut(4) {
@@ -1651,6 +1750,9 @@ fn capture(hwnd: HWND, path: &Path) -> Result<()> {
             nonblank,
             "The native screenshot is blank; failed pixels were retained, not UI rendering proof."
         );
+        if let Some(index) = missing_row {
+            return Err(MissingRowPixels(index).into());
+        }
         Ok(())
     }
 }

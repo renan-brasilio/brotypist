@@ -2997,14 +2997,18 @@ unsafe extern "system" fn choice_row_proc(
     data: usize,
 ) -> LRESULT {
     unsafe {
-        if msg != WM_PAINT {
+        if !matches!(msg, WM_PAINT | WM_PRINTCLIENT) {
             return DefSubclassProc(hwnd, msg, wp, lp);
         }
         let Some(paint) = (data as *const ChoicePaint).as_ref() else {
             return DefSubclassProc(hwnd, msg, wp, lp);
         };
         let mut ps = PAINTSTRUCT::default();
-        let dc = BeginPaint(hwnd, &mut ps);
+        let dc = if msg == WM_PRINTCLIENT {
+            HDC(wp.0 as *mut _)
+        } else {
+            BeginPaint(hwnd, &mut ps)
+        };
         let mut rect = RECT::default();
         let _ = GetClientRect(hwnd, &mut rect);
         FillRect(dc, &rect, GetSysColorBrush(COLOR_WINDOW));
@@ -3013,6 +3017,8 @@ unsafe extern "system" fn choice_row_proc(
         SetTextColor(dc, COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
         if let Some(units) = paint.text.get(id) {
             if TextOutW(dc, 0, 0, units).as_bool()
+                // Printing an owned bitmap is not a visible presentation.
+                && msg == WM_PAINT
                 && !units.is_empty()
                 && IsWindowVisible(hwnd).as_bool()
                 && GetForegroundWindow() == paint.foreground
@@ -3049,7 +3055,9 @@ unsafe extern "system" fn choice_row_proc(
             }
         }
         let _ = SelectObject(dc, old);
-        let _ = EndPaint(hwnd, &ps);
+        if msg == WM_PAINT {
+            let _ = EndPaint(hwnd, &ps);
+        }
         LRESULT(0)
     }
 }
