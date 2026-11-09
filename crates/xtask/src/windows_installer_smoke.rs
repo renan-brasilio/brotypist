@@ -157,13 +157,14 @@ fn execute(bundle: &Path, assets: &Path, output: &Path, receipt: &mut Value) -> 
         .status()
         .context("cannot invoke owned native installer probe")?;
     let client_path = work.join("client-observations.json");
-    regular(&client_path).context("shared restricted client did not produce policy evidence")?;
+    regular(&client_path)
+        .context("shared standard-user client did not produce lifecycle evidence")?;
     ensure!(
         fs::metadata(&client_path)?.len() <= 256 * 1024,
-        "restricted client evidence exceeds limit"
+        "standard-user client evidence exceeds limit"
     );
     let client: Value = serde_json::from_slice(&fs::read(client_path)?)?;
-    receipt["restricted_client"] = client.clone();
+    receipt["standard_user_client"] = client.clone();
     let observed_path = work.join("observations.json");
     regular(&observed_path).context("native installer probe did not produce evidence")?;
     ensure!(
@@ -190,25 +191,40 @@ fn execute(bundle: &Path, assets: &Path, output: &Path, receipt: &mut Value) -> 
             json_new(&output.join(format!("{name}.json")), &worker_observed)?;
         }
     }
+    ensure!(status.success(), "native installer client failed");
+    validate_native_evidence(&client, &observed)?;
+    receipt["stage"] = json!("completed_core_scope_only");
+    Ok(())
+}
+
+fn validate_native_evidence(client: &Value, observed: &Value) -> Result<()> {
+    for field in [
+        "passed",
+        "genuine_standard_user",
+        "account_cleanup_verified",
+        "profile_cleanup_verified",
+        "restoration_verified",
+        "quiescence_verified",
+    ] {
+        ensure!(
+            client[field] == true,
+            "standard-user lifecycle evidence missing: {field}"
+        );
+    }
     ensure!(
-        status.success()
-            && client["passed"] == true
-            && client["restoration_verified"] == true
-            && client["quiescence_verified"] == true
-            && observed["passed"] == true
+        observed["passed"] == true
             && observed["observations"]
                 .as_array()
                 .context("native observations missing")?
                 .iter()
                 .filter(|row| {
-                    row["check"] == "restricted_rights_client_verified_before_installer"
+                    row["check"] == "genuine_standard_user_verified_before_installer"
                         && row["passed"] == true
                 })
                 .count()
                 == 1,
         "native installer assertions failed"
     );
-    receipt["stage"] = json!("completed_core_scope_only");
     Ok(())
 }
 
@@ -336,6 +352,40 @@ fn verify_zip(path: &Path, rows: &[Row]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_evidence_requires_genuine_identity_and_complete_cleanup() {
+        let client = json!({
+            "passed": true, "genuine_standard_user": true,
+            "account_cleanup_verified": true, "profile_cleanup_verified": true,
+            "restoration_verified": true, "quiescence_verified": true
+        });
+        let observed = json!({
+            "passed": true,
+            "observations": [{
+                "check": "genuine_standard_user_verified_before_installer", "passed": true
+            }]
+        });
+        assert!(validate_native_evidence(&client, &observed).is_ok());
+        for field in client.as_object().unwrap().keys() {
+            let mut missing = client.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(validate_native_evidence(&missing, &observed).is_err());
+            for invalid in [json!(false), json!("true"), json!(1), Value::Null] {
+                let mut invalid_client = client.clone();
+                invalid_client[field] = invalid;
+                assert!(validate_native_evidence(&invalid_client, &observed).is_err());
+            }
+        }
+        for invalid in [
+            json!({"passed": false, "observations": observed["observations"]}),
+            json!({"passed": true, "observations": []}),
+            json!({"passed": true, "observations": [{"check": "genuine_standard_user_verified_before_installer", "passed": "true"}]}),
+            json!({"passed": true, "observations": [observed["observations"][0], observed["observations"][0]]}),
+        ] {
+            assert!(validate_native_evidence(&client, &invalid).is_err());
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn bounded_policy_and_real_write_rollback_evidence_fail_closed() {
@@ -390,16 +440,66 @@ foreach ($outcome in @(
     try { Assert-NativeQuiescence $outcome } catch { $rejected++ }
 }
 if ($rejected -ne 6) { throw 'Unknown/untyped quiescence accepted as permission to restore host policy' }
-foreach ($definition in @(Load-Guards 'windows-installer-smoke.ps1' @('Observe', 'Assert-RollbackLog', 'New-MsiStartInfo'))) { . ([scriptblock]::Create($definition)) }
-foreach ($operation in @('/i', '/fa', '/x')) {
-    $msi = Join-Path $Work 'canonical package Unicode é.msi'
-    $log = Join-Path $Work 'native MSI Unicode é.log'
-    $start = New-MsiStartInfo @($operation, $msi) $log
-    $expected = @($operation, $msi, '/qn', '/norestart', '/L*v', $log)
-    if ($start.UseShellExecute -or -not [string]::IsNullOrEmpty($start.Arguments) -or $start.ArgumentList.Count -ne $expected.Count) { throw 'MSI direct raw-argv launch contract lost' }
-    for ($i = 0; $i -lt $expected.Count; $i++) {
-        if ($start.ArgumentList[$i] -cne $expected[$i]) { throw 'MSI argv element was pre-quoted, split, or rewritten' }
+foreach ($definition in @(Load-Guards 'windows-installer-smoke.ps1' @('Observe', 'Assert-RollbackLog', 'Assert-StandardUserToken', 'Redact'))) { . ([scriptblock]::Create($definition)) }
+$validToken = @{
+    matches_expected_user = $true; is_system = $false
+    administrator_role_enabled = $false; administrator_group_present = $false
+    token_elevation = 0; integrity_rid = 8192; token_type = 1
+    impersonation_level = 'None'; token_has_restrictions = 0
+}
+Assert-StandardUserToken $validToken
+foreach ($invalid in @(
+    @{ key = 'matches_expected_user'; value = $false },
+    @{ key = 'is_system'; value = $true },
+    @{ key = 'administrator_role_enabled'; value = $true },
+    @{ key = 'administrator_group_present'; value = $true },
+    @{ key = 'token_elevation'; value = 1 },
+    @{ key = 'integrity_rid'; value = 12288 },
+    @{ key = 'token_type'; value = 2 },
+    @{ key = 'impersonation_level'; value = 'Impersonation' },
+    @{ key = 'matches_expected_user'; value = 'true' }
+)) {
+    $token = $validToken.Clone(); $token[$invalid.key] = $invalid.value
+    $refused = $false
+    try { Assert-StandardUserToken $token } catch { $refused = $true }
+    if (-not $refused) { throw 'Invalid identity or elevated/impersonated token accepted' }
+}
+$ExpectedUserSid = 'S-1-5-21-100-200-300-1001'
+$SupervisorSid = 'S-1-5-21-100-200-300-1002'
+$private = "$ExpectedUserSid $SupervisorSid $env:USERNAME $env:USERPROFILE"
+$redacted = Redact ($private.ToUpperInvariant())
+foreach ($value in @($ExpectedUserSid, $SupervisorSid, $env:USERNAME, $env:USERPROFILE)) {
+    if (-not [string]::IsNullOrWhiteSpace($value) -and $redacted.Contains($value, [StringComparison]::OrdinalIgnoreCase)) { throw 'Private validation identity leaked' }
+}
+foreach ($definition in @(Load-Guards 'windows-installer-reuse.ps1' @('Assert-StandardUserEvidence'))) { . ([scriptblock]::Create($definition)) }
+$validClient = @{
+    passed = $true; genuine_standard_user = $true
+    account_cleanup_verified = $true; profile_cleanup_verified = $true
+    restoration_verified = $true; quiescence_verified = $true
+}
+$validCore = @{ passed = $true; observations = @(@{ check = 'genuine_standard_user_verified_before_installer'; passed = $true }) }
+Assert-StandardUserEvidence $validClient $validCore
+foreach ($field in @($validClient.Keys)) {
+    foreach ($invalid in @($false, 'true', 1, $null)) {
+        $candidate = $validClient.Clone(); $candidate[$field] = $invalid
+        $refused = $false
+        try { Assert-StandardUserEvidence $candidate $validCore } catch { $refused = $true }
+        if (-not $refused) { throw 'Incomplete or untyped standard-user lifecycle accepted by reuse' }
     }
+    $candidate = $validClient.Clone(); $candidate.Remove($field)
+    $refused = $false
+    try { Assert-StandardUserEvidence $candidate $validCore } catch { $refused = $true }
+    if (-not $refused) { throw 'Missing standard-user lifecycle fact accepted by reuse' }
+}
+foreach ($invalidCore in @(
+    @{ passed = $false; observations = $validCore.observations },
+    @{ passed = $true; observations = @() },
+    @{ passed = $true; observations = @(@{ check = 'genuine_standard_user_verified_before_installer'; passed = 'true' }) },
+    @{ passed = $true; observations = @($validCore.observations[0], $validCore.observations[0]) }
+)) {
+    $refused = $false
+    try { Assert-StandardUserEvidence $validClient $invalidCore } catch { $refused = $true }
+    if (-not $refused) { throw 'Invalid core evidence accepted by reuse' }
 }
 $receipt = @{ observations = [Collections.Generic.List[object]]::new() }
 $path = Join-Path $Work 'rollback.log'

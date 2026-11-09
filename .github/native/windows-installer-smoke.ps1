@@ -3,8 +3,9 @@
 param(
     [Parameter(Mandatory)][string]$InputFile,
     [Parameter(Mandatory)][string]$Work,
-    [switch]$RequireRestrictedClient,
-    [string]$ExpectedUserSid
+    [switch]$RequireStandardUser,
+    [Parameter(Mandatory)][string]$ExpectedUserSid,
+    [Parameter(Mandatory)][string]$SupervisorSid
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -42,8 +43,12 @@ function Equal($Actual, $Expected, [string]$Message) { Require ($Actual -ceq $Ex
 function Observe([string]$Check, $Evidence) { $receipt.observations.Add(@{ check = $Check; passed = $true; evidence = $Evidence }) }
 function Redact([string]$Text) {
     foreach ($path in @($Work, $env:RUNNER_TEMP, $env:USERPROFILE)) {
-        if (-not [string]::IsNullOrWhiteSpace($path)) { $Text = $Text.Replace($path, '<private-path>') }
+        if (-not [string]::IsNullOrWhiteSpace($path)) { $Text = [regex]::Replace($Text, [regex]::Escape($path), '<private-path>', [Text.RegularExpressions.RegexOptions]::IgnoreCase) }
     }
+    foreach ($identityValue in @($ExpectedUserSid, $SupervisorSid, $env:USERNAME, $env:USERDOMAIN)) {
+        if (-not [string]::IsNullOrWhiteSpace($identityValue)) { $Text = [regex]::Replace($Text, [regex]::Escape($identityValue), '<private-identity>', [Text.RegularExpressions.RegexOptions]::IgnoreCase) }
+    }
+    $Text = [regex]::Replace($Text, '(?i)\bS-1-\d+(?:-\d+)+\b', '<private-sid>')
     $Text = [regex]::Replace($Text, '(?im)(token|password|secret|authorization|api[_-]?key)\s*[:=]\s*[^\r\n]+', '$1=<redacted>')
     if ($Text.Length -gt 8192) { $Text = $Text.Substring(0, 8192) + '[truncated]' }
     return $Text
@@ -66,6 +71,7 @@ function Bounded-Text([string]$Path, [int]$Limit = 32768) {
     } finally { $stream.Dispose() }
 }
 function New-PrivateDirectory([string]$Path) {
+    Assert-PrivatePath $Path $env:RUNNER_TEMP
     Require (-not (Test-Path -LiteralPath $Path)) 'Private smoke directory already exists'
     [void][IO.Directory]::CreateDirectory($Path)
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -74,6 +80,9 @@ function New-PrivateDirectory([string]$Path) {
     $acl.SetAccessRuleProtection($true, $false)
     $rule = [Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
     $acl.AddAccessRule($rule)
+    foreach ($reader in @($SupervisorSid, 'S-1-5-18')) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($reader), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+    }
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 function Hash-Equal([string]$Path, [string]$Hash) {
@@ -356,6 +365,41 @@ function Arp-Keys([string]$Product) {
 function Machine-ArpKeys([string]$Product) {
     return @("HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$Product", "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$Product")
 }
+function Assert-StandardUserToken($Token) {
+    Require ($Token.matches_expected_user -is [bool] -and $Token.matches_expected_user -eq $true -and
+        $Token.is_system -is [bool] -and $Token.is_system -eq $false -and
+        $Token.administrator_role_enabled -is [bool] -and $Token.administrator_role_enabled -eq $false -and
+        $Token.administrator_group_present -is [bool] -and $Token.administrator_group_present -eq $false -and
+        $Token.token_elevation -eq 0 -and $Token.integrity_rid -eq 8192 -and
+        $Token.token_type -eq 1 -and $Token.impersonation_level -ceq 'None') 'Expected genuine nonadministrator unelevated medium-integrity primary token required'
+}
+function Assert-PrivatePath([string]$Path, [string]$Root) {
+    Require ([IO.Path]::IsPathFullyQualified($Path) -and [IO.Path]::IsPathFullyQualified($Root)) 'Absolute private paths required'
+    $relative = [IO.Path]::GetRelativePath([IO.Path]::GetFullPath($Root), [IO.Path]::GetFullPath($Path))
+    Require ($relative -ne '.' -and $relative -ne '..' -and -not $relative.StartsWith('..\') -and -not $relative.StartsWith('../') -and -not [IO.Path]::IsPathRooted($relative)) 'Path escaped its owned private root'
+    $ancestor = [IO.DirectoryInfo]::new([IO.Path]::GetFullPath($Path))
+    while ($null -ne $ancestor) {
+        if ($ancestor.Exists) { Require (($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Linked private path refused' }
+        $ancestor = $ancestor.Parent
+    }
+}
+function Assert-ValidationProfile {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        Require ($identity.User.Value -ceq $ExpectedUserSid -and $identity.ImpersonationLevel.ToString() -ceq 'None') 'Unexpected or impersonated profile identity'
+        Require ($identity.Name.Split('\')[-1] -cmatch '^btci-[0-9a-f]{12}$') 'Disposable validation account name required'
+        Require ($identity.Name.Split('\')[-1] -ieq $env:USERNAME) 'Environment identity differs from the validation account'
+        $nativeProfile = [BroTypistInstallerNative]::ProfileDirectory($identity.AccessToken.DangerousGetHandle())
+    } finally { $identity.Dispose() }
+    Require (-not [string]::IsNullOrWhiteSpace($nativeProfile) -and [IO.Path]::IsPathFullyQualified($env:USERPROFILE)) 'Loaded validation profile is missing'
+    Require ([IO.Path]::GetFullPath($env:USERPROFILE) -ieq [IO.Path]::GetFullPath($nativeProfile)) 'Environment does not belong to the loaded validation profile'
+    foreach ($folder in @('LocalApplicationData', 'ApplicationData', 'Programs')) {
+        Assert-PrivatePath ([Environment]::GetFolderPath($folder)) $nativeProfile
+    }
+    Require ($env:LOCALAPPDATA -ieq [Environment]::GetFolderPath('LocalApplicationData') -and $env:APPDATA -ieq [Environment]::GetFolderPath('ApplicationData')) 'Application-data environment does not match the validation profile'
+    Assert-PrivatePath $Work $env:RUNNER_TEMP
+    Assert-PrivatePath $InputFile $env:RUNNER_TEMP
+}
 function Observe-ClientAndPolicy {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     try {
@@ -366,7 +410,7 @@ function Observe-ClientAndPolicy {
             administrator_role_enabled = ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
             administrator_group_present = $identity.Groups -contains [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
             is_system = $identity.IsSystem; impersonation_level = $identity.ImpersonationLevel.ToString()
-            same_user_as_launcher = -not [string]::IsNullOrWhiteSpace($ExpectedUserSid) -and $identity.User.Value -ceq $ExpectedUserSid
+            matches_expected_user = $identity.User.Value -ceq $ExpectedUserSid
         }
     } finally { $identity.Dispose() }
     $policies = @(
@@ -384,11 +428,13 @@ function Observe-ClientAndPolicy {
         }
     )
     $receipt.observations.Add(@{ check = 'installer_client_token_and_policies'; status = 'observed'; passed = $null; evidence = @{ client = $client; policies = $policies; modified_by_this_core = $false; launcher_policy_fixture = 'separate client-observations.json before/during/restored evidence, not a core claim of unchanged host policy' } })
-    if ($RequireRestrictedClient) {
-        Require ($client.same_user_as_launcher -and -not $client.is_system -and -not $client.administrator_role_enabled -and $client.integrity_rid -eq 8192 -and $client.token_has_restrictions -eq 1 -and $client.token_type -eq 1 -and $client.impersonation_level -ceq 'None') 'Restricted experiment requires verified same-user non-System Administrator-disabled medium-integrity restricted primary client'
-        Require (@($policies | Where-Object { $_.hive -ceq 'LocalMachine' -and $_.policy -ceq 'DisableMSI' -and $_.present -and $_.dword -and $_.value -eq 0 }).Count -eq 1) 'Restricted child did not observe the explicit bounded DisableMSI0 host fixture'
-        Observe 'restricted_rights_client_verified_before_installer' @{ same_user = $true; administrator_role_enabled = $false; integrity_rid = 8192; token_has_restrictions = 1; token_type = 1; token_elevation = $client.token_elevation; elevation_type = $client.elevation_type; scope = 'SAFER-restricted rights, not a genuine UAC-filtered logon or full desktop compatibility proof' }
-    }
+    Assert-StandardUserToken $client
+    $processToken = [BroTypistInstallerNative]::ProcessTokenFacts([Diagnostics.Process]::GetCurrentProcess().Handle, $ExpectedUserSid)
+    Assert-StandardUserToken $processToken
+    Require (@($policies | Where-Object { $_.hive -ceq 'LocalMachine' -and $_.policy -ceq 'DisableMSI' -and $_.present -and $_.dword -and $_.value -eq 0 }).Count -eq 1) 'Standard-user child did not observe the explicit bounded DisableMSI0 host fixture'
+    Require (@($policies | Where-Object { $_.policy -ceq 'AlwaysInstallElevated' -and $_.present -and (-not $_.dword -or $_.value -ne 0) }).Count -eq 0) 'Elevating installer policy refused'
+    Assert-ValidationProfile
+    Observe 'genuine_standard_user_verified_before_installer' @{ client = $client; process_primary_token = $processToken; profile_matches_logon = $true; scope = 'genuine standard-user logon; not a UAC-filtered administrator or restricted administrator token' }
 }
 function Observe-ArpScope([string]$Stage, [string]$Product) {
     # Open explicit native views independently of PowerShell provider resolution.
@@ -535,7 +581,7 @@ function Msi-Transaction([string]$Stage, [string[]]$Arguments, [switch]$Expected
     # intervening exception leaves service transaction quiescence unprovable.
     $script:installerTransactionActive = $true
     # Start-Process defaults to ShellExecute on desktop Windows. That brokered
-    # path cannot establish inheritance of this verified restricted primary
+    # path cannot establish inheritance of this verified standard-user primary
     # token. Use direct process creation, with the identical MSI arguments.
     $start = New-MsiStartInfo $Arguments $log
     $process = [Diagnostics.Process]::new()
@@ -549,9 +595,10 @@ function Msi-Transaction([string]$Stage, [string[]]$Arguments, [switch]$Expected
         # query is retained as failure, but still wait for synchronous MSI exit
         # before throwing so cleanup and the policy lease cannot race it.
         $actualClientToken = [BroTypistInstallerNative]::ProcessTokenFacts($process.Handle, $ExpectedUserSid)
-        $actualClientVerified = $actualClientToken.same_user_as_launcher -and -not $actualClientToken.is_system -and -not $actualClientToken.administrator_role_enabled -and $actualClientToken.integrity_rid -eq 8192 -and $actualClientToken.token_has_restrictions -eq 1 -and $actualClientToken.token_type -eq 1 -and $actualClientToken.impersonation_level -ceq 'None'
+        Assert-StandardUserToken $actualClientToken
+        $actualClientVerified = $true
     } catch { $actualClientVerified = $false }
-    $receipt.observations.Add(@{ check = 'msi_client_primary_token'; passed = $actualClientVerified; evidence = @{ stage = $Stage; shell_execute = $false; launch = 'direct ProcessStartInfo, inherited primary token/environment, no alternate credentials'; actual_child_token = $actualClientToken; token_query_succeeded = $null -ne $actualClientToken; genuine_uac_filtered_logon = $false; elevation_metadata_is_not_a_rights_assertion = $true } })
+    $receipt.observations.Add(@{ check = 'msi_client_primary_token'; passed = $actualClientVerified; evidence = @{ stage = $Stage; shell_execute = $false; launch = 'direct ProcessStartInfo, inherited primary token/environment, no alternate credentials'; actual_child_token = $actualClientToken; token_query_succeeded = $null -ne $actualClientToken; genuine_standard_user = $actualClientVerified } })
     if (-not $process.WaitForExit(180000)) {
         $script:transactionUnknown = $true
         try {
@@ -563,12 +610,10 @@ function Msi-Transaction([string]$Stage, [string[]]$Arguments, [switch]$Expected
     $code = $process.ExitCode
     $script:installerTransactionActive = $false
     Observe-MsiRouting $Stage $log
-    if ($RequireRestrictedClient) {
-        if (-not $actualClientVerified) {
-            foreach ($product in $products) { Observe-ArpScope ($Stage + '_after_unverified_child_exit') $product }
-        }
-        Require $actualClientVerified 'Actual msiexec child primary token was not independently verified as same-user non-System Administrator-disabled medium restricted rights'
+    if (-not $actualClientVerified) {
+        foreach ($product in $products) { Observe-ArpScope ($Stage + '_after_unverified_child_exit') $product }
     }
+    Require $actualClientVerified 'Actual msiexec child primary token was not independently verified as the expected genuine standard user'
     $rejected = $false
     if ($ExpectedFailure -and $code -eq 1603) {
         $text = Bounded-Text $log 65536
@@ -709,6 +754,8 @@ function Probe-Gui([string]$Directory, [string]$Stage) {
 try {
     Require ($IsWindows -and [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [Runtime.InteropServices.Architecture]::X64) 'Native Windows x86_64 required'
     Require ($env:BROTYPIST_INSTALLER_SMOKE_DISPOSABLE -ceq '1' -and $env:CI -ceq 'true' -and $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted' -and $env:RUNNER_OS -ceq 'Windows') 'Explicit disposable GitHub-hosted Windows guard required'
+    Require ([bool]$RequireStandardUser) 'Genuine disposable standard-user launcher required'
+    Require ($ExpectedUserSid -cmatch '^S-1-5-21-\d+-\d+-\d+-\d+$' -and $SupervisorSid -cmatch '^S-1-5-21-\d+-\d+-\d+-\d+$' -and $ExpectedUserSid -cne $SupervisorSid) 'Distinct validation and supervisor account identities required'
     $Work = [IO.Path]::GetFullPath($Work)
     Require (Test-Path -LiteralPath $Work -PathType Container) 'Owned evidence work directory is missing'
     Require (-not (Test-Path -LiteralPath (Join-Path $Work 'observations.json'))) 'Refusing existing evidence output'
@@ -742,7 +789,7 @@ public static class BroTypistInstallerNative {
             uint[] facts=TokenFacts(token);
             using(var identity=new System.Security.Principal.WindowsIdentity(token)) {
                 return new System.Collections.Generic.Dictionary<string,object> {
-                    {"same_user_as_launcher",identity.User.Value==expectedSid},
+                    {"matches_expected_user",identity.User.Value==expectedSid},
                     {"is_system",identity.IsSystem},
                     {"administrator_role_enabled",new System.Security.Principal.WindowsPrincipal(identity).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator)},
                     {"administrator_group_present",identity.Groups.Contains(new System.Security.Principal.SecurityIdentifier("S-1-5-32-544"))},
@@ -768,6 +815,15 @@ public static class BroTypistInstallerNative {
             uint integrity=unchecked((uint)Marshal.ReadInt32(GetSidSubAuthority(sid,(uint)count-1)));
             return new uint[] { elevated,type,integrity,restricted,tokenType };
         } finally { Marshal.FreeHGlobal(buffer); }
+    }
+    [DllImport("userenv.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool GetUserProfileDirectoryW(IntPtr token,StringBuilder path,ref uint length);
+    public static string ProfileDirectory(IntPtr token) {
+        uint length=0;
+        GetUserProfileDirectoryW(token,null,ref length);
+        if(length==0 || length>32768) throw new InvalidOperationException("Invalid validation profile length");
+        var path=new StringBuilder((int)length);
+        if(!GetUserProfileDirectoryW(token,path,ref length)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return path.ToString();
     }
     public static async System.Threading.Tasks.Task<long> Capture(System.IO.Stream source,System.IO.Stream destination,int limit) {
         byte[] buffer=new byte[8192]; long total=0; int retained=0;
@@ -837,7 +893,7 @@ public static class BroTypistInstallerNative {
         $products.Add($code)
     }
     $originalRun = Read-Run; $runObserved = $true
-    $root = Join-Path $env:RUNNER_TEMP ('brotypist-installer-' + [Guid]::NewGuid().ToString('N'))
+    $root = Join-Path $Work ('brotypist-installer-' + [Guid]::NewGuid().ToString('N'))
     New-PrivateDirectory $root
     $profile = Join-Path $root 'profile'
     New-PrivateDirectory $profile
@@ -983,6 +1039,7 @@ public static class BroTypistInstallerNative {
     $receipt.quiescence = @{
         installer_transactions_quiescent = -not $transactionUnknown -and -not $installerTransactionActive
         owned_processes_quiescent = $ownedQuiescent
+        uninstall_verified = -not $installAttempted -or @($receipt.observations | Where-Object { $_.check -ceq 'uninstall' -and $_.passed -eq $true }).Count -eq 1
         unknown_transaction_is_not_exit_evidence = $true
     }
     $receipt.passed = $receipt.diagnostics.Count -eq 0 -and $installAttempted -and $receipt.quiescence.installer_transactions_quiescent -and $receipt.quiescence.owned_processes_quiescent -and @($receipt.observations | Where-Object { $_.check -eq 'installed_native_settings_quit' }).Count -eq 1 -and @($receipt.observations | Where-Object { $_.check -eq 'uninstall' -and $_.passed }).Count -eq 1
@@ -992,3 +1049,4 @@ public static class BroTypistInstallerNative {
 }
 if (-not $receipt.passed) { [Console]::Error.WriteLine('Windows core installer smoke failed; see redacted observations'); exit 1 }
 Write-Output 'Windows core installer smoke passed within the explicitly recorded upgrade/rollback scope'
+exit 0

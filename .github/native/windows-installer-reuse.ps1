@@ -129,6 +129,14 @@ function Redact([string]$Text) {
     return $Text
 }
 
+function Assert-StandardUserEvidence($Client, $Core) {
+    foreach ($field in @('passed', 'genuine_standard_user', 'account_cleanup_verified', 'profile_cleanup_verified', 'restoration_verified', 'quiescence_verified')) {
+        Require ($Client.$field -is [bool] -and $Client.$field -eq $true) 'Shared standard-user identity, cleanup, quiescence or policy restoration evidence missing'
+    }
+    Require (@($Core.observations | Where-Object { $_.check -ceq 'genuine_standard_user_verified_before_installer' -and $_.passed -is [bool] -and $_.passed -eq $true }).Count -eq 1) 'Child did not independently verify genuine standard-user identity before installer access'
+    Require ($Core.passed -is [bool] -and $Core.passed -eq $true) 'Native installer core assertions failed; inspect retained native receipt'
+}
+
 try {
     Require ($IsWindows -and [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [Runtime.InteropServices.Architecture]::X64) 'Native Windows x86_64 required'
     Require ($env:CI -ceq 'true' -and $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted' -and $env:RUNNER_OS -ceq 'Windows' -and $env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch') 'Disposable manual GitHub-hosted probe required'
@@ -306,7 +314,7 @@ try {
     }
     $metadata.rollback_fixture_requested = [bool]$ExerciseRollback
 
-    $stage = 'existing_guarded_native_core_restricted_rights'
+    $stage = 'existing_guarded_native_core_standard_user'
     $pwsh = (Get-Process -Id $PID).Path
     $core = Join-Path $PSScriptRoot 'windows-installer-smoke.ps1'
     $metadata.probe_core_sha256 = (Get-FileHash -LiteralPath $core -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -316,7 +324,7 @@ try {
     $env:GH_TOKEN = $null; $script:headers = $null
     $client = Join-Path $PSScriptRoot 'windows-installer-client.ps1'
     $metadata.probe_client_sha256 = (Get-FileHash -LiteralPath $client -Algorithm SHA256).Hash.ToLowerInvariant()
-    $metadata.client_experiment = @{ method = 'shared SAFER NORMALUSER restricted primary rights + medium integrity + CreateProcessAsUserW'; genuine_uac_filtered_logon = $false; retained_elevation_metadata_reported = $true; child_verification_before_installer_required = $true; policy_changes = 'only approved absent HKLM64 DisableMSI-to-DWORD0 fixture; restored in finally'; global_acl_changes = $false; alternate_credentials = $false }
+    $metadata.client_experiment = @{ method = 'fresh nonadministrator local account; LOGON_WITH_PROFILE; private window station and desktop'; child_verification_before_installer_required = $true; policy_changes = 'only approved absent HKLM64 DisableMSI-to-DWORD0 fixture; restored in finally'; global_acl_changes = $false; account_and_profile_cleanup_required = $true }
     & $pwsh -NoLogo -NoProfile -NonInteractive -File $client -InputFile $inputPath -Work $coreWork
     $nativeExit = $LASTEXITCODE
     foreach ($name in @('client-observations.json', 'observations.json')) {
@@ -331,12 +339,12 @@ try {
     $observationsPath = Join-Path $coreWork 'observations.json'
     Require ((Get-Item -LiteralPath $observationsPath).Length -le 262144) 'Native core receipt missing/oversized'
     $clientObserved = Get-Content -LiteralPath (Join-Path $coreWork 'client-observations.json') -Raw | ConvertFrom-Json
-    Require ($clientObserved.passed -eq $true -and $clientObserved.restoration_verified -eq $true -and $clientObserved.quiescence_verified -eq $true) 'Shared restricted client/quiescence/policy restoration failed'
+    $metadata.standard_user_client = $clientObserved
     $observations = Get-Content -LiteralPath $observationsPath -Raw | ConvertFrom-Json
-    Require (@($observations.observations | Where-Object { $_.check -ceq 'restricted_rights_client_verified_before_installer' -and $_.passed -eq $true }).Count -eq 1) 'Child did not independently verify restricted primary rights before installer access'
-    Require ($nativeExit -eq 0 -and $observations.passed -eq $true) 'Native installer core assertions failed; inspect retained native receipt'
+    Assert-StandardUserEvidence $clientObserved $observations
+    Require ($nativeExit -eq 0) 'Native standard-user client failed; inspect retained native receipt'
     $metadata.passed = $true
-    $stage = 'completed_core_scope_only_restricted_rights'
+    $stage = 'completed_core_scope_only_standard_user'
 } catch {
     $metadata.diagnostics.Add((Redact $_.Exception.Message))
 } finally {

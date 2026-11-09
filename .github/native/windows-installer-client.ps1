@@ -3,20 +3,25 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$InputFile,
-    [Parameter(Mandatory)][string]$Work
+    [Parameter(Mandatory)][string]$Work,
+    [switch]$Bootstrap,
+    [string]$HandoffHash
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $metadata = [ordered]@{
-    schema = 1; tool = 'windows-restricted-installer-client'; passed = $false
-    genuine_uac_filtered_logon = $false; policy_scope = 'HKLM64 DisableMSI absent-to-DWORD-zero only; disposable GitHub runner'
+    schema = 1; tool = 'windows-standard-user-installer-client'; passed = $false
+    genuine_standard_user = $false; policy_scope = 'HKLM64 DisableMSI absent-to-DWORD-zero only; disposable GitHub runner'
     policy_modified = $false; restoration_verified = $false
     before = $null; during = $null; restored = $null; policy_key_created = $false
     transactional_policy_contract = 'KTM RegOpen/Create/DeleteKeyTransacted; conflict/unsupported fails closed; no ordinary write/delete fallback'
-    quiescence_verified = $false
-    global_acl_changes = $false; alternate_credentials = $false
-    diagnostics = [Collections.Generic.List[string]]::new()
+    quiescence_verified = $false; account_cleanup_verified = $false; profile_cleanup_verified = $false
+    private_tree_cleanup_verified = $false; global_acl_changes = $false; alternate_credentials = $true
+    stage = 'preflight'; diagnostics = [Collections.Generic.List[string]]::new()
 }
+$ownedRoot = $null; $account = $null; $accountName = $null; $validationSid = $null
+$password = $null; $coreWork = $null; $profileWasAbsent = $false; $outcome = $null
+$accountCreationAttempted = $false
 $base = $null; $key = $null; $createdKey = $false; $createdValue = $false
 $nativeInitialized = $false
 $policyPath = 'Software\Policies\Microsoft\Windows\Installer'
@@ -42,8 +47,8 @@ function Policy-Snapshot($Key) {
     return $result
 }
 function Initialize-InstallerNative {
-    # SAFER rights restriction is not a UAC-filtered logon. Native diagnostic
-    # 41285568481 proved elevation metadata stays 1 after rights restriction.
+    # LOGON_WITH_PROFILE + NULL environment: a real local logon with its own
+    # profile environment, never SAFER, impersonation, or inherited CI secrets.
     Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -51,10 +56,13 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
-public static class BroTypistRestrictedInstallerClient {
-    public static Dictionary<string,object> PreparedToken;
-    public static bool ClientLaunched, ClientExited, DeadlineExceeded;
-    public static uint LastWaitError;
+public static class BroTypistStandardUserInstallerClient {
+    public static Dictionary<string,object> ChildToken;
+    public static bool LogonAttempted, ClientLaunched, ClientResumed, ClientExited, DeadlineExceeded, JobQuiescent;
+    public static string ProfileDirectory;
+    public static string Stage="native_setup";
+    public static int LastNativeError;
+    static IntPtr station,desktop,job;
     [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
     struct Startup {
         public int size;
@@ -67,24 +75,47 @@ public static class BroTypistRestrictedInstallerClient {
         public IntPtr process,thread;
         public uint processId,threadId;
     }
-    [StructLayout(LayoutKind.Sequential)] struct Label { public IntPtr sid; public uint attributes; }
-    [DllImport("advapi32.dll", SetLastError=true)] static extern bool SaferCreateLevel(uint scope,uint level,uint flags,out IntPtr handle,IntPtr reserved);
-    [DllImport("advapi32.dll", SetLastError=true)] static extern bool SaferComputeTokenFromLevel(IntPtr level,IntPtr source,out IntPtr token,uint flags,IntPtr reserved);
-    [DllImport("advapi32.dll")] static extern bool SaferCloseLevel(IntPtr handle);
-    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool ConvertStringSidToSidW(string text,out IntPtr sid);
-    [DllImport("advapi32.dll")] static extern uint GetLengthSid(IntPtr sid);
-    [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
-    [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthority(IntPtr sid,uint index);
-    [DllImport("advapi32.dll", SetLastError=true)] static extern bool SetTokenInformation(IntPtr token,int kind,IntPtr value,int size);
+    [StructLayout(LayoutKind.Sequential)] struct SecurityAttributes {
+        public int size; public IntPtr descriptor; public int inherit;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct JobAccounting {
+        public long user,kernel,periodUser,periodKernel;
+        public uint faults,total,active,terminated;
+    }
+    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern bool CreateProcessWithLogonW(string user,string domain,IntPtr password,uint logonFlags,string application,StringBuilder command,uint flags,IntPtr environment,string directory,ref Startup startup,out ProcessInfo process);
+    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string sddl,uint revision,out IntPtr descriptor,IntPtr size);
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr process,uint access,out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenThreadToken(IntPtr thread,uint access,bool openAsSelf,out IntPtr token);
     [DllImport("advapi32.dll", EntryPoint="GetTokenInformation", SetLastError=true)] static extern bool TokenUInt(IntPtr token,int kind,out uint value,int size,out int needed);
     [DllImport("advapi32.dll", EntryPoint="GetTokenInformation", SetLastError=true)] static extern bool TokenBuffer(IntPtr token,int kind,IntPtr value,int size,out int needed);
-    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern bool CreateProcessAsUserW(IntPtr token,string application,StringBuilder command,IntPtr processAttributes,IntPtr threadAttributes,bool inherit,uint flags,IntPtr environment,string directory,ref Startup startup,out ProcessInfo process);
-    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
-    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
+    [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthority(IntPtr sid,uint index);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern IntPtr CreateWindowStationW(string name,uint flags,uint access,ref SecurityAttributes attributes);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern IntPtr CreateDesktopW(string name,IntPtr device,IntPtr mode,uint flags,uint access,ref SecurityAttributes attributes);
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetProcessWindowStation();
+    [DllImport("user32.dll", SetLastError=true)] static extern bool SetProcessWindowStation(IntPtr station);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool CloseWindowStation(IntPtr station);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool CloseDesktop(IntPtr desktop);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)] static extern IntPtr CreateJobObjectW(IntPtr attributes,string name);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr job,IntPtr process);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr job,int kind,out JobAccounting info,int size,IntPtr length);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(IntPtr process,uint exit);
     [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle,uint timeout);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr handle,out uint code);
-    static void Check(bool value) { if(!value) throw new Win32Exception(Marshal.GetLastWin32Error()); }
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process,out uint exit);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+    [DllImport("userenv.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern bool DeleteProfileW(string sid,string path,string computer);
+    [DllImport("userenv.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern bool GetUserProfileDirectoryW(IntPtr token,StringBuilder path,ref uint size);
+    static void Check(bool value) {
+        if(!value) { LastNativeError=Marshal.GetLastWin32Error(); throw new Win32Exception(LastNativeError); }
+    }
     static uint UInt(IntPtr token,int kind) {
         uint value; int needed; Check(TokenUInt(token,kind,out value,4,out needed)); return value;
     }
@@ -100,64 +131,119 @@ public static class BroTypistRestrictedInstallerClient {
             return unchecked((uint)Marshal.ReadInt32(GetSidSubAuthority(sid,(uint)count-1)));
         } finally { Marshal.FreeHGlobal(buffer); }
     }
-    public static int Run(string executable,string command,string directory,string expectedSid) {
-        IntPtr level=IntPtr.Zero,token=IntPtr.Zero,sid=IntPtr.Zero,label=IntPtr.Zero;
+    static void RetainOwnership() {
+        // Unknown live ownership is not a cleanup authorization. VM teardown
+        // is the only fallback; never kill MSI services or close a live job.
+        Console.Error.WriteLine("Native ownership retained until VM teardown; stage="+Stage+"; win32="+LastNativeError+"; deadline="+DeadlineExceeded);
+        for(;;) System.Threading.Thread.Sleep(30000);
+    }
+    static void WaitOwned(IntPtr process,uint timeout) {
+        uint wait=WaitForSingleObject(process,timeout);
+        if(wait==258) DeadlineExceeded=true;
+        if(wait!=0) {
+            if(wait==0xffffffff) LastNativeError=Marshal.GetLastWin32Error();
+            RetainOwnership();
+        }
+        ClientExited=true;
+    }
+    public static int Run(string executable,string command,string directory,string user,System.Security.SecureString password,string expectedSid,string supervisorSid) {
+        IntPtr descriptor=IntPtr.Zero,secret=IntPtr.Zero,token=IntPtr.Zero,threadToken=IntPtr.Zero;
         ProcessInfo process=new ProcessInfo();
+        if(command.Length>=1024) throw new InvalidOperationException("Logon command exceeds native limit");
+        string stationName="btci-"+Guid.NewGuid().ToString("N");
         try {
-            Check(SaferCreateLevel(2,0x20000,1,out level,IntPtr.Zero));
-            // NORMALUSER removes Administrator/Power User rights. Flags=0
-            // preserves AppLocker/software-restriction enforcement.
-            Check(SaferComputeTokenFromLevel(level,IntPtr.Zero,out token,0,IntPtr.Zero));
-            if(token==IntPtr.Zero) throw new InvalidOperationException("SAFER returned no token");
-            Check(ConvertStringSidToSidW("S-1-16-8192",out sid));
-            int size=checked(Marshal.SizeOf<Label>()+(int)GetLengthSid(sid));
-            label=Marshal.AllocHGlobal(size);
-            Marshal.StructureToPtr(new Label { sid=sid,attributes=0x20 },label,false);
-            Check(SetTokenInformation(token,25,label,size));
-            uint integrity=Integrity(token),restricted=UInt(token,21),tokenType=UInt(token,8);
+            Stage="private_desktop";
+            // A new object only; no WinSta0, shared desktop ACL, or desktop switch.
+            string sddl="D:P(A;;GA;;;SY)(A;;GA;;;"+supervisorSid+")(A;;GA;;;"+expectedSid+")";
+            Check(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl,1,out descriptor,IntPtr.Zero));
+            var attributes=new SecurityAttributes { size=Marshal.SizeOf<SecurityAttributes>(),descriptor=descriptor };
+            IntPtr original=GetProcessWindowStation(); Check(original!=IntPtr.Zero);
+            // GENERIC_ALL maps to the noninteractive station's supported rights.
+            station=CreateWindowStationW(stationName,1,0x10000000,ref attributes); Check(station!=IntPtr.Zero);
+            try {
+                Check(SetProcessWindowStation(station));
+                desktop=CreateDesktopW("Probe",IntPtr.Zero,IntPtr.Zero,0,0x10000000,ref attributes);
+                Check(desktop!=IntPtr.Zero);
+            } finally {
+                if(!SetProcessWindowStation(original)) { LastNativeError=Marshal.GetLastWin32Error(); RetainOwnership(); }
+            }
+            job=CreateJobObjectW(IntPtr.Zero,null); Check(job!=IntPtr.Zero);
+            Stage="profile_logon";
+            var startup=new Startup { size=Marshal.SizeOf<Startup>(),desktop=stationName+@"\Probe" };
+            secret=Marshal.SecureStringToGlobalAllocUnicode(password);
+            try {
+                // LOGON_WITH_PROFILE=1; CREATE_SUSPENDED=4. NULL environment
+                // means target-profile environment, NOT the runner environment.
+                LogonAttempted=true;
+                Check(CreateProcessWithLogonW(user,".",secret,1,executable,new StringBuilder(command),4,IntPtr.Zero,directory,ref startup,out process));
+                ClientLaunched=true;
+            } finally { Marshal.ZeroFreeGlobalAllocUnicode(secret); secret=IntPtr.Zero; password.Dispose(); }
+            Stage="actual_child_token";
+            // WindowsPrincipal membership checks duplicate a primary token.
+            Check(OpenProcessToken(process.process,0x000A,out token));
+            uint profileSize=0;
+            GetUserProfileDirectoryW(token,null,ref profileSize);
+            if(profileSize==0 || profileSize>32768) throw new InvalidOperationException("Invalid profile path length");
+            var profile=new StringBuilder((int)profileSize);
+            Check(GetUserProfileDirectoryW(token,profile,ref profileSize)); ProfileDirectory=profile.ToString();
+            bool noImpersonation=!OpenThreadToken(process.thread,8,true,out threadToken);
+            if(!noImpersonation || Marshal.GetLastWin32Error()!=1008) throw new InvalidOperationException("Child thread token is not absent");
             using(var identity=new WindowsIdentity(token)) {
                 bool same=identity.User.Value==expectedSid,system=identity.IsSystem;
                 bool administrator=new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
-                PreparedToken=new Dictionary<string,object> {
-                    {"same_user",same}, {"is_system",system}, {"administrator_role_enabled",administrator},
-                    {"token_elevation",UInt(token,20)}, {"token_elevation_type",UInt(token,18)},
-                    {"integrity_rid",integrity}, {"token_has_restrictions",restricted}, {"token_type",tokenType},
-                    {"client_launched",false}
+                bool adminSid=false;
+                foreach(var group in identity.Groups) if(group.Value=="S-1-5-32-544") adminSid=true;
+                uint elevation=UInt(token,20),integrity=Integrity(token),type=UInt(token,8);
+                ChildToken=new Dictionary<string,object> {
+                    {"expected_user",same}, {"is_system",system}, {"administrator_role_enabled",administrator},
+                    {"administrator_sid_present",adminSid}, {"token_elevation",elevation},
+                    {"token_elevation_type",UInt(token,18)}, {"integrity_rid",integrity},
+                    {"token_has_restrictions",UInt(token,21)}, {"token_type",type}, {"no_impersonation",noImpersonation}
                 };
-                if(!same || system || administrator || integrity!=8192 || restricted!=1 || tokenType!=1)
-                    throw new InvalidOperationException("SAFER token lacks required same-user restricted primary rights");
+                if(!same || system || administrator || adminSid || elevation!=0 || integrity!=8192 || type!=1)
+                    throw new InvalidOperationException("Actual child is not a genuine standard-user primary token");
             }
-            var startup=new Startup { size=Marshal.SizeOf<Startup>() };
-            // Same SID/profile/environment/desktop; no inherited handles,
-            // alternate credentials or desktop/window-station ACL changes.
-            Check(CreateProcessAsUserW(token,executable,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,false,0,IntPtr.Zero,directory,ref startup,out process));
-            PreparedToken["client_launched"]=true;
-            ClientLaunched=true;
-            uint wait=WaitForSingleObject(process.process,900000);
-            DeadlineExceeded=wait==258;
-            // A deadline is failure, never permission to abandon ownership.
-            // Wait errors retain the handle and the policy lease until a later
-            // signalled exit or disposal of this entire hosted VM.
-            while(wait!=0) {
-                if(wait==0xffffffff) {
-                    LastWaitError=unchecked((uint)Marshal.GetLastWin32Error());
-                    System.Threading.Thread.Sleep(1000);
-                }
-                wait=WaitForSingleObject(process.process,0xffffffff);
-            }
-            ClientExited=true;
-            if(LastWaitError!=0) throw new Win32Exception(unchecked((int)LastWaitError),"Owned child wait failed before exit was subsequently confirmed");
-            if(DeadlineExceeded) throw new TimeoutException("Restricted probe exceeded its deadline; owned child exit was subsequently confirmed");
+            Stage="job_assignment";
+            Check(AssignProcessToJobObject(job,process.process));
+            Stage="core_lifecycle";
+            uint previousSuspendCount=ResumeThread(process.thread);
+            ClientResumed=previousSuspendCount!=0xffffffff;
+            Check(previousSuspendCount!=0xffffffff);
+            if(previousSuspendCount!=1) throw new InvalidOperationException("Unexpected child suspend count");
+            WaitOwned(process.process,900000);
+            Stage="job_quiescence";
+            JobAccounting accounting;
+            Check(QueryInformationJobObject(job,1,out accounting,Marshal.SizeOf<JobAccounting>(),IntPtr.Zero));
+            if(accounting.active!=0) RetainOwnership();
+            JobQuiescent=true;
             uint code; Check(GetExitCodeProcess(process.process,out code));
+            Stage="child_exited";
             return unchecked((int)code);
         } finally {
+            if(ClientLaunched && !ClientExited) {
+                if(ClientResumed) RetainOwnership();
+                // Only the never-resumed child may be terminated safely.
+                if(!TerminateProcess(process.process,1)) RetainOwnership();
+                WaitOwned(process.process,30000); JobQuiescent=true;
+            }
+            if(threadToken!=IntPtr.Zero) CloseHandle(threadToken);
+            if(token!=IntPtr.Zero) CloseHandle(token);
             if(process.thread!=IntPtr.Zero) CloseHandle(process.thread);
             if(process.process!=IntPtr.Zero) CloseHandle(process.process);
-            if(label!=IntPtr.Zero) Marshal.FreeHGlobal(label);
-            if(sid!=IntPtr.Zero) LocalFree(sid);
-            if(token!=IntPtr.Zero) CloseHandle(token);
-            if(level!=IntPtr.Zero) SaferCloseLevel(level);
+            if(secret!=IntPtr.Zero) Marshal.ZeroFreeGlobalAllocUnicode(secret);
+            if(descriptor!=IntPtr.Zero) LocalFree(descriptor);
         }
+    }
+    public static void DeleteOwnedProfile(string sid) {
+        Stage="profile_cleanup";
+        Check(DeleteProfileW(sid,null,null));
+    }
+    public static void ReleaseObjects() {
+        if(ClientLaunched && (!ClientExited || !JobQuiescent)) throw new InvalidOperationException("Live native objects retained");
+        Stage="private_object_cleanup";
+        if(desktop!=IntPtr.Zero) { Check(CloseDesktop(desktop)); desktop=IntPtr.Zero; }
+        if(station!=IntPtr.Zero) { Check(CloseWindowStation(station)); station=IntPtr.Zero; }
+        if(job!=IntPtr.Zero) { Check(CloseHandle(job)); job=IntPtr.Zero; }
     }
 }
 // No ordinary RegistryKey write/delete fallback is permitted. Registry reads,
@@ -232,19 +318,138 @@ public sealed class BroTypistInstallerPolicyTransaction : IDisposable {
 }
 '@
 }
-function Invoke-RestrictedCore([string]$Executable, [string]$Core, [string]$InputPath, [string]$CoreWork) {
-    foreach ($path in @($Executable, $Core, $InputPath, $CoreWork)) {
-        Require ([IO.Path]::IsPathFullyQualified($path) -and $path -cnotmatch '["\r\n]') 'Unsafe restricted child path'
+function Assert-RegularPath([string]$Path) {
+    Require ([IO.Path]::IsPathFullyQualified($Path) -and $Path -cnotmatch '["\r\n]' -and -not $Path.EndsWith('\')) 'Unsafe absolute file path'
+    $item = Get-Item -LiteralPath $Path -Force
+    Require (-not $item.PSIsContainer) 'Regular file required'
+    $ancestor = $item
+    while ($null -ne $ancestor) {
+        Require (($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Linked input or ancestor refused'
+        $ancestor = if ($ancestor -is [IO.FileInfo]) { $ancestor.Directory } else { $ancestor.Parent }
     }
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    try { $expectedSid = $identity.User.Value } finally { $identity.Dispose() }
-    $command = '"{0}" -NoLogo -NoProfile -NonInteractive -File "{1}" -InputFile "{2}" -Work "{3}" -RequireRestrictedClient -ExpectedUserSid "{4}"' -f $Executable, $Core, $InputPath, $CoreWork, $expectedSid
-    try { return [BroTypistRestrictedInstallerClient]::Run($Executable, $command, $CoreWork, $expectedSid) }
+    return $item
+}
+function File-Identity([string]$Path) {
+    $item = Assert-RegularPath $Path
+    return @{ size = $item.Length; sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
+}
+function Copy-VerifiedFile([string]$Source, [string]$Destination, $Expected) {
+    $before = File-Identity $Source
+    Require ($before.size -eq $Expected.size -and $before.sha256 -ceq $Expected.sha256) 'Source bytes differ from expected identity'
+    [IO.File]::Copy($Source, $Destination, $false)
+    $after = File-Identity $Destination
+    Require ($after.size -eq $Expected.size -and $after.sha256 -ceq $Expected.sha256) 'Staged bytes differ from expected identity'
+    return @{ path = $Destination; size = $after.size; sha256 = $after.sha256 }
+}
+function Private-DirectoryAcl([string]$Supervisor, [string]$User, [string]$UserRights) {
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @($Supervisor, 'S-1-5-18')) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($User)) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($User), $UserRights, 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+    }
+    return $acl
+}
+function New-PrivateDirectory([string]$Path, $Acl) {
+    Require (-not (Test-Path -LiteralPath $Path)) 'Existing private directory refused'
+    [void][IO.FileSystemAclExtensions]::CreateDirectory([IO.DirectoryInfo]::new($Path), $Acl)
+}
+function Write-NewJson([string]$Path, $Value) {
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 32) + "`n")
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+}
+function Save-ClientReceipt {
+    Write-NewJson (Join-Path $Work 'client-observations.json') $metadata
+}
+function Hold-OwnedVm([string]$Reason) {
+    $metadata.passed = $false
+    $metadata.diagnostics.Add($Reason)
+    try { Save-ClientReceipt } catch { [Console]::Error.WriteLine('Fail-closed client receipt unavailable') }
+    [Console]::Error.WriteLine($Reason)
+    while ($true) { [Threading.Thread]::Sleep(30000) }
+}
+function Promote-Report([string]$Relative, [bool]$Required) {
+    $source = Join-Path $coreWork $Relative
+    if (-not (Test-Path -LiteralPath $source)) {
+        Require (-not $Required) 'Required native report missing'
+        return
+    }
+    $file = Assert-RegularPath $source
+    Require ($file.Length -gt 0 -and $file.Length -le 262144) 'Native report size refused'
+    $text = [IO.File]::ReadAllText($source)
+    [void]($text | ConvertFrom-Json)
+    # Do not publish profile/account identifiers even when a native diagnostic
+    # includes an unexpected Windows path. JSON escaping is redacted as well.
+    foreach ($private in @($ownedRoot, [BroTypistStandardUserInstallerClient]::ProfileDirectory, $accountName, $validationSid, $supervisorSid, $env:USERPROFILE)) {
+        if (-not [string]::IsNullOrWhiteSpace($private)) {
+            $text = $text.Replace($private.Replace('\', '\\'), '<private>').Replace($private, '<private>')
+        }
+    }
+    $destination = Join-Path $Work $Relative
+    $parent = [IO.Path]::GetDirectoryName($destination)
+    if ($parent -ne $Work) {
+        Require (-not (Test-Path -LiteralPath $parent)) 'Existing promoted report directory refused'
+        [void][IO.Directory]::CreateDirectory($parent)
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text)
+    $stream = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+}
+function Remove-OwnedTree([IO.DirectoryInfo]$Directory) {
+    Require (($Directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Linked private directory refused during cleanup'
+    foreach ($entry in $Directory.EnumerateFileSystemInfos()) {
+        Require (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Linked private entry refused during cleanup'
+        if ($entry -is [IO.DirectoryInfo]) { Remove-OwnedTree $entry }
+        else { $entry.Delete() }
+    }
+    $Directory.Delete()
+}
+function Invoke-StandardUserCore([string]$Executable, [string]$Client, [string]$InputPath, [string]$CoreWork, [string]$Hash) {
+    foreach ($path in @($Executable, $Client, $InputPath, $CoreWork)) {
+        Require ([IO.Path]::IsPathFullyQualified($path) -and $path -cnotmatch '["\r\n]' -and -not $path.EndsWith('\')) 'Unsafe standard-user child path'
+    }
+    $command = '"{0}" -NoLogo -NoProfile -NonInteractive -File "{1}" -InputFile "{2}" -Work "{3}" -Bootstrap -HandoffHash "{4}"' -f $Executable, $Client, $InputPath, $CoreWork, $Hash
+    Require ($command.Length -lt 1024) 'Native logon command length refused'
+    try { return [BroTypistStandardUserInstallerClient]::Run($Executable, $command, $CoreWork, $accountName, $password, $validationSid, $supervisorSid) }
     finally {
-        $metadata.prepared_restricted_token = [BroTypistRestrictedInstallerClient]::PreparedToken
-        $metadata.child_deadline_exceeded = [BroTypistRestrictedInstallerClient]::DeadlineExceeded
-        $metadata.child_wait_error = [BroTypistRestrictedInstallerClient]::LastWaitError
-        $metadata.child_exit_confirmed = [BroTypistRestrictedInstallerClient]::ClientExited
+        $metadata.actual_standard_user_token = [BroTypistStandardUserInstallerClient]::ChildToken
+        $metadata.child_deadline_exceeded = [BroTypistStandardUserInstallerClient]::DeadlineExceeded
+        $metadata.native_error_code = [BroTypistStandardUserInstallerClient]::LastNativeError
+        $metadata.native_stage = [BroTypistStandardUserInstallerClient]::Stage
+        $metadata.child_exit_confirmed = [BroTypistStandardUserInstallerClient]::ClientExited
+        $metadata.genuine_standard_user = [BroTypistStandardUserInstallerClient]::ClientResumed
+    }
+}
+
+if ($Bootstrap) {
+    # This branch never creates accounts or touches host policy. Its immutable
+    # handoff is authenticated by argv hash, not by inherited CI environment.
+    try {
+        Require ($IsWindows -and $HandoffHash -cmatch '^[0-9a-f]{64}$') 'Invalid bootstrap platform or handoff'
+        $handoffPath = Join-Path $PSScriptRoot 'handoff.json'
+        $handoffIdentity = File-Identity $handoffPath
+        Require ($handoffIdentity.size -le 65536 -and $handoffIdentity.sha256 -ceq $HandoffHash) 'Bootstrap handoff identity differs'
+        $handoff = Get-Content -LiteralPath $handoffPath -Raw | ConvertFrom-Json
+        Require ($InputFile -ceq $handoff.input -and $Work -ceq $handoff.work) 'Bootstrap path handoff differs'
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        try {
+            Require ($identity.User.Value -ceq $handoff.expected_user_sid -and -not $identity.IsSystem -and -not [Security.Principal.WindowsPrincipal]::new($identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'Bootstrap account differs'
+        } finally { $identity.Dispose() }
+        foreach ($file in $handoff.files) {
+            $actual = File-Identity $file.path
+            Require ($actual.size -eq $file.size -and $actual.sha256 -ceq $file.sha256) 'Bootstrap staged file identity differs'
+        }
+        $env:CI = 'true'; $env:GITHUB_ACTIONS = 'true'
+        $env:RUNNER_ENVIRONMENT = 'github-hosted'; $env:RUNNER_OS = 'Windows'
+        $env:BROTYPIST_INSTALLER_SMOKE_DISPOSABLE = '1'; $env:RUNNER_TEMP = $handoff.root
+        & $handoff.core -InputFile $InputFile -Work $Work -RequireStandardUser -ExpectedUserSid $handoff.expected_user_sid -SupervisorSid $handoff.supervisor_sid
+        exit $LASTEXITCODE
+    } catch {
+        [Console]::Error.WriteLine('Standard-user bootstrap failed before core launch; private VM ownership retained by supervisor')
+        exit 1
     }
 }
 
@@ -262,20 +467,89 @@ try {
         }
     }
     Require (-not (Test-Path -LiteralPath (Join-Path $Work 'client-observations.json'))) 'Existing client evidence refused'
-    $input = Get-Content -LiteralPath $InputFile -Raw | ConvertFrom-Json
-    foreach ($package in @($input.package, $input.previous)) {
-        if ($null -eq $package) { continue }
-        $msi = Get-Item -LiteralPath $package.artifacts.msi.path
-        Require (-not $msi.PSIsContainer -and ($msi.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and $msi.Length -eq $package.artifacts.msi.size) 'Nonregular or mismatched MSI refused'
-        Require ((Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $package.artifacts.msi.sha256) 'Canonical MSI hash differs before leaf-only SYSTEM Read'
-        $acl = Get-Acl -LiteralPath $msi.FullName
-        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-18'), 'Read', 'Allow'))
-        Set-Acl -LiteralPath $msi.FullName -AclObject $acl
-        Require ((Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $package.artifacts.msi.sha256) 'Canonical MSI hash differs after leaf-only SYSTEM Read'
-    }
-    $metadata.msi_system_read = 'non-secret canonical MSI leaves only; hashes rechecked; no inherited directory grants'
+    $metadata.stage = 'native_initialization'
     Initialize-InstallerNative
     $nativeInitialized = $true
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        Require (-not $identity.IsSystem -and [Security.Principal.WindowsPrincipal]::new($identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'Administrative non-SYSTEM CI supervisor required'
+        $supervisorSid = $identity.User.Value
+    } finally { $identity.Dispose() }
+    $metadata.stage = 'account_creation'
+    $accountName = 'btci-' + [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(6)).ToLowerInvariant()
+    Require (@(Get-LocalUser | Where-Object Name -CEQ $accountName).Count -eq 0) 'Fresh account name collision refused'
+    $password = [Security.SecureString]::new()
+    foreach ($character in 'Aa1!'.ToCharArray()) { $password.AppendChar($character) }
+    $randomPasswordBytes = [Security.Cryptography.RandomNumberGenerator]::GetBytes(48)
+    try {
+        $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+        foreach ($value in $randomPasswordBytes) { $password.AppendChar($alphabet[$value -band 63]) }
+    } finally { [Array]::Clear($randomPasswordBytes, 0, $randomPasswordBytes.Length); $randomPasswordBytes = $null }
+    $password.MakeReadOnly()
+    $accountCreationAttempted = $true
+    $account = New-LocalUser -Name $accountName -Password $password -Description 'Disposable BroTypist CI validation only' -AccountNeverExpires
+    $validationSid = $account.SID.Value
+    Require ($validationSid -cne $supervisorSid -and $validationSid -cmatch '^S-1-5-21-\d+-\d+-\d+-\d+$') 'Fresh local account SID required'
+    $profileKeyPath = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$validationSid"
+    $profileBase = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $existingProfile = $profileBase.OpenSubKey($profileKeyPath)
+        try { Require ($null -eq $existingProfile) 'Existing profile for fresh account refused' } finally { if ($null -ne $existingProfile) { $existingProfile.Dispose() } }
+        $profileWasAbsent = $true
+    } finally { $profileBase.Dispose() }
+    $users = Get-LocalGroup -SID ([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'))
+    if (@(Get-LocalGroupMember -Group $users | Where-Object { $_.SID.Value -ceq $validationSid }).Count -eq 0) {
+        Add-LocalGroupMember -Group $users -Member $account
+    }
+    foreach ($group in Get-LocalGroup) {
+        if (@(Get-LocalGroupMember -Group $group | Where-Object { $_.SID.Value -ceq $validationSid }).Count -gt 0) {
+            Require ($group.SID.Value -ceq 'S-1-5-32-545') 'Fresh account has membership beyond Users'
+        }
+    }
+    $metadata.stage = 'private_staging'
+    $ownedRoot = Join-Path $env:RUNNER_TEMP ('btci-' + [Guid]::NewGuid().ToString('N'))
+    New-PrivateDirectory $ownedRoot (Private-DirectoryAcl $supervisorSid '' '')
+    $stagedInputs = Join-Path $ownedRoot 'inputs'
+    New-PrivateDirectory $stagedInputs (Private-DirectoryAcl $supervisorSid $validationSid 'ReadAndExecute')
+    $coreWork = Join-Path $ownedRoot 'work'
+    New-PrivateDirectory $coreWork (Private-DirectoryAcl $supervisorSid $validationSid 'Modify')
+    $input = Get-Content -LiteralPath $InputFile -Raw | ConvertFrom-Json
+    $manifest = [Collections.Generic.List[object]]::new()
+    foreach ($which in @('package', 'previous')) {
+        $package = $input.$which
+        if ($null -eq $package) { continue }
+        foreach ($kind in @('msi', 'zip')) {
+            $artifact = $package.artifacts.$kind
+            $staged = Copy-VerifiedFile $artifact.path (Join-Path $stagedInputs "$which.$kind") $artifact
+            $manifest.Add($staged); $artifact.path = $staged.path
+        }
+    }
+    foreach ($optional in @('worker', 'model')) {
+        if (-not [string]::IsNullOrWhiteSpace($input.$optional)) {
+            $source = [string]$input.$optional
+            $suffix = if ($optional -ceq 'worker') { '.exe' } else { '.bin' }
+            $staged = Copy-VerifiedFile $source (Join-Path $stagedInputs ($optional + $suffix)) (File-Identity $source)
+            $manifest.Add($staged); $input.$optional = $staged.path
+        }
+    }
+    foreach ($script in @('windows-installer-client.ps1', 'windows-installer-smoke.ps1')) {
+        $source = Join-Path $PSScriptRoot $script
+        $manifest.Add((Copy-VerifiedFile $source (Join-Path $stagedInputs $script) (File-Identity $source)))
+    }
+    $stagedInput = Join-Path $stagedInputs 'input.json'
+    Write-NewJson $stagedInput $input
+    $stagedIdentity = File-Identity $stagedInput
+    $manifest.Add(@{ path = $stagedInput; size = $stagedIdentity.size; sha256 = $stagedIdentity.sha256 })
+    $core = Join-Path $stagedInputs 'windows-installer-smoke.ps1'
+    $metadata.core_sha256 = (File-Identity $core).sha256
+    $handoffPath = Join-Path $stagedInputs 'handoff.json'
+    Write-NewJson $handoffPath @{ root = $ownedRoot; input = $stagedInput; work = $coreWork; core = $core; expected_user_sid = $validationSid; supervisor_sid = $supervisorSid; files = @($manifest.ToArray()) }
+    $handoffHash = (File-Identity $handoffPath).sha256
+    Set-Acl -LiteralPath $ownedRoot -AclObject (Private-DirectoryAcl $supervisorSid $validationSid 'ReadAndExecute')
+    $metadata.staged_file_count = $manifest.Count
+    $metadata.staged_bytes_verified = $true
+    $metadata.msi_system_read = 'owned staged MSI only; original artifact ACLs unchanged'
+    $metadata.stage = 'policy_fixture'
     $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
     $apply = [BroTypistInstallerPolicyTransaction]::new()
     try {
@@ -303,42 +577,41 @@ try {
     $key = $base.OpenSubKey($policyPath, $false)
     $metadata.during = Policy-Snapshot $key
     Require ($metadata.during.values.DisableMSI.kind -ceq 'DWord' -and $metadata.during.values.DisableMSI.value -eq 0) 'Temporary DisableMSI fixture was not applied'
-    $core = Join-Path $PSScriptRoot 'windows-installer-smoke.ps1'
-    $metadata.core_sha256 = (Get-FileHash -LiteralPath $core -Algorithm SHA256).Hash.ToLowerInvariant()
-    $nativeExit = Invoke-RestrictedCore (Get-Process -Id $PID).Path $core $InputFile $Work
+    $metadata.stage = 'standard_user_launch'
+    $nativeExit = Invoke-StandardUserCore (Get-Process -Id $PID).Path (Join-Path $stagedInputs 'windows-installer-client.ps1') $stagedInput $coreWork $handoffHash
     $metadata.native_exit_code = $nativeExit
-    Require ($nativeExit -eq 0) 'Restricted native lifecycle failed; retain its independent observations'
+    Require ($nativeExit -eq 0) 'Standard-user native lifecycle failed'
     $metadata.passed = $true
 } catch {
-    $metadata.diagnostics.Add('Restricted client or bounded policy fixture failed; native observations and typed policy snapshots are authoritative')
+    $metadata.diagnostics.Add(('Stage {0} failed ({1}); native observations and typed policy snapshots are authoritative' -f $metadata.stage, $_.Exception.GetType().Name))
     try { if ($null -ne $base) { $metadata.during = Policy-Snapshot $key } }
     catch { $metadata.diagnostics.Add('During-policy snapshot unavailable; never counted as passed') }
-    $message = $_.Exception.Message
-    foreach ($path in @($Work, $InputFile, $env:RUNNER_TEMP, $env:USERPROFILE)) {
-        if (-not [string]::IsNullOrWhiteSpace($path)) { $message = $message.Replace($path, '<private-path>') }
-    }
-    $metadata.diagnostics.Add($message.Substring(0, [Math]::Min(2048, $message.Length)))
     $metadata.passed = $false
 } finally {
     # Never race host-policy restoration with a live child, active/unknown MSI
     # service transaction, or owned UI/worker cleanup. A deadline does not free
     # the lease. Unprovable quiescence deliberately holds this runner until VM
     # teardown rather than returning/collecting an unfinished native outcome.
-    $quiescent = -not $nativeInitialized -or -not [BroTypistRestrictedInstallerClient]::ClientLaunched
-    if ($nativeInitialized -and [BroTypistRestrictedInstallerClient]::ClientLaunched -and [BroTypistRestrictedInstallerClient]::ClientExited) {
-        try {
-            $outcomePath = Join-Path $Work 'observations.json'
-            Require ((Get-Item -LiteralPath $outcomePath).Length -le 262144) 'Native quiescence receipt missing/oversized'
-            $outcome = Get-Content -LiteralPath $outcomePath -Raw | ConvertFrom-Json
-            Assert-NativeQuiescence $outcome
-            $quiescent = $true
-        } catch { $quiescent = $false }
+    $quiescent = -not $nativeInitialized -or -not [BroTypistStandardUserInstallerClient]::ClientLaunched
+    $uninstallVerified = $quiescent
+    if ($nativeInitialized -and [BroTypistStandardUserInstallerClient]::ClientLaunched -and [BroTypistStandardUserInstallerClient]::ClientExited -and [BroTypistStandardUserInstallerClient]::JobQuiescent) {
+        if (-not [BroTypistStandardUserInstallerClient]::ClientResumed) {
+            $quiescent = $true; $uninstallVerified = $true
+        } else {
+            try {
+                $outcomePath = Join-Path $coreWork 'observations.json'
+                $file = Assert-RegularPath $outcomePath
+                Require ($file.Length -gt 0 -and $file.Length -le 262144) 'Native quiescence receipt missing/oversized'
+                $outcome = Get-Content -LiteralPath $outcomePath -Raw | ConvertFrom-Json
+                Assert-NativeQuiescence $outcome
+                $quiescent = $true
+                $uninstallVerified = $outcome.quiescence.uninstall_verified -is [bool] -and $outcome.quiescence.uninstall_verified
+            } catch { $quiescent = $false }
+        }
     }
-    if (-not $quiescent) {
-        [Console]::Error.WriteLine('Native quiescence is unknown: retaining child/VM ownership and policy lease until hosted VM teardown; no restoration, racing uninstall or final receipt collection')
-        while ($true) { [Threading.Thread]::Sleep(30000) }
-    }
+    if (-not $quiescent) { Hold-OwnedVm 'Native quiescence unknown; retaining VM and policy lease until teardown, with no restoration or report promotion' }
     $metadata.quiescence_verified = $true
+    $metadata.stage = 'policy_restoration'
     try {
         if ($createdValue) {
             if ($null -ne $key) { $key.Dispose(); $key = $null }
@@ -380,8 +653,65 @@ try {
         if ($null -ne $base) { $base.Dispose() }
     }
     $metadata.passed = $metadata.passed -and $metadata.restoration_verified
-    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($metadata | ConvertTo-Json -Depth 16) + "`n")
-    $stream = [IO.File]::Open((Join-Path $Work 'client-observations.json'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    if (-not $uninstallVerified) { Hold-OwnedVm 'Uninstall unverified; policy restoration attempted after quiescence, account/profile/tree retained until VM teardown' }
+    try {
+        $metadata.stage = 'report_promotion'
+        if ($null -ne $outcome) {
+            Promote-Report 'observations.json' $true
+            Promote-Report 'tiny-worker/worker-smoke.json' $false
+            Promote-Report 'portable-tiny-worker/worker-smoke.json' $false
+            $metadata.passed = $metadata.passed -and $outcome.passed
+        }
+        $metadata.stage = 'profile_cleanup'
+        if ($null -ne $account) {
+            Require ((Get-LocalUser -Name $accountName).SID.Value -ceq $validationSid) 'Owned account SID changed before profile cleanup'
+            Require $profileWasAbsent 'Profile absence before logon not established'
+            $profileBase = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+            try {
+                $profileKey = $profileBase.OpenSubKey($profileKeyPath)
+                $profilePath = $null
+                try {
+                    if ($null -ne $profileKey) { $profilePath = [string]$profileKey.GetValue('ProfileImagePath') }
+                } finally { if ($null -ne $profileKey) { $profileKey.Dispose() } }
+                if ([BroTypistStandardUserInstallerClient]::ClientLaunched) {
+                    Require (-not [string]::IsNullOrWhiteSpace([BroTypistStandardUserInstallerClient]::ProfileDirectory) -and $profilePath -ieq [BroTypistStandardUserInstallerClient]::ProfileDirectory) 'Actual child profile and owned SID registration differ'
+                }
+                if ([BroTypistStandardUserInstallerClient]::LogonAttempted -and -not [BroTypistStandardUserInstallerClient]::ClientLaunched) {
+                    Require ($null -ne $profilePath) 'Failed logon profile disposition unknown'
+                }
+                if ($null -ne $profilePath) {
+                    Require ([IO.Path]::IsPathFullyQualified($profilePath) -and -not [string]::IsNullOrWhiteSpace($profilePath)) 'Owned profile path unavailable'
+                    [BroTypistStandardUserInstallerClient]::DeleteOwnedProfile($validationSid)
+                    Require (-not (Test-Path -LiteralPath $profilePath)) 'Owned profile directory remains after lifecycle deletion'
+                }
+                $remainingProfile = $profileBase.OpenSubKey($profileKeyPath)
+                try { Require ($null -eq $remainingProfile) 'Owned profile registration remains' }
+                finally { if ($null -ne $remainingProfile) { $remainingProfile.Dispose() } }
+                Require (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$validationSid") -and -not (Test-Path -LiteralPath "Registry::HKEY_USERS\${validationSid}_Classes")) 'Owned profile hive remains loaded'
+            } finally { $profileBase.Dispose() }
+            $metadata.profile_cleanup_verified = $true
+            $metadata.stage = 'account_cleanup'
+            Require ((Get-LocalUser -Name $accountName).SID.Value -ceq $validationSid) 'Owned account SID changed before deletion'
+            Remove-LocalUser -SID ([Security.Principal.SecurityIdentifier]::new($validationSid))
+            Require (@(Get-LocalUser | Where-Object { $_.SID.Value -ceq $validationSid -or $_.Name -ceq $accountName }).Count -eq 0) 'Owned account remains'
+        } else {
+            Require (-not $accountCreationAttempted) 'Account creation result unknown; account ownership retained'
+            $metadata.profile_cleanup_verified = $true
+        }
+        $metadata.account_cleanup_verified = $true
+        if ($nativeInitialized) { [BroTypistStandardUserInstallerClient]::ReleaseObjects() }
+        $metadata.stage = 'private_tree_cleanup'
+        if ($null -ne $ownedRoot) {
+            Remove-OwnedTree ([IO.DirectoryInfo]::new($ownedRoot))
+            Require (-not (Test-Path -LiteralPath $ownedRoot)) 'Owned staging tree remains'
+        }
+        $metadata.private_tree_cleanup_verified = $true
+    } catch {
+        $metadata.diagnostics.Add(('Cleanup stage {0} failed ({1}); no exception text or identifiers retained' -f $metadata.stage, $_.Exception.GetType().Name))
+        Hold-OwnedVm 'Owned account/profile/tree cleanup unverified; retaining hosted VM until teardown'
+    } finally { if ($null -ne $password) { $password.Dispose(); $password = $null } }
+    $metadata.passed = $metadata.passed -and $metadata.genuine_standard_user -and $metadata.account_cleanup_verified -and $metadata.profile_cleanup_verified -and $metadata.private_tree_cleanup_verified
+    $metadata.stage = 'complete'
+    Save-ClientReceipt
 }
-if (-not $metadata.passed) { [Console]::Error.WriteLine('Restricted installer client failed; inspect client-observations.json and observations.json'); exit 1 }
+if (-not $metadata.passed) { [Console]::Error.WriteLine('Standard-user installer client failed; inspect client-observations.json and observations.json'); exit 1 }
