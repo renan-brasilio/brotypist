@@ -154,8 +154,10 @@ switch ($Phase) {
     }
     desktop {
         Import-NativeRuntime
-        # Reuse only this verified, explicitly supplied read-only test artifact;
-        # a new profile must never inherit another profile's model directory.
+        # Supply a verified read-only fixture for the independent import/model
+        # scenarios. Windows Welcome separately exercises a real catalogue
+        # download into its empty private profile; it must not reuse this file.
+        # No profile may inherit another profile's model directory.
         $env:BROTYPIST_SMOKE_MODEL = Get-VerifiedTinyModel
         # Canonical UI smoke requires a distinct, genuinely empty disposable
         # profile, not the configuration touched by CLI/worker smoke.

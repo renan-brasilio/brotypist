@@ -5465,24 +5465,27 @@ impl Engine {
         Ok(())
     }
     fn consume_download(&mut self) {
-        let events = self
+        // Decide ownership before draining. If the producer finishes after a
+        // live drain, retain its receiver until the next tick. Never drop it
+        // merely because is_finished changed after try_iter observed empty.
+        let finished = self
             .download
             .as_ref()
-            .map(|d| d.receiver.try_iter().collect::<Vec<_>>())
-            .unwrap_or_default();
+            .is_some_and(|d| d.thread.is_finished());
+        let events = if finished {
+            let download = self.download.take().expect("finished download owner");
+            let _ = download.thread.join();
+            download.receiver.try_iter().collect::<Vec<_>>()
+        } else {
+            self.download
+                .as_ref()
+                .map(|d| d.receiver.try_iter().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
         for event in events {
             self.download_status = Some(event.clone());
             if !self.stopping {
                 self.emit(event);
-            }
-        }
-        if self
-            .download
-            .as_ref()
-            .is_some_and(|d| d.thread.is_finished())
-        {
-            if let Some(d) = self.download.take() {
-                let _ = d.thread.join();
             }
         }
     }
@@ -6476,6 +6479,41 @@ mod tests {
     use crate::core::InlineRender;
     use crate::platform::{DetachedContextRead, Foreground, Permission, ShortcutHandler};
 
+    #[test]
+    fn asynchronous_download_terminal_events_survive_live_drain_and_owner_retirement() {
+        for state in ["complete", "error", "cancelled"] {
+            let mut h = harness(Config::default(), None);
+            let (sender, receiver) = mpsc::sync_channel(128);
+            let (release, released) = mpsc::sync_channel(0);
+            let owner = thread::spawn(move || {
+                sender
+                    .send(json!({"type":"download","id":"tiny","state":"downloading"}))
+                    .unwrap();
+                released.recv().unwrap();
+                sender
+                    .send(json!({"type":"download","id":"tiny","state":state}))
+                    .unwrap();
+            });
+            h.engine.download = Some(Download {
+                cancel: models::DownloadCancellation::new(),
+                thread: owner,
+                receiver,
+            });
+            h.engine.consume_download();
+            assert!(h.engine.download.is_some());
+            release.send(()).unwrap();
+            while !h.engine.download.as_ref().unwrap().thread.is_finished() {
+                thread::yield_now();
+            }
+            h.engine.consume_download();
+            assert!(h.engine.download.is_none());
+            assert_eq!(h.engine.download_status.as_ref().unwrap()["state"], state);
+            // Retirement is final: a later tick cannot publish a stale progress
+            // snapshot over the genuine terminal outcome.
+            h.engine.consume_download();
+            assert_eq!(h.engine.download_status.as_ref().unwrap()["state"], state);
+        }
+    }
     #[test]
     fn ready_only_publications_consume_prepared_ready_and_result_without_periodic_tick() {
         let mut h = harness(Config::default(), None);

@@ -235,6 +235,60 @@ fn screenshot(shell: &Shell, output: &Path, name: &str, receipt: &mut Value) -> 
     receipt["screenshots"].as_array_mut().unwrap().push(json!({"file":path.file_name().unwrap().to_string_lossy(),"method":"PrintWindow-owned-hwnd","pid":std::process::id()}));
     Ok(())
 }
+fn welcome_geometry(shell: &Shell) -> Result<()> {
+    let mut client = RECT::default();
+    unsafe {
+        GetClientRect(shell.window, &mut client)?;
+    }
+    let rect = |id| -> Result<RECT> {
+        let mut result = RECT::default();
+        unsafe {
+            GetWindowRect(shell.h(id), &mut result)?;
+            let mut points = [
+                POINT {
+                    x: result.left,
+                    y: result.top,
+                },
+                POINT {
+                    x: result.right,
+                    y: result.bottom,
+                },
+            ];
+            MapWindowPoints(None, Some(shell.window), &mut points);
+            result = RECT {
+                left: points[0].x,
+                top: points[0].y,
+                right: points[1].x,
+                bottom: points[1].y,
+            };
+        }
+        Ok(result)
+    };
+    let step = rect(W_STEP)?;
+    let title = rect(W_TITLE)?;
+    let body = rect(W_TEXT)?;
+    let next = rect(W_NEXT)?;
+    let quit = rect(QUIT)?;
+    ensure!(
+        step.top >= 0
+            && step.bottom <= title.top
+            && title.bottom <= body.top
+            && body.bottom < next.top
+            && next.bottom <= client.bottom
+            && quit.top == next.top
+            && quit.bottom == next.bottom
+            && quit.right < next.left
+            && next.right <= client.right,
+        "Welcome header hierarchy or stable unclipped footer geometry failed."
+    );
+    let body_font = unsafe { SendMessageW(shell.h(W_TEXT), WM_GETFONT, None, None).0 };
+    let title_font = unsafe { SendMessageW(shell.h(W_TITLE), WM_GETFONT, None, None).0 };
+    ensure!(
+        body_font != 0 && title_font != 0 && body_font != title_font,
+        "Welcome title/body do not have distinct owned native fonts."
+    );
+    Ok(())
+}
 fn preview_caret(shell: &Shell) -> Result<(u32, u32)> {
     let edit = shell.h(W_EDIT);
     owned(edit)?;
@@ -1191,6 +1245,7 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
                 "Wrong Welcome step."
             );
             screenshot(&shell, output, &format!("welcome-{step}"), receipt)?;
+            welcome_geometry(&shell)?;
             click(&mut shell, W_NEXT, &clipboard)?;
         }
         ensure!(
@@ -1205,6 +1260,62 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
                 && !unsafe { IsWindowEnabled(shell.h(W_NEXT)).as_bool() },
             "No selected model borrowed readiness."
         );
+        // Resize the genuine HWND at its actual monitor DPI; do not manufacture
+        // a DPI-change message or claim another display scale was exercised.
+        let dpi = unsafe { GetDpiForWindow(shell.window) }.max(96) as i32;
+        for (width, height, name) in [
+            (760, 700, "welcome-3-compact"),
+            (1040, 820, "welcome-3-wide"),
+        ] {
+            unsafe {
+                SetWindowPos(
+                    shell.window,
+                    None,
+                    0,
+                    0,
+                    width * dpi / 96,
+                    height * dpi / 96,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )?;
+            }
+            pump(&mut shell, &clipboard)?;
+            welcome_geometry(&shell)?;
+            screenshot(&shell, output, name, receipt)?;
+        }
+        receipt["welcome_actual_dpi"] = json!(dpi);
+        passed(
+            receipt,
+            "native-welcome-hierarchy-and-resize-stable-footer-at-observed-monitor-dpi",
+        );
+        let invalid = crate::paths::config_dir()?.join("owned-invalid-model.gguf");
+        ensure!(
+            !invalid.exists(),
+            "Invalid-model smoke fixture already exists."
+        );
+        std::fs::write(&invalid, b"not a GGUF model")?;
+        let active_before_invalid = shell.controller.config();
+        modal(
+            &mut shell,
+            &clipboard,
+            "Import GGUF model",
+            DialogButton::Id(IDOK.0),
+            Some(invalid.clone()),
+            |s, c| click(s, MODEL_IMPORT, c),
+        )?;
+        until(&mut shell, &clipboard, Duration::from_secs(30), |s| {
+            s.operations.is_empty()
+        })?;
+        std::fs::remove_file(&invalid)?;
+        ensure!(
+            shell.controller.config() == active_before_invalid
+                && !unsafe { IsWindowEnabled(shell.h(W_NEXT)).as_bool() }
+                && shell.welcome.as_ref().is_some_and(|w| !w.can_continue()),
+            "An invalid imported model changed active config or enabled Continue."
+        );
+        passed(
+            receipt,
+            "invalid-gguf-selection-fails-closed-with-continue-disabled",
+        );
         ensure!(
             shell.preview.is_none()
                 && !shell.preview_suspended
@@ -1215,12 +1326,127 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             receipt,
             "welcome-system-review-and-selected-model-readiness-refuse-unmet-prerequisites",
         );
+        // A genuinely fresh destination is mandatory. BROTYPIST_SMOKE_MODEL is
+        // deliberately not copied into this profile: cached import is a separate
+        // scenario below and cannot prove the asynchronous download transition.
+        until(&mut shell, &clipboard, Duration::from_secs(30), |s| {
+            !s.models.is_empty()
+        })?;
+        let tiny = crate::models::get_preset("tiny")?;
+        let downloaded = crate::models::model_path(tiny)?;
+        ensure!(
+            !downloaded.exists(),
+            "Fresh-download smoke found pre-existing private weights."
+        );
+        let index = shell
+            .models
+            .iter()
+            .position(|m| m["id"] == "tiny")
+            .context("The real catalog omitted the smoke download model.")?;
+        set_selection(shell.h(MODEL_LIST), index);
+        unsafe {
+            SendMessageW(
+                shell.window,
+                WM_COMMAND,
+                Some(WPARAM(MODEL_LIST | ((CBN_SELCHANGE as usize) << 16))),
+                Some(LPARAM(shell.h(MODEL_LIST).0 as isize)),
+            );
+        }
+        pump(&mut shell, &clipboard)?;
+        let before_download = shell.controller.config();
+        shell.draft.set(
+            "custom_instructions",
+            json!("Independent draft during fresh download: 😀"),
+        )?;
+        shell.refresh_controls()?;
+        receipt["model_download_requested"] = json!(true);
+        if tiny.requires_license_acceptance {
+            modal(
+                &mut shell,
+                &clipboard,
+                "Model license",
+                DialogButton::Id(IDYES.0),
+                None,
+                |s, c| click(s, MODEL_DOWNLOAD, c),
+            )?;
+        } else {
+            click(&mut shell, MODEL_DOWNLOAD, &clipboard)?;
+        }
+        ensure!(
+            !unsafe { IsWindowEnabled(shell.h(W_NEXT)).as_bool() }
+                && shell.preview.is_none()
+                && !shell.preview_suspended,
+            "Download start borrowed readiness or preview ownership."
+        );
+        screenshot(&shell, output, "welcome-3-fresh-download-pending", receipt)?;
+        until(&mut shell, &clipboard, Duration::from_secs(180), |s| {
+            ["complete", "error", "cancelled"]
+                .contains(&s.model_transfer["state"].as_str().unwrap_or(""))
+        })?;
+        ensure!(
+            shell.model_transfer["state"] == "complete",
+            "The actual asynchronous pinned-model download did not complete: {}",
+            shell.model_message
+        );
+        until(&mut shell, &clipboard, Duration::from_secs(180), |s| {
+            s.operations.is_empty()
+        })?;
+        ensure!(
+            downloaded.is_file()
+                && shell.controller.config().model_id == "tiny"
+                && crate::config::load_config()?.model_id == "tiny"
+                && shell.welcome.as_ref().is_some_and(|w| w.can_continue())
+                && unsafe { IsWindowEnabled(shell.h(W_NEXT)).as_bool() }
+                && shell.preview.is_none()
+                && !shell.preview_suspended,
+            "A fresh completed download did not validate/save its exact selected model and enable Continue."
+        );
+        ensure!(
+            shell.controller.config().custom_instructions == before_download.custom_instructions
+                && shell.draft.value("custom_instructions")
+                    == Some(&json!("Independent draft during fresh download: 😀")),
+            "Automatic downloaded-model selection consumed an independent settings draft."
+        );
+        screenshot(&shell, output, "welcome-3-fresh-download-ready", receipt)?;
+        passed(
+            receipt,
+            "fresh-asynchronous-pinned-download-validates-saves-exact-selection-and-enables-continue-without-preview-owner",
+        );
+        shell.draft.reset(&shell.controller.config())?;
+        shell.refresh_controls()?;
+        click(&mut shell, W_NEXT, &clipboard)?;
+        until(&mut shell, &clipboard, Duration::from_secs(30), |s| {
+            s.welcome.as_ref().is_some_and(|w| w.step == 4)
+                && s.preview_suspended
+                && s.controller.status()["preview_suspended"] == true
+        })?;
+        ensure!(
+            shell
+                .preview
+                .as_ref()
+                .is_some_and(|p| p.config.model_id == "tiny"),
+            "Continue after a fresh download did not use the newly saved selected model."
+        );
+        screenshot(&shell, output, "welcome-4-after-fresh-download", receipt)?;
+        click(&mut shell, W_BACK, &clipboard)?;
+        until(&mut shell, &clipboard, Duration::from_secs(30), |s| {
+            s.welcome
+                .as_ref()
+                .is_some_and(|w| w.step == 3 && w.can_continue())
+                && s.preview.is_none()
+                && !s.preview_suspended
+                && s.controller.status()["preview"] == false
+        })?;
+        passed(
+            receipt,
+            "fresh-download-native-continue-enters-exact-model-preview-only-after-owner-release-and-back-restores-model-step",
+        );
         let model = match crate::ui::smoke_model_path() {
             Ok(path) if path.is_file() => Some(path),
             _ => None,
         };
         let Some(model) = model else {
-            receipt["not_exercised"].as_array_mut().unwrap().push(json!({"scenario":"welcome-real-inference-visible-prefix-readback","reason":"No existing real GGUF smoke model is available; no model download was requested."}));
+            receipt["not_exercised"].as_array_mut().unwrap().push(json!({"scenario":"welcome-real-inference-visible-prefix-readback","reason":"No independently supplied existing GGUF smoke model is available for the import/inference scenario. The separately recorded fresh-download transition is not substituted for this scenario."}));
             screenshot(&shell, output, "welcome-model-unavailable", receipt)?;
             return Ok(false);
         };
