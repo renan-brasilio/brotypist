@@ -405,10 +405,28 @@ function Observe-ClientAndPolicy {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     try {
         $token = [BroTypistInstallerNative]::TokenFacts($identity.AccessToken.DangerousGetHandle())
+        $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+        $groups = @(
+            foreach ($entry in @(
+                @{ name = 'interactive'; sid = 'S-1-5-4' },
+                @{ name = 'authenticated_users'; sid = 'S-1-5-11' },
+                @{ name = 'service'; sid = 'S-1-5-6' },
+                @{ name = 'batch'; sid = 'S-1-5-3' },
+                @{ name = 'network'; sid = 'S-1-5-2' },
+                @{ name = 'users'; sid = 'S-1-5-32-545' },
+                @{ name = 'everyone'; sid = 'S-1-1-0' }
+            )) {
+                $sid = [Security.Principal.SecurityIdentifier]::new($entry.sid)
+                @{ group = $entry.name; present = $identity.Groups -contains $sid; enabled = $principal.IsInRole($sid) }
+            }
+        )
+        $logonSids = @($identity.Groups | Where-Object { $_.Value -cmatch '^S-1-5-5-\d+-\d+$' })
+        $logonSidCount = $logonSids.Count
+        $enabledLogonSidCount = @($logonSids | Where-Object { $principal.IsInRole([Security.Principal.SecurityIdentifier]$_) }).Count
         $client = @{
             elevated = $token[0] -ne 0; elevation_type = $token[1]; integrity_rid = $token[2]
             token_elevation = $token[0]; token_has_restrictions = $token[3]; token_type = $token[4]
-            administrator_role_enabled = ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            administrator_role_enabled = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
             administrator_group_present = $identity.Groups -contains [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
             is_system = $identity.IsSystem; impersonation_level = $identity.ImpersonationLevel.ToString()
             matches_expected_user = $identity.User.Value -ceq $ExpectedUserSid
@@ -441,7 +459,12 @@ function Observe-ClientAndPolicy {
     $receipt.observations.Add(@{ check = 'host_uac_policy'; status = 'observed'; passed = $null; evidence = $uac })
     $receipt.observations.Add(@{ check = 'installer_client_token_and_policies'; status = 'observed'; passed = $null; evidence = @{ client = $client; policies = $policies; modified_by_this_core = $false; launcher_policy_fixture = 'separate client-observations.json before/during/restored evidence, not a core claim of unchanged host policy' } })
     Assert-StandardUserToken $client
-    $processToken = [BroTypistInstallerNative]::ProcessTokenFacts([Diagnostics.Process]::GetCurrentProcess().Handle, $ExpectedUserSid)
+    $currentProcess = [Diagnostics.Process]::GetCurrentProcess()
+    try {
+        $sessionId = $currentProcess.SessionId
+        $processToken = [BroTypistInstallerNative]::ProcessTokenFacts($currentProcess.Handle, $ExpectedUserSid)
+    } finally { $currentProcess.Dispose() }
+    $receipt.observations.Add(@{ check = 'standard_user_logon_context'; status = 'observed'; passed = $null; evidence = @{ session_id = $sessionId; groups = $groups; logon_sid_count = $logonSidCount; enabled_logon_sid_count = $enabledLogonSidCount; raw_sids_retained = $false } })
     Assert-StandardUserToken $processToken
     Require (@($policies | Where-Object { $_.hive -ceq 'LocalMachine' -and $_.policy -ceq 'DisableMSI' -and $_.present -and $_.dword -and $_.value -eq 0 }).Count -eq 1) 'Standard-user child did not observe the explicit bounded DisableMSI0 host fixture'
     Require (@($policies | Where-Object { $_.policy -ceq 'AlwaysInstallElevated' -and $_.present -and (-not $_.dword -or $_.value -ne 0) }).Count -eq 0) 'Elevating installer policy refused'
@@ -836,6 +859,15 @@ public static class BroTypistInstallerNative {
         uint[] access={0x100000,0x1,0x20000,0x1f0001};
         string[] kinds={"synchronize","modify_state","read_control","all_access"};
         foreach(string scope in new[] { "Global","Local" }) {
+            // Never-created random controls distinguish object-specific denial
+            // from failure to traverse the Global/Local namespace itself.
+            IntPtr control=OpenMutexW(0x100000,false,scope+@"\btci-"+Guid.NewGuid().ToString("N"));
+            int controlError=control==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+            bool? controlClosed=control==IntPtr.Zero ? (bool?)null : CloseHandle(control);
+            facts.Add(new System.Collections.Generic.Dictionary<string,object> {
+                {"candidate_name","uncreated_random_control"}, {"scope",scope}, {"access","synchronize"},
+                {"opened",control!=IntPtr.Zero}, {"error",controlError}, {"handle_closed",controlClosed}
+            });
             string name=scope+@"\_MSIExecute";
             for(int index=0;index<access.Length;index++) {
                 IntPtr mutex=OpenMutexW(access[index],false,name);
