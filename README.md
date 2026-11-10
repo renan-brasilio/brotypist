@@ -20,8 +20,9 @@ use. Accept what fits, dismiss what doesn't, and keep writing—without moving
 your draft into a chatbot. It lives in the menu bar or system tray, with
 OS-native Settings and local model inference.
 
-**Native Rust, with macOS first.** **[0.6.1 macOS release](https://github.com/renan-brasilio/brotypist/releases/tag/v0.6.1);
-Windows and Linux remain ALPHA.** Apple Silicon DMG/ZIP assets only.
+**Native Rust, with macOS first.** **[0.6.1 downloads](https://github.com/renan-brasilio/brotypist/releases/tag/v0.6.1):
+macOS stable; Windows and Linux ALPHA.** Apple Silicon DMG/ZIP, Linux x86-64
+DEB/portable archive and unsigned Windows x86-64 MSI/ZIP are listed separately.
 This release retains 0.6.0's native writing reliability and scoped preferences,
 with native verification fixes and Windows Welcome worker-ownership corrections.
 macOS inference policy is unchanged from 0.6.0; no speed improvement is claimed.
@@ -55,9 +56,9 @@ source-bound observations from final release proof and remaining platform gates.
 | Platform | Current native status | Installation |
 | --- | --- | --- |
 | **macOS 15+, Apple Silicon** | **0.6.1 stable channel.** Native writing reliability and scoped preferences; compatibility varies by text field. | Mac-only DMG/ZIP in Releases; Apple Development signed, **not notarized**. |
-| **Linux x86-64, X11** | **ALPHA.** Packaging, inference and native UI have evidence; desktop typing compatibility is limited. Emoji/synonym/typo rewrites are unavailable. | Alpha DEB or portable test bundle when supplied; not part of the macOS stable release. |
-| **Linux x86-64, Wayland** | **ALPHA. Ordinary inline completion is unavailable.** Manual preview only; experimental KDE input-method controls require explicit selection and are not general inline support. | Alpha test bundles; installation does not enable an input method. |
-| **Windows x86-64** | **ALPHA.** Unsigned portable testing; inference and owned-window GUI checks do not establish full physical typing, upgrade or rollback acceptance. **MSI distribution is held.** | Authorized portable test bundle only; not part of the macOS stable release. |
+| **Linux x86-64, X11** | **ALPHA.** Desktop typing compatibility is limited; emoji/synonym/typo rewrites are unavailable. | Manual DEB or portable archive in the same v0.6.1 release. |
+| **Linux x86-64, Wayland** | **ALPHA. Ordinary inline completion is unavailable.** Manual preview only. | Same Linux downloads; installation does not enable an input method. |
+| **Windows x86-64** | **ALPHA, unsigned.** Hosted installer/runtime checks do not establish full physical typing, upgrade or rollback acceptance. | Manual per-user MSI or portable ZIP in the same v0.6.1 release; Windows OTA remains held. |
 
 **Not every text field is supported.** BroTypist needs reliable focus, text,
 caret geometry and insertion information. Password fields, active text
@@ -152,6 +153,10 @@ durable app data. Original weights and custom model paths are preserved.
 
 ### Linux ALPHA
 
+Download the **linux-amd64.deb** or **linux-amd64.tar.gz** asset from
+[v0.6.1](https://github.com/renan-brasilio/brotypist/releases/tag/v0.6.1)
+and verify it against that release's `SHA256SUMS`.
+
 For a supplied DEB on Ubuntu 24.04+/Debian 13+:
 
 ```sh
@@ -165,12 +170,17 @@ its directory. Keep the entire bundle together and run as your desktop user,
 use the manual preview; do not change session environment variables to pretend
 the session is X11.
 
-### Windows ALPHA — portable testing
+### Windows ALPHA — unsigned MSI or portable ZIP
 
-Extract the supplied ZIP into a user-writable folder, keep all bundled DLLs
-together, and launch `BroTypist.exe`. The preview is **unsigned**; do not disable
-Windows security controls to run it. MSI installation remains held pending the
-installer acceptance gates.
+Download the **windows-x86_64.msi** or **windows-x86_64.zip** asset from
+[v0.6.1](https://github.com/renan-brasilio/brotypist/releases/tag/v0.6.1).
+Verify its SHA-256 with PowerShell `Get-FileHash .\BroTypist-0.6.1-windows-x86_64.msi -Algorithm SHA256`
+(substitute the ZIP filename if applicable) against the release's `SHA256SUMS`.
+
+The MSI installs for the current user. For portable use, extract the ZIP into
+a user-writable folder, keep all bundled DLLs together, and launch `BroTypist.exe`.
+Both are **unsigned alpha builds**: do not disable Windows security controls to
+run them. Windows automatic updates remain held; install alpha updates manually.
 
 ## Use BroTypist
 
