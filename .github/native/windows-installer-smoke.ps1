@@ -863,6 +863,13 @@ public static class BroTypistInstallerNative {
     [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetThreadDesktop(uint thread);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
     static extern bool GetUserObjectInformationW(IntPtr handle,int index,StringBuilder value,uint bytes,out uint needed);
+    [StructLayout(LayoutKind.Sequential)] struct UserFlags { public int inherit,reserved; public uint flags; }
+    [DllImport("user32.dll", EntryPoint="GetUserObjectInformationW", ExactSpelling=true, SetLastError=true)]
+    static extern bool ObjectFlags(IntPtr handle,int index,out UserFlags value,uint bytes,out uint needed);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern IntPtr OpenWindowStationW(string name,bool inherit,uint access);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool CloseWindowStation(IntPtr station);
+    [DllImport("user32.dll")] static extern IntPtr GetDesktopWindow();
     public static bool GuiLaunchOwnershipUnresolved;
     static string ObjectName(IntPtr handle) {
         uint needed;
@@ -965,6 +972,17 @@ public static class BroTypistInstallerNative {
             IntPtr observerDesktop=GetThreadDesktop(GetCurrentThreadId());
             facts["observer_station_kind"]=station.StartsWith("btci-",StringComparison.Ordinal) ? "owned_private" : station.Equals("WinSta0",StringComparison.OrdinalIgnoreCase) ? "interactive" : "other";
             facts["observer_desktop_kind"]=DesktopKind(ObjectName(observerDesktop));
+            UserFlags stationFlags; uint needed;
+            if(ObjectFlags(GetProcessWindowStation(),1,out stationFlags,(uint)Marshal.SizeOf<UserFlags>(),out needed))
+                facts["station_visible_surfaces"]=(stationFlags.flags&1)!=0;
+            else facts["station_flags_error"]=Marshal.GetLastWin32Error();
+            // Read the existing access boundary only: never change a shared
+            // station/desktop ACL, attach to it, or switch the input desktop.
+            IntPtr interactive=OpenWindowStationW("WinSta0",false,0x23);
+            facts["interactive_station_access_mask"]="00000023";
+            facts["interactive_station_access_available"]=interactive!=IntPtr.Zero;
+            facts["interactive_station_access_error"]=interactive==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+            if(interactive!=IntPtr.Zero) facts["interactive_station_probe_closed"]=CloseWindowStation(interactive);
             if(alive) {
                 var desktops=new System.Collections.Generic.List<object>();
                 facts["thread_desktops"]=desktops;
@@ -1010,6 +1028,20 @@ public static class BroTypistInstallerNative {
                 IntPtr sent=SendMessageTimeoutW(hwnd,0,UIntPtr.Zero,IntPtr.Zero,0x0003,2000,out result);
                 windowFacts["null_message_responded"]=sent!=IntPtr.Zero;
                 windowFacts["null_message_error"]=sent==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+                var ancestors=new System.Collections.Generic.List<object>();
+                IntPtr ancestor=GetAncestor(hwnd,1),desktopWindow=GetDesktopWindow();
+                while(ancestor!=IntPtr.Zero && ancestors.Count<16) {
+                    IntPtr ancestorStyle=GetWindowLongPtrW(ancestor,-16);
+                    int ancestorError=ancestorStyle==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+                    ancestors.Add(new System.Collections.Generic.Dictionary<string,object> {
+                        {"class",Class(ancestor)}, {"visible",IsWindowVisible(ancestor)},
+                        {"style",unchecked((uint)ancestorStyle.ToInt64()).ToString("X8")},
+                        {"style_error",ancestorError}, {"observer_desktop_window",ancestor==desktopWindow}
+                    });
+                    ancestor=GetAncestor(ancestor,1);
+                }
+                windowFacts["ancestors"]=ancestors;
+                windowFacts["ancestors_truncated"]=ancestor!=IntPtr.Zero;
             }
             windows.Add(windowFacts);
             return true;
