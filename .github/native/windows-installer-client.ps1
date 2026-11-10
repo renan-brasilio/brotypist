@@ -22,7 +22,7 @@ $metadata = [ordered]@{
     private_tree_cleanup_verified = $false; alternate_credentials = $true
     interactive_station_acl_modified = $false; station_access_restoration_verified = $false
     input_desktop_restoration_verified = $false; private_desktop_cleanup_verified = $false
-    station_user_access_mask = '0x00020337'; desktop_user_access_mask = '0x000201cf'
+    station_user_access_mask = '0x00020337'; desktop_user_access_mask = '0x000f01ff'
     station_acl_mutation_attempted = $false; private_desktop_creation_attempted = $false
     private_desktop_created = $false; input_desktop_activation_attempted = $false; input_desktop_activated = $false
     owned_interactive_desktop_verified = $false
@@ -365,6 +365,13 @@ public static class BroTypistStandardUserInstallerClient {
                         string caption=title.ToString();
                         row["dialog_kind"]=caption.EndsWith("Application Error",StringComparison.OrdinalIgnoreCase) ? "application_error" :
                             caption=="Windows Installer" ? "windows_installer" : caption=="Unsaved settings" ? "unsaved_settings" : "other";
+                        row["error_program"]="unclassified";
+                        foreach(string program in new[] { "pwsh.exe","powershell.exe","conhost.exe","OpenConsole.exe","BroTypist.exe","BroTypist-cli.exe","msiexec.exe","worker.exe" }) {
+                            if(caption.Equals(program+" - Application Error",StringComparison.OrdinalIgnoreCase)) {
+                                row["error_program"]=program;
+                                break;
+                            }
+                        }
                         var codes=new System.Collections.Generic.HashSet<string>();
                         var text=new StringBuilder(1024); int controls=0,failedReads=0;
                         WindowVisitor child=(control,unused) => {
@@ -441,7 +448,9 @@ public static class BroTypistStandardUserInstallerClient {
             stationAccess=new BroTypistWindowStationAccess(station,expectedSid);
             stationAccess.Apply();
             Stage="private_desktop";
-            string sddl="D:P(A;;0x000f01ff;;;SY)(A;;0x000f01ff;;;"+supervisorSid+")(A;;0x000201cf;;;"+expectedSid+")";
+            // Preserve full access on this newly owned private desktop, as in
+            // the original working logon fixture. WinSta0 stays narrowly granted.
+            string sddl="D:P(A;;0x000f01ff;;;SY)(A;;0x000f01ff;;;"+supervisorSid+")(A;;0x000f01ff;;;"+expectedSid+")";
             Exception creationFailure=null;
             // CreateDesktop binds its caller. A normal, bounded dedicated thread
             // releases that binding without moving any PowerShell thread.
