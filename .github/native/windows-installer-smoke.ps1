@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory)][string]$Work,
     [switch]$RequireStandardUser,
     [Parameter(Mandatory)][string]$ExpectedUserSid,
-    [Parameter(Mandatory)][string]$SupervisorSid
+    [Parameter(Mandatory)][string]$SupervisorSid,
+    [Parameter(Mandatory)][string]$ExpectedDesktopName
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -45,7 +46,7 @@ function Redact([string]$Text) {
     foreach ($path in @($Work, $env:RUNNER_TEMP, $env:USERPROFILE)) {
         if (-not [string]::IsNullOrWhiteSpace($path)) { $Text = [regex]::Replace($Text, [regex]::Escape($path), '<private-path>', [Text.RegularExpressions.RegexOptions]::IgnoreCase) }
     }
-    foreach ($identityValue in @($ExpectedUserSid, $SupervisorSid, $env:USERNAME, $env:USERDOMAIN)) {
+    foreach ($identityValue in @($ExpectedUserSid, $SupervisorSid, $ExpectedDesktopName, $env:USERNAME, $env:USERDOMAIN)) {
         if (-not [string]::IsNullOrWhiteSpace($identityValue)) { $Text = [regex]::Replace($Text, [regex]::Escape($identityValue), '<private-identity>', [Text.RegularExpressions.RegexOptions]::IgnoreCase) }
     }
     $Text = [regex]::Replace($Text, '(?i)\bS-1-\d+(?:-\d+)+\b', '<private-sid>')
@@ -866,9 +867,8 @@ public static class BroTypistInstallerNative {
     [StructLayout(LayoutKind.Sequential)] struct UserFlags { public int inherit,reserved; public uint flags; }
     [DllImport("user32.dll", EntryPoint="GetUserObjectInformationW", ExactSpelling=true, SetLastError=true)]
     static extern bool ObjectFlags(IntPtr handle,int index,out UserFlags value,uint bytes,out uint needed);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
-    static extern IntPtr OpenWindowStationW(string name,bool inherit,uint access);
-    [DllImport("user32.dll", SetLastError=true)] static extern bool CloseWindowStation(IntPtr station);
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr OpenInputDesktop(uint flags,bool inherit,uint access);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool CloseDesktop(IntPtr desktop);
     [DllImport("user32.dll")] static extern IntPtr GetDesktopWindow();
     public static bool GuiLaunchOwnershipUnresolved;
     static string ObjectName(IntPtr handle) {
@@ -880,17 +880,41 @@ public static class BroTypistInstallerNative {
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
         return value.ToString();
     }
+    static string expectedDesktop;
     static string PrivateDesktop() {
         string station=ObjectName(GetProcessWindowStation());
         string desktop=ObjectName(GetThreadDesktop(GetCurrentThreadId()));
-        if(station.Length!=37 || !station.StartsWith("btci-",StringComparison.Ordinal) || !desktop.Equals("Probe",StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("Owned private desktop connection required");
-        for(int index=5;index<station.Length;index++) {
-            char value=station[index];
-            if(!((value>='0'&&value<='9')||(value>='a'&&value<='f')))
-                throw new InvalidOperationException("Private station identity differs");
+        if(!station.Equals("WinSta0",StringComparison.OrdinalIgnoreCase) || expectedDesktop==null || !desktop.Equals(expectedDesktop,StringComparison.Ordinal))
+            throw new InvalidOperationException("Authenticated owned interactive desktop connection required");
+        UserFlags flags; uint needed;
+        if(!ObjectFlags(GetProcessWindowStation(),1,out flags,(uint)Marshal.SizeOf<UserFlags>(),out needed))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        if((flags.flags&1)==0) throw new InvalidOperationException("Interactive station is not visible");
+        IntPtr input=OpenInputDesktop(0,false,1);
+        if(input==IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            if(!ObjectName(input).Equals(expectedDesktop,StringComparison.Ordinal))
+                throw new InvalidOperationException("Owned desktop is not the input desktop");
+        } finally {
+            if(!CloseDesktop(input)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
         }
-        return station+@"\"+desktop;
+        return @"WinSta0\"+expectedDesktop;
+    }
+    public static System.Collections.Generic.Dictionary<string,object> VerifyInteractiveDesktop(string expected) {
+        if(expectedDesktop!=null || expected==null || expected.Length!=37 || !expected.StartsWith("btci-",StringComparison.Ordinal))
+            throw new InvalidOperationException("Invalid authenticated desktop identity");
+        for(int index=5;index<expected.Length;index++) {
+            char value=expected[index];
+            if(!((value>='0'&&value<='9')||(value>='a'&&value<='f')))
+                throw new InvalidOperationException("Invalid authenticated desktop identity");
+        }
+        expectedDesktop=expected;
+        try { PrivateDesktop(); }
+        catch { expectedDesktop=null; throw; }
+        return new System.Collections.Generic.Dictionary<string,object> {
+            {"interactive_station",true}, {"expected_desktop_matches",true},
+            {"station_visible",true}, {"input_desktop_matches",true}
+        };
     }
     public static System.Diagnostics.Process StartSettings(string executable,string directory,System.Collections.Generic.List<System.Diagnostics.Process> owned) {
         if(GuiLaunchOwnershipUnresolved || !System.IO.Path.IsPathFullyQualified(executable) || !System.IO.Path.IsPathFullyQualified(directory))
@@ -948,7 +972,7 @@ public static class BroTypistInstallerNative {
     [DllImport("user32.dll", ExactSpelling=true, SetLastError=true)] static extern IntPtr GetWindowLongPtrW(IntPtr hwnd,int index);
     static string Class(IntPtr hwnd) { var text=new StringBuilder(256); GetClassNameW(hwnd,text,text.Capacity); return text.ToString(); }
     static string DesktopKind(string name) {
-        if(name.Equals("Probe",StringComparison.OrdinalIgnoreCase)) return "owned_probe";
+        if(expectedDesktop!=null && name.Equals(expectedDesktop,StringComparison.Ordinal)) return "owned_interactive";
         if(name.Equals("Default",StringComparison.OrdinalIgnoreCase)) return "default";
         return "other";
     }
@@ -970,19 +994,12 @@ public static class BroTypistInstallerNative {
         try {
             string station=ObjectName(GetProcessWindowStation());
             IntPtr observerDesktop=GetThreadDesktop(GetCurrentThreadId());
-            facts["observer_station_kind"]=station.StartsWith("btci-",StringComparison.Ordinal) ? "owned_private" : station.Equals("WinSta0",StringComparison.OrdinalIgnoreCase) ? "interactive" : "other";
+            facts["observer_station_kind"]=station.Equals("WinSta0",StringComparison.OrdinalIgnoreCase) ? "interactive" : "other";
             facts["observer_desktop_kind"]=DesktopKind(ObjectName(observerDesktop));
             UserFlags stationFlags; uint needed;
             if(ObjectFlags(GetProcessWindowStation(),1,out stationFlags,(uint)Marshal.SizeOf<UserFlags>(),out needed))
                 facts["station_visible_surfaces"]=(stationFlags.flags&1)!=0;
             else facts["station_flags_error"]=Marshal.GetLastWin32Error();
-            // Read the existing access boundary only: never change a shared
-            // station/desktop ACL, attach to it, or switch the input desktop.
-            IntPtr interactive=OpenWindowStationW("WinSta0",false,0x23);
-            facts["interactive_station_access_mask"]="00000023";
-            facts["interactive_station_access_available"]=interactive!=IntPtr.Zero;
-            facts["interactive_station_access_error"]=interactive==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
-            if(interactive!=IntPtr.Zero) facts["interactive_station_probe_closed"]=CloseWindowStation(interactive);
             if(alive) {
                 var desktops=new System.Collections.Generic.List<object>();
                 facts["thread_desktops"]=desktops;
@@ -1050,7 +1067,7 @@ public static class BroTypistInstallerNative {
         facts["window_enumeration_complete"]=complete;
         facts["window_enumeration_error"]=!complete && !truncated ? Marshal.GetLastWin32Error() : 0;
         facts["windows_truncated"]=truncated;
-        // No HWNDs, thread IDs, titles, or private station nonces are retained.
+        // No HWNDs, thread IDs, titles, or private desktop nonces are retained.
         return facts;
     }
     public static IntPtr FindSettings(uint pid) {
@@ -1069,6 +1086,7 @@ public static class BroTypistInstallerNative {
 }
 '@
     Observe-ClientAndPolicy
+    Observe 'owned_interactive_desktop_verified_before_installer' ([BroTypistInstallerNative]::VerifyInteractiveDesktop($ExpectedDesktopName))
     $installDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\BroTypist'
     $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'BroTypist.lnk'
     Require (-not (Test-Path -LiteralPath $installDirectory) -and -not (Test-Path -LiteralPath $shortcut) -and -not (Test-Path -LiteralPath 'HKCU:\Software\Inklow\Installer')) 'Existing BroTypist installation/registration refused'

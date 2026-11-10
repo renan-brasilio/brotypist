@@ -19,7 +19,13 @@ $metadata = [ordered]@{
     before = $null; during = $null; restored = $null; policy_key_created = $false
     transactional_policy_contract = 'KTM RegOpen/Create/DeleteKeyTransacted; conflict/unsupported fails closed; no ordinary write/delete fallback'
     quiescence_verified = $false; account_cleanup_verified = $false; profile_cleanup_verified = $false
-    private_tree_cleanup_verified = $false; global_acl_changes = $false; alternate_credentials = $true
+    private_tree_cleanup_verified = $false; alternate_credentials = $true
+    interactive_station_acl_modified = $false; station_access_restoration_verified = $false
+    input_desktop_restoration_verified = $false; private_desktop_cleanup_verified = $false
+    station_user_access_mask = '0x00020337'; desktop_user_access_mask = '0x000201cf'
+    station_acl_mutation_attempted = $false; private_desktop_creation_attempted = $false
+    private_desktop_created = $false; input_desktop_activation_attempted = $false; input_desktop_activated = $false
+    owned_interactive_desktop_verified = $false
     stage = 'preflight'; diagnostics = [Collections.Generic.List[string]]::new()
     failure = $null; cleanup_failure = $null
 }
@@ -29,6 +35,7 @@ $accountCreationAttempted = $false
 $ownedRootCreated = $false
 $reportDirectoryValidated = $false
 $ownedProfilePath = $null
+$expectedDesktopName = $null
 $base = $null; $key = $null; $createdKey = $false; $createdValue = $false
 $nativeInitialized = $false
 $nativeLifecycleSucceeded = $false
@@ -62,13 +69,114 @@ using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Security.AccessControl;
+using System.Security.Principal;
+// Borrowed station handle: only the DACL is read/written, never owner or SACL.
+// Win32 offers no ACL compare-and-swap. A changed snapshot is refused, and
+// every write is read back; this lease is only for a disposable isolated runner.
+public sealed class BroTypistWindowStationAccess {
+    public const int UserAccessMask=0x20337;
+    readonly IntPtr station;
+    readonly RawSecurityDescriptor original,granted;
+    bool applicationAttempted,restorationAttempted;
+    public bool Modified { get; private set; }
+    public bool Restored { get; private set; }
+    public bool MutationAttempted { get; private set; }
+    [DllImport("user32.dll", SetLastError=true)]
+    static extern bool GetUserObjectSecurity(IntPtr handle,ref uint information,[Out] byte[] descriptor,uint size,out uint needed);
+    [DllImport("user32.dll", SetLastError=true)]
+    static extern bool SetUserObjectSecurity(IntPtr handle,ref uint information,byte[] descriptor);
+    internal static RawSecurityDescriptor ReadDacl(IntPtr handle) {
+        uint information=4,needed;
+        bool unexpected=GetUserObjectSecurity(handle,ref information,null,0,out needed);
+        int error=Marshal.GetLastWin32Error();
+        if(unexpected || error!=122 || needed<20 || needed>131072)
+            throw new InvalidOperationException("Native DACL size query refused");
+        byte[] bytes=new byte[needed];
+        if(!GetUserObjectSecurity(handle,ref information,bytes,(uint)bytes.Length,out needed))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        if(needed>bytes.Length) throw new InvalidOperationException("Native DACL size changed");
+        var descriptor=new RawSecurityDescriptor(bytes,0);
+        if((descriptor.ControlFlags&ControlFlags.DiscretionaryAclPresent)==0 || descriptor.DiscretionaryAcl==null)
+            throw new InvalidOperationException("Absent or null DACL refused");
+        return descriptor;
+    }
+    internal static bool SameDacl(RawSecurityDescriptor left,RawSecurityDescriptor right) {
+        return left.ControlFlags==right.ControlFlags && SameAcl(left.DiscretionaryAcl,right.DiscretionaryAcl);
+    }
+    internal static bool SameAcl(RawAcl left,RawAcl right) {
+        if(left.BinaryLength!=right.BinaryLength) return false;
+        byte[] first=new byte[left.BinaryLength],second=new byte[right.BinaryLength];
+        left.GetBinaryForm(first,0); right.GetBinaryForm(second,0);
+        for(int index=0;index<first.Length;index++) if(first[index]!=second[index]) return false;
+        return true;
+    }
+    void WriteDacl(RawSecurityDescriptor descriptor) {
+        uint information=4;
+        byte[] bytes=new byte[descriptor.BinaryLength];
+        descriptor.GetBinaryForm(bytes,0);
+        if(!SetUserObjectSecurity(station,ref information,bytes))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+    public BroTypistWindowStationAccess(IntPtr station,string sid) {
+        if(station==IntPtr.Zero || station==new IntPtr(-1)) throw new ArgumentException("Station handle required");
+        var target=new SecurityIdentifier(sid);
+        this.station=station;
+        original=ReadDacl(station);
+        RawAcl acl=original.DiscretionaryAcl;
+        if(acl.Revision!=GenericAcl.AclRevision && acl.Revision!=GenericAcl.AclRevisionDS)
+            throw new InvalidOperationException("Unsupported DACL revision");
+        int insertion=acl.Count;
+        for(int index=0;index<acl.Count;index++) {
+            var ace=acl[index] as CommonAce;
+            if(ace==null || ace.IsCallback || (ace.AceType!=AceType.AccessAllowed && ace.AceType!=AceType.AccessDenied))
+                throw new InvalidOperationException("Unsupported station ACE");
+            if(ace.SecurityIdentifier==target) throw new InvalidOperationException("Preexisting target SID refused");
+            if(insertion==acl.Count && (ace.AceFlags&AceFlags.Inherited)!=0) insertion=index;
+        }
+        var amended=new RawAcl(acl.Revision,acl.Count+1);
+        for(int index=0;index<=acl.Count;index++) {
+            if(index==insertion) amended.InsertAce(amended.Count,new CommonAce(AceFlags.None,AceQualifier.AccessAllowed,UserAccessMask,target,false,null));
+            if(index<acl.Count) amended.InsertAce(amended.Count,acl[index]);
+        }
+        granted=new RawSecurityDescriptor(original.ControlFlags,original.Owner,original.Group,original.SystemAcl,amended);
+    }
+    public void Apply() {
+        if(applicationAttempted || restorationAttempted) throw new InvalidOperationException("Station grant cannot be retried");
+        applicationAttempted=true;
+        if(!SameDacl(ReadDacl(station),original)) throw new InvalidOperationException("Station DACL changed before grant");
+        MutationAttempted=true;
+        WriteDacl(granted);
+        Modified=true;
+        if(!SameDacl(ReadDacl(station),granted)) throw new InvalidOperationException("Station grant read-back differs");
+    }
+    public void Restore() {
+        if(Restored) return;
+        if(restorationAttempted) throw new InvalidOperationException("Station restoration cannot be retried");
+        restorationAttempted=true;
+        var current=ReadDacl(station);
+        if(!SameDacl(current,original)) {
+            if(!MutationAttempted || !SameDacl(current,granted)) throw new InvalidOperationException("Unexpected station DACL preserved");
+            WriteDacl(original);
+        }
+        if(!SameDacl(ReadDacl(station),original)) throw new InvalidOperationException("Original station DACL restoration unverified");
+        Restored=true;
+    }
+}
 public static class BroTypistStandardUserInstallerClient {
     public static bool LogonAttempted, ClientLaunched, ClientResumed, ClientExited, DeadlineExceeded, JobQuiescent, OwnershipUnresolved;
     public static string FailureStage, CleanupFailureStage;
     public static int FailureNativeError, CleanupNativeError;
     public static string Stage="native_setup";
     public static int LastNativeError;
-    static IntPtr station,desktop,job;
+    public static bool DesktopCreationAttempted, DesktopCreated, CreatorOutstanding, InputActivationAttempted, InputActivated;
+    public static bool StationAccessRestorationVerified, InputDesktopRestorationVerified, PrivateDesktopCleanupVerified;
+    public static bool InteractiveStationAclModified { get { return stationAccess!=null && stationAccess.Modified; } }
+    public static bool StationAclMutationAttempted { get { return stationAccess!=null && stationAccess.MutationAttempted; } }
+    static IntPtr station,desktop,originalInput,job;
+    static ProcessInfo process;
+    static string desktopName,originalInputName;
+    static BroTypistWindowStationAccess stationAccess;
     [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
     struct Startup {
         public int size;
@@ -93,11 +201,18 @@ public static class BroTypistStandardUserInstallerClient {
     [DllImport("advapi32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
     static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string sddl,uint revision,out IntPtr descriptor,IntPtr size);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
-    static extern IntPtr CreateWindowStationW(string name,uint flags,uint access,ref SecurityAttributes attributes);
+    static extern IntPtr OpenWindowStationW(string name,bool inherit,uint access);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
     static extern IntPtr CreateDesktopW(string name,IntPtr device,IntPtr mode,uint flags,uint access,ref SecurityAttributes attributes);
     [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetProcessWindowStation();
-    [DllImport("user32.dll", SetLastError=true)] static extern bool SetProcessWindowStation(IntPtr station);
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr OpenInputDesktop(uint flags,bool inherit,uint access);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool SwitchDesktop(IntPtr desktop);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern bool GetUserObjectInformationW(IntPtr handle,int kind,IntPtr information,uint size,out uint needed);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi, CharSet=CharSet.Unicode)]
+    delegate bool DesktopVisitor([MarshalAs(UnmanagedType.LPWStr)] string name,IntPtr state);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern bool EnumDesktopsW(IntPtr station,DesktopVisitor visitor,IntPtr state);
     [DllImport("user32.dll", SetLastError=true)] static extern bool CloseWindowStation(IntPtr station);
     [DllImport("user32.dll", SetLastError=true)] static extern bool CloseDesktop(IntPtr desktop);
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)] static extern IntPtr CreateJobObjectW(IntPtr attributes,string name);
@@ -113,6 +228,61 @@ public static class BroTypistStandardUserInstallerClient {
     static extern bool DeleteProfileW(string sid,string path,string computer);
     static void Check(bool value) {
         if(!value) { LastNativeError=Marshal.GetLastWin32Error(); throw new Win32Exception(LastNativeError); }
+    }
+    static string ObjectName(IntPtr handle) {
+        IntPtr buffer=Marshal.AllocHGlobal(1024);
+        try {
+            uint needed;
+            Check(GetUserObjectInformationW(handle,2,buffer,1024,out needed));
+            if(needed<2 || needed>1024) throw new InvalidOperationException("Native object name size refused");
+            return Marshal.PtrToStringUni(buffer);
+        } finally { Marshal.FreeHGlobal(buffer); }
+    }
+    static void RequireInteractiveStation() {
+        IntPtr current=GetProcessWindowStation(); Check(current!=IntPtr.Zero);
+        if(!String.Equals(ObjectName(current),"WinSta0",StringComparison.OrdinalIgnoreCase) ||
+           !String.Equals(ObjectName(station),"WinSta0",StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Existing interactive process station required");
+        IntPtr buffer=Marshal.AllocHGlobal(12);
+        try {
+            uint needed;
+            Check(GetUserObjectInformationW(station,1,buffer,12,out needed));
+            if(needed!=12 || (Marshal.ReadInt32(buffer,8)&1)==0)
+                throw new InvalidOperationException("Visible interactive station required");
+        } finally { Marshal.FreeHGlobal(buffer); }
+    }
+    static bool DesktopExists() {
+        bool found=false;
+        DesktopVisitor visitor=(name,state) => {
+            if(String.Equals(name,desktopName,StringComparison.OrdinalIgnoreCase)) found=true;
+            return true;
+        };
+        Check(EnumDesktopsW(station,visitor,IntPtr.Zero));
+        GC.KeepAlive(visitor);
+        return found;
+    }
+    static string InputName() {
+        IntPtr current=OpenInputDesktop(0,false,0x1); Check(current!=IntPtr.Zero);
+        try { return ObjectName(current); }
+        finally { Check(CloseDesktop(current)); }
+    }
+    static void RestoreInputDesktop() {
+        Stage="input_desktop_restoration";
+        if(originalInput==IntPtr.Zero) {
+            if(InputActivationAttempted) FailOwnership();
+            InputDesktopRestorationVerified=true;
+            return;
+        }
+        if(String.IsNullOrEmpty(originalInputName)) FailOwnership();
+        string current=InputName();
+        if(!String.Equals(current,originalInputName,StringComparison.Ordinal)) {
+            if(!DesktopCreated || !String.Equals(current,desktopName,StringComparison.Ordinal))
+                throw new InvalidOperationException("Unrelated input desktop preserved");
+            Check(SwitchDesktop(originalInput));
+        }
+        if(!String.Equals(InputName(),originalInputName,StringComparison.Ordinal))
+            throw new InvalidOperationException("Original input desktop restoration unverified");
+        InputDesktopRestorationVerified=true;
     }
     static void FailOwnership() {
         OwnershipUnresolved=true;
@@ -142,61 +312,89 @@ public static class BroTypistStandardUserInstallerClient {
             System.Threading.Thread.Sleep(100);
         }
     }
-    public static int Run(string executable,string command,string directory,string user,System.Security.SecureString password,string expectedSid,string supervisorSid) {
-        IntPtr descriptor=IntPtr.Zero,secret=IntPtr.Zero;
+    public static int Run(string executable,string command,string directory,string user,System.Security.SecureString password,string expectedSid,string supervisorSid,string expectedDesktopName) {
+        IntPtr secret=IntPtr.Zero;
         Exception primaryFailure=null;
-        ProcessInfo process=new ProcessInfo();
         if(command.Length>=1024) throw new InvalidOperationException("Logon command exceeds native limit");
-        string stationName="btci-"+Guid.NewGuid().ToString("N");
+        if(!System.Text.RegularExpressions.Regex.IsMatch(expectedDesktopName ?? "",@"\Abtci-[0-9a-f]{32}\z"))
+            throw new InvalidOperationException("Fresh exact desktop name required");
+        desktopName=expectedDesktopName;
         try {
+            Stage="interactive_station";
+            // Open the existing station; never change process station or Default's ACL.
+            // Supervisor rights: READ_CONTROL, WRITE_DAC, ENUMDESKTOPS,
+            // READATTRIBUTES and CREATEDESKTOP. No privilege adjustment.
+            station=OpenWindowStationW("WinSta0",false,0x6000b); Check(station!=IntPtr.Zero);
+            RequireInteractiveStation();
+            if(DesktopExists()) throw new InvalidOperationException("Preexisting desktop name refused");
+            Stage="input_desktop_capture";
+            originalInput=OpenInputDesktop(0,false,0x101); Check(originalInput!=IntPtr.Zero);
+            originalInputName=ObjectName(originalInput);
+            if(String.Equals(originalInputName,desktopName,StringComparison.OrdinalIgnoreCase)) FailOwnership();
+            Stage="station_access_grant";
+            stationAccess=new BroTypistWindowStationAccess(station,expectedSid);
+            stationAccess.Apply();
             Stage="private_desktop";
-            // New private objects only; no shared ACL or visible input-desktop switch.
-            string sddl="D:P(A;;GA;;;SY)(A;;GA;;;"+supervisorSid+")(A;;GA;;;"+expectedSid+")";
-            Check(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl,1,out descriptor,IntPtr.Zero));
-            var attributes=new SecurityAttributes { size=Marshal.SizeOf<SecurityAttributes>(),descriptor=descriptor };
-            IntPtr original=GetProcessWindowStation(); Check(original!=IntPtr.Zero);
-            // GENERIC_ALL maps to the noninteractive station's supported rights.
-            station=CreateWindowStationW(stationName,1,0x10000000,ref attributes); Check(station!=IntPtr.Zero);
-            Exception desktopFailure=null;
-            bool creatorOutstanding=false;
-            try {
-                Check(SetProcessWindowStation(station));
-                Exception creationFailure=null;
-                // CreateDesktop binds its caller. A short-lived thread releases
-                // that binding without moving the PowerShell supervisor thread.
-                var creator=new System.Threading.Thread(() => {
-                    IntPtr desktopDescriptor=IntPtr.Zero;
-                    try {
-                        Check(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl,1,out desktopDescriptor,IntPtr.Zero));
-                        var desktopAttributes=new SecurityAttributes { size=Marshal.SizeOf<SecurityAttributes>(),descriptor=desktopDescriptor };
-                        desktop=CreateDesktopW("Probe",IntPtr.Zero,IntPtr.Zero,0,0x10000000,ref desktopAttributes);
-                        Check(desktop!=IntPtr.Zero);
-                    } catch(Exception failure) { creationFailure=failure; }
-                    finally { if(desktopDescriptor!=IntPtr.Zero) LocalFree(desktopDescriptor); }
-                });
-                creator.IsBackground=true;
-                creator.Start();
-                creatorOutstanding=true;
-                if(!creator.Join(30000)) { DeadlineExceeded=true; FailOwnership(); }
-                creatorOutstanding=false;
-                if(creationFailure!=null)
-                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(creationFailure).Throw();
-            } catch(Exception failure) { desktopFailure=failure; throw; }
-            finally {
-                if(creatorOutstanding) {
-                    // Do not race a live creator into the original station.
-                    OwnershipUnresolved=true;
-                    CleanupFailureStage="desktop_creator_unresolved";
-                } else if(!SetProcessWindowStation(original)) {
-                    LastNativeError=Marshal.GetLastWin32Error();
-                    OwnershipUnresolved=true;
-                    CleanupFailureStage="window_station_restoration"; CleanupNativeError=LastNativeError;
-                    if(desktopFailure==null) FailOwnership();
-                }
+            string sddl="D:P(A;;0x000f01ff;;;SY)(A;;0x000f01ff;;;"+supervisorSid+")(A;;0x000201cf;;;"+expectedSid+")";
+            Exception creationFailure=null;
+            // CreateDesktop binds its caller. A normal, bounded dedicated thread
+            // releases that binding without moving any PowerShell thread.
+            var creator=new System.Threading.Thread(() => {
+                IntPtr descriptor=IntPtr.Zero;
+                try {
+                    RequireInteractiveStation();
+                    if(DesktopExists()) throw new InvalidOperationException("Desktop name appeared before creation");
+                    Check(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl,1,out descriptor,IntPtr.Zero));
+                    var attributes=new SecurityAttributes { size=Marshal.SizeOf<SecurityAttributes>(),descriptor=descriptor };
+                    DesktopCreationAttempted=true;
+                    desktop=CreateDesktopW(desktopName,IntPtr.Zero,IntPtr.Zero,0,0x000f01ff,ref attributes);
+                    int error=Marshal.GetLastWin32Error();
+                    Check(desktop!=IntPtr.Zero);
+                    // Enumeration, an unguessable sealed name and exact protected
+                    // DACL read-back establish ownership; never take an existing
+                    // desktop returned by CreateDesktop.
+                    if(error==183 || !String.Equals(ObjectName(desktop),desktopName,StringComparison.Ordinal))
+                        FailOwnership();
+                    var actual=BroTypistWindowStationAccess.ReadDacl(desktop);
+                    var expected=new RawSecurityDescriptor(sddl);
+                    // Creation can supply default owner/group metadata. Ownership
+                    // requires the exact protected DACL, not those unrelated flags.
+                    if((actual.ControlFlags&ControlFlags.DiscretionaryAclProtected)==0 ||
+                       !BroTypistWindowStationAccess.SameAcl(actual.DiscretionaryAcl,expected.DiscretionaryAcl))
+                        FailOwnership();
+                    DesktopCreated=true;
+                } catch(Exception failure) {
+                    if(DesktopCreationAttempted && desktop!=IntPtr.Zero && !DesktopCreated) OwnershipUnresolved=true;
+                    creationFailure=failure;
+                } finally { if(descriptor!=IntPtr.Zero) LocalFree(descriptor); }
+            });
+            creator.IsBackground=true;
+            CreatorOutstanding=true;
+            try { creator.Start(); }
+            catch {
+                if((creator.ThreadState&System.Threading.ThreadState.Unstarted)!=0) CreatorOutstanding=false;
+                else OwnershipUnresolved=true;
+                throw;
             }
+            if(!creator.Join(30000)) {
+                CleanupFailureStage="desktop_creator_unresolved";
+                DeadlineExceeded=true; FailOwnership();
+            }
+            CreatorOutstanding=false;
+            if(creationFailure!=null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(creationFailure).Throw();
+            Stage="input_desktop_activation";
+            RequireInteractiveStation();
+            if(!String.Equals(InputName(),originalInputName,StringComparison.Ordinal))
+                throw new InvalidOperationException("Input desktop changed before activation");
+            InputActivationAttempted=true;
+            Check(SwitchDesktop(desktop));
+            InputActivated=true;
+            if(!String.Equals(InputName(),desktopName,StringComparison.Ordinal))
+                throw new InvalidOperationException("Owned input desktop activation unverified");
             job=CreateJobObjectW(IntPtr.Zero,null); Check(job!=IntPtr.Zero);
             Stage="profile_logon";
-            var startup=new Startup { size=Marshal.SizeOf<Startup>(),desktop=stationName+@"\Probe" };
+            var startup=new Startup { size=Marshal.SizeOf<Startup>(),desktop=@"WinSta0\"+desktopName };
             secret=Marshal.SecureStringToGlobalAllocUnicode(password);
             try {
                 // LOGON_WITH_PROFILE=1; CREATE_SUSPENDED=4. NULL environment
@@ -239,10 +437,10 @@ public static class BroTypistStandardUserInstallerClient {
                 // Preserve the first failure; cleanup is separate evidence.
                 if(primaryFailure==null) throw;
             } finally {
-                if(process.thread!=IntPtr.Zero) CloseHandle(process.thread);
-                if(process.process!=IntPtr.Zero) CloseHandle(process.process);
+                // Unknown creator/process/job ownership retains every native
+                // handle for disposable-VM teardown, not optimistic cleanup.
+                if(CreatorOutstanding) OwnershipUnresolved=true;
                 if(secret!=IntPtr.Zero) Marshal.ZeroFreeGlobalAllocUnicode(secret);
-                if(descriptor!=IntPtr.Zero) LocalFree(descriptor);
             }
         }
     }
@@ -251,11 +449,40 @@ public static class BroTypistStandardUserInstallerClient {
         Check(DeleteProfileW(sid,null,null));
     }
     public static void ReleaseObjects() {
-        if(OwnershipUnresolved || (ClientLaunched && (!ClientExited || !JobQuiescent))) throw new InvalidOperationException("Live native objects retained");
-        Stage="private_object_cleanup";
-        if(desktop!=IntPtr.Zero) { Check(CloseDesktop(desktop)); desktop=IntPtr.Zero; }
+        try {
+        if(OwnershipUnresolved || CreatorOutstanding || (ClientLaunched && (!ClientExited || !JobQuiescent)))
+            throw new InvalidOperationException("Live native objects retained");
+        if(job!=IntPtr.Zero) WaitJobQuiescent();
+        RestoreInputDesktop();
+        Stage="station_access_restoration";
+        if(stationAccess!=null) {
+            stationAccess.Restore();
+            StationAccessRestorationVerified=stationAccess.Restored;
+        } else StationAccessRestorationVerified=true;
+        Stage="private_desktop_cleanup";
+        if(desktop!=IntPtr.Zero) {
+            if(!DesktopCreated) FailOwnership();
+            Check(CloseDesktop(desktop)); desktop=IntPtr.Zero;
+            var deadline=System.Diagnostics.Stopwatch.StartNew();
+            while(DesktopExists()) {
+                if(deadline.ElapsedMilliseconds>=30000) { DeadlineExceeded=true; FailOwnership(); }
+                System.Threading.Thread.Sleep(100);
+            }
+        } else if(DesktopCreated) {
+            throw new InvalidOperationException("Owned desktop closure not independently verified");
+        }
+        PrivateDesktopCleanupVerified=true;
+        if(originalInput!=IntPtr.Zero) { Check(CloseDesktop(originalInput)); originalInput=IntPtr.Zero; }
         if(station!=IntPtr.Zero) { Check(CloseWindowStation(station)); station=IntPtr.Zero; }
+        if(process.thread!=IntPtr.Zero) { Check(CloseHandle(process.thread)); process.thread=IntPtr.Zero; }
+        if(process.process!=IntPtr.Zero) { Check(CloseHandle(process.process)); process.process=IntPtr.Zero; }
         if(job!=IntPtr.Zero) { Check(CloseHandle(job)); job=IntPtr.Zero; }
+        } catch(Exception failure) {
+            CleanupFailureStage=Stage;
+            var nativeFailure=failure as Win32Exception;
+            CleanupNativeError=nativeFailure!=null ? nativeFailure.NativeErrorCode : LastNativeError;
+            throw;
+        }
     }
 }
 // No ordinary RegistryKey write/delete fallback is permitted. Registry reads,
@@ -387,8 +614,26 @@ function Validate-ReportDirectory([string]$Path) {
     Require (-not (Test-Path -LiteralPath (Join-Path $fullPath 'client-observations.json'))) 'Existing client evidence refused'
     return $fullPath
 }
+function Observe-NativeDesktopLease {
+    if (-not $nativeInitialized) { return }
+    $metadata.interactive_station_acl_modified = [BroTypistStandardUserInstallerClient]::InteractiveStationAclModified
+    $metadata.station_acl_mutation_attempted = [BroTypistStandardUserInstallerClient]::StationAclMutationAttempted
+    $metadata.private_desktop_creation_attempted = [BroTypistStandardUserInstallerClient]::DesktopCreationAttempted
+    $metadata.private_desktop_created = [BroTypistStandardUserInstallerClient]::DesktopCreated
+    $metadata.input_desktop_activation_attempted = [BroTypistStandardUserInstallerClient]::InputActivationAttempted
+    $metadata.input_desktop_activated = [BroTypistStandardUserInstallerClient]::InputActivated
+    $metadata.station_access_restoration_verified = [BroTypistStandardUserInstallerClient]::StationAccessRestorationVerified
+    $metadata.input_desktop_restoration_verified = [BroTypistStandardUserInstallerClient]::InputDesktopRestorationVerified
+    $metadata.private_desktop_cleanup_verified = [BroTypistStandardUserInstallerClient]::PrivateDesktopCleanupVerified
+    $metadata.native_ownership_unresolved = [BroTypistStandardUserInstallerClient]::OwnershipUnresolved
+    $metadata.desktop_creator_outstanding = [BroTypistStandardUserInstallerClient]::CreatorOutstanding
+    $metadata.child_deadline_exceeded = [BroTypistStandardUserInstallerClient]::DeadlineExceeded
+    $metadata.native_cleanup_failure_stage = [BroTypistStandardUserInstallerClient]::CleanupFailureStage
+    $metadata.native_cleanup_error_code = [BroTypistStandardUserInstallerClient]::CleanupNativeError
+}
 function Save-ClientReceipt {
     Require $reportDirectoryValidated 'Public report directory was not validated'
+    Observe-NativeDesktopLease
     $json = $metadata | ConvertTo-Json -Depth 32
     Require ([Text.Encoding]::UTF8.GetByteCount($json) -le 65536) 'Client receipt exceeds bounded metadata limit'
     Write-NewJson (Join-Path $ReportDirectory 'client-observations.json') $metadata
@@ -423,6 +668,10 @@ function Stop-OwnedVm([string]$Reason) {
         quiescence_verified = $metadata.quiescence_verified
         uninstall_verified = $metadata.uninstall_verified
         restoration_verified = $metadata.restoration_verified
+        interactive_station_acl_modified = $metadata.interactive_station_acl_modified
+        station_access_restoration_verified = $metadata.station_access_restoration_verified
+        input_desktop_restoration_verified = $metadata.input_desktop_restoration_verified
+        private_desktop_cleanup_verified = $metadata.private_desktop_cleanup_verified
         teardown_required = $metadata.teardown_required
     } | ConvertTo-Json -Depth 8 -Compress))
     exit 1
@@ -482,6 +731,15 @@ function Observe-VerifiedCoreIdentity($Outcome) {
     $metadata.actual_standard_user_token = $actual
     $metadata.genuine_standard_user = $true
 }
+function Observe-VerifiedCoreDesktop($Outcome) {
+    $proofs = @($Outcome.observations | Where-Object { $_.check -ceq 'owned_interactive_desktop_verified_before_installer' })
+    if ($proofs.Count -eq 0) { return }
+    Require ($proofs.Count -eq 1 -and $proofs[0].passed -is [bool] -and $proofs[0].passed) 'Ambiguous or failed owned interactive desktop proof'
+    foreach ($field in @('interactive_station', 'expected_desktop_matches', 'station_visible', 'input_desktop_matches')) {
+        Require ($proofs[0].evidence.$field -is [bool] -and $proofs[0].evidence.$field) 'Owned interactive desktop evidence missing or invalid'
+    }
+    $metadata.owned_interactive_desktop_verified = $true
+}
 function Promote-Report([string]$Relative, [bool]$Required) {
     $source = Join-Path $coreWork $Relative
     if (-not (Test-Path -LiteralPath $source)) {
@@ -494,7 +752,7 @@ function Promote-Report([string]$Relative, [bool]$Required) {
     [void]($text | ConvertFrom-Json)
     # Do not publish profile/account identifiers even when a native diagnostic
     # includes an unexpected Windows path. JSON escaping is redacted as well.
-    foreach ($private in @($ownedRoot, $ownedProfilePath, $accountName, $validationSid, $supervisorSid, $env:USERPROFILE)) {
+    foreach ($private in @($ownedRoot, $ownedProfilePath, $accountName, $validationSid, $supervisorSid, $expectedDesktopName, $env:USERPROFILE)) {
         if (-not [string]::IsNullOrWhiteSpace($private)) {
             $text = $text.Replace($private.Replace('\', '\\'), '<private>').Replace($private, '<private>')
         }
@@ -535,8 +793,9 @@ function Invoke-StandardUserCore([string]$Executable, [string]$Client, [string]$
     }
     $command = '"{0}" -NoLogo -NoProfile -NonInteractive -File "{1}" -InputFile "{2}" -Work "{3}" -Bootstrap -HandoffHash "{4}"' -f $Executable, $Client, $InputPath, $CoreWork, $Hash
     Require ($command.Length -lt 1024) 'Native logon command length refused'
-    try { return [BroTypistStandardUserInstallerClient]::Run($Executable, $command, $CoreWork, $accountName, $password, $validationSid, $supervisorSid) }
+    try { return [BroTypistStandardUserInstallerClient]::Run($Executable, $command, $CoreWork, $accountName, $password, $validationSid, $supervisorSid, $expectedDesktopName) }
     finally {
+        Observe-NativeDesktopLease
         $metadata.child_deadline_exceeded = [BroTypistStandardUserInstallerClient]::DeadlineExceeded
         $metadata.native_error_code = if ($null -ne [BroTypistStandardUserInstallerClient]::FailureStage) { [BroTypistStandardUserInstallerClient]::FailureNativeError } else { [BroTypistStandardUserInstallerClient]::LastNativeError }
         $metadata.native_stage = if ($null -ne [BroTypistStandardUserInstallerClient]::FailureStage) { [BroTypistStandardUserInstallerClient]::FailureStage } else { [BroTypistStandardUserInstallerClient]::Stage }
@@ -559,6 +818,7 @@ if ($Bootstrap) {
         Require ($handoffIdentity.size -le 65536 -and $handoffIdentity.sha256 -ceq $HandoffHash) 'Bootstrap handoff identity differs'
         $handoff = Get-Content -LiteralPath $handoffPath -Raw | ConvertFrom-Json
         Require ($InputFile -ceq $handoff.input -and $Work -ceq $handoff.work) 'Bootstrap path handoff differs'
+        Require ($handoff.expected_desktop_name -is [string] -and $handoff.expected_desktop_name -cmatch '\Abtci-[0-9a-f]{32}\z') 'Bootstrap owned desktop handoff differs'
         $bootstrapHandoffAuthenticated = $true
         $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
         try {
@@ -573,7 +833,7 @@ if ($Bootstrap) {
         $env:RUNNER_ENVIRONMENT = 'github-hosted'; $env:RUNNER_OS = 'Windows'
         $env:BROTYPIST_INSTALLER_SMOKE_DISPOSABLE = '1'; $env:RUNNER_TEMP = $handoff.root
         $bootstrapStage = 'bootstrap_core'
-        & $handoff.core -InputFile $InputFile -Work $Work -RequireStandardUser -ExpectedUserSid $handoff.expected_user_sid -SupervisorSid $handoff.supervisor_sid
+        & $handoff.core -InputFile $InputFile -Work $Work -RequireStandardUser -ExpectedUserSid $handoff.expected_user_sid -SupervisorSid $handoff.supervisor_sid -ExpectedDesktopName $handoff.expected_desktop_name
         exit $LASTEXITCODE
     } catch {
         $bootstrapFailure = Failure-Facts $_ $bootstrapStage
@@ -681,7 +941,8 @@ try {
     $core = Join-Path $stagedInputs 'windows-installer-smoke.ps1'
     $metadata.core_sha256 = (File-Identity $core).sha256
     $handoffPath = Join-Path $stagedInputs 'handoff.json'
-    Write-NewJson $handoffPath @{ root = $ownedRoot; input = $stagedInput; work = $coreWork; core = $core; expected_user_sid = $validationSid; supervisor_sid = $supervisorSid; files = @($manifest.ToArray()) }
+    $expectedDesktopName = 'btci-' + [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(16)).ToLowerInvariant()
+    Write-NewJson $handoffPath @{ root = $ownedRoot; input = $stagedInput; work = $coreWork; core = $core; expected_user_sid = $validationSid; supervisor_sid = $supervisorSid; expected_desktop_name = $expectedDesktopName; files = @($manifest.ToArray()) }
     $handoffHash = (File-Identity $handoffPath).sha256
     Set-Acl -LiteralPath $ownedRoot -AclObject (Private-DirectoryAcl $supervisorSid $validationSid 'ReadAndExecute')
     $metadata.staged_file_count = $manifest.Count
@@ -746,6 +1007,7 @@ try {
                 Require ($file.Length -gt 0 -and $file.Length -le 262144) 'Native quiescence receipt missing/oversized'
                 $outcome = Get-Content -LiteralPath $outcomePath -Raw | ConvertFrom-Json
                 Observe-VerifiedCoreIdentity $outcome
+                Observe-VerifiedCoreDesktop $outcome
                 Assert-NativeQuiescence $outcome
                 $quiescent = $true
                 $uninstallVerified = $outcome.quiescence.uninstall_verified -is [bool] -and $outcome.quiescence.uninstall_verified
@@ -781,6 +1043,17 @@ try {
         Promote-Report 'observations.json' $true
         Promote-Report 'tiny-worker/worker-smoke.json' $false
         Promote-Report 'portable-tiny-worker/worker-smoke.json' $false
+    }
+    $metadata.stage = 'interactive_desktop_restoration'
+    try {
+        if ($nativeInitialized) {
+            try { [BroTypistStandardUserInstallerClient]::ReleaseObjects() }
+            finally { Observe-NativeDesktopLease }
+            Require ($metadata.station_access_restoration_verified -and $metadata.input_desktop_restoration_verified -and $metadata.private_desktop_cleanup_verified) 'Interactive desktop lease restoration unverified'
+        }
+    } catch {
+        if ($null -eq $metadata.cleanup_failure) { $metadata.cleanup_failure = Failure-Facts $_ $metadata.stage }
+        Stop-OwnedVm 'Interactive desktop restoration or cleanup unverified; remaining leases require disposable VM teardown'
     }
     $metadata.stage = 'policy_restoration'
     try {
@@ -877,7 +1150,6 @@ try {
             $metadata.profile_cleanup_verified = $true
         }
         $metadata.account_cleanup_verified = $true
-        if ($nativeInitialized) { [BroTypistStandardUserInstallerClient]::ReleaseObjects() }
         $metadata.stage = 'private_tree_cleanup'
         Remove-CreatedTree $ownedRoot $ownedRootCreated
         $metadata.private_tree_cleanup_verified = $true
@@ -886,7 +1158,7 @@ try {
         $metadata.diagnostics.Add(('Cleanup stage {0} failed ({1}); no exception text or identifiers retained' -f $metadata.stage, $_.Exception.GetType().Name))
         Stop-OwnedVm 'Owned account/profile/tree cleanup unverified; disposable VM teardown required'
     }
-    $metadata.passed = $nativeLifecycleSucceeded -and $null -eq $metadata.failure -and $null -eq $metadata.cleanup_failure -and $null -ne $outcome -and $outcome.passed -is [bool] -and $outcome.passed -and $metadata.restoration_verified -and $metadata.genuine_standard_user -and $metadata.account_cleanup_verified -and $metadata.profile_cleanup_verified -and $metadata.private_tree_cleanup_verified
+    $metadata.passed = $nativeLifecycleSucceeded -and $null -eq $metadata.failure -and $null -eq $metadata.cleanup_failure -and $null -ne $outcome -and $outcome.passed -is [bool] -and $outcome.passed -and $metadata.restoration_verified -and $metadata.genuine_standard_user -and $metadata.owned_interactive_desktop_verified -and $metadata.station_access_restoration_verified -and $metadata.input_desktop_restoration_verified -and $metadata.private_desktop_cleanup_verified -and $metadata.account_cleanup_verified -and $metadata.profile_cleanup_verified -and $metadata.private_tree_cleanup_verified
     $metadata.stage = 'complete'
     } catch {
         if ($null -eq $metadata.cleanup_failure) { $metadata.cleanup_failure = Failure-Facts $_ $metadata.stage }

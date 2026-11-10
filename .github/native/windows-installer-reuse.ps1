@@ -130,10 +130,16 @@ function Redact([string]$Text) {
 }
 
 function Assert-StandardUserEvidence($Client, $Core) {
-    foreach ($field in @('passed', 'genuine_standard_user', 'account_cleanup_verified', 'profile_cleanup_verified', 'restoration_verified', 'quiescence_verified')) {
-        Require ($Client.$field -is [bool] -and $Client.$field -eq $true) 'Shared standard-user identity, cleanup, quiescence or policy restoration evidence missing'
+    foreach ($field in @('passed', 'genuine_standard_user', 'account_cleanup_verified', 'profile_cleanup_verified', 'restoration_verified', 'quiescence_verified', 'station_access_restoration_verified', 'input_desktop_restoration_verified', 'private_desktop_cleanup_verified')) {
+        Require ($Client.$field -is [bool] -and $Client.$field -eq $true) 'Shared standard-user identity, cleanup, quiescence, desktop or policy restoration evidence missing'
     }
     Require (@($Core.observations | Where-Object { $_.check -ceq 'genuine_standard_user_verified_before_installer' -and $_.passed -is [bool] -and $_.passed -eq $true }).Count -eq 1) 'Child did not independently verify genuine standard-user identity before installer access'
+    $desktop = @($Core.observations | Where-Object { $_.check -ceq 'owned_interactive_desktop_verified_before_installer' })
+    Require ($desktop.Count -eq 1) 'Owned interactive desktop proof missing or duplicated'
+    Require ($desktop[0].passed -is [bool] -and $desktop[0].passed -eq $true) 'Owned interactive desktop verification failed'
+    foreach ($field in @('interactive_station', 'expected_desktop_matches', 'station_visible', 'input_desktop_matches')) {
+        Require ($desktop[0].evidence.$field -is [bool] -and $desktop[0].evidence.$field -eq $true) 'Owned interactive desktop evidence missing or untyped'
+    }
     Require ($Core.passed -is [bool] -and $Core.passed -eq $true) 'Native installer core assertions failed; inspect retained native receipt'
 }
 
@@ -340,7 +346,7 @@ try {
     $env:GH_TOKEN = $null; $script:headers = $null
     $client = Join-Path $PSScriptRoot 'windows-installer-client.ps1'
     $metadata.probe_client_sha256 = (Get-FileHash -LiteralPath $client -Algorithm SHA256).Hash.ToLowerInvariant()
-    $metadata.client_experiment = @{ method = 'fresh nonadministrator local account; LOGON_WITH_PROFILE; private window station and desktop'; child_verification_before_installer_required = $true; policy_changes = 'only approved absent HKLM64 DisableMSI-to-DWORD0 fixture; restored in finally'; global_acl_changes = $false; account_and_profile_cleanup_required = $true }
+    $metadata.client_experiment = @{ method = 'fresh nonadministrator local account; LOGON_WITH_PROFILE; owned private input desktop on disposable interactive station'; child_verification_before_installer_required = $true; policy_changes = 'only approved absent HKLM64 DisableMSI-to-DWORD0 fixture; restored in finally'; interactive_station_acl_fixture = 'temporary exact new-user allow ACE; verified restoration required'; station_access_mask = '00020337'; account_and_profile_cleanup_required = $true; station_input_and_desktop_cleanup_required = $true }
     & $pwsh -NoLogo -NoProfile -NonInteractive -File $client -InputFile $inputPath -Work $coreWork -ReportDirectory $Reports
     $nativeExit = $LASTEXITCODE
     $metadata.native_exit_code = $nativeExit
