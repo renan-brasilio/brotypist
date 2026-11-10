@@ -712,23 +712,23 @@ function Probe-TinyWorker([string]$Directory, [string]$Stage, [string]$OutputNam
     Assert-Run
 }
 function Probe-Gui([string]$Directory, [string]$Stage) {
-    $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $Directory 'BroTypist.exe'))
-    $start.UseShellExecute = $false; $start.WorkingDirectory = $profile
-    foreach ($arg in @('--paused', '--settings', '--no-tray', '--pane', 'about')) { $start.ArgumentList.Add($arg) }
-    $gui = [Diagnostics.Process]::new(); $gui.StartInfo = $start
-    Require ($gui.Start()) 'Could not start owned GUI'
-    $owned.Add($gui)
-    [void]$gui.Handle
+    # Connection handles opened by Windows are not inheritable. Select the
+    # verified private desktop explicitly rather than the new logon's default.
+    $gui = [BroTypistInstallerNative]::StartSettings((Join-Path $Directory 'BroTypist.exe'), $profile, $owned)
     $children = [System.Collections.Generic.Dictionary[int,System.Diagnostics.Process]]::new()
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     $window = [IntPtr]::Zero
     do {
-        Require (-not $gui.HasExited) 'GUI exited before visible Settings'
+        if ($gui.HasExited) {
+            $receipt.observations.Add(@{ check = ($Stage + '_startup_exit'); passed = $false; evidence = [BroTypistInstallerNative]::GuiObservation($gui) })
+            throw 'GUI exited before visible Settings'
+        }
         Capture-Children $gui $children
         $window = [BroTypistInstallerNative]::FindSettings([uint32]$gui.Id)
         if ($window -ne [IntPtr]::Zero) { break }
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
+    $receipt.observations.Add(@{ check = ($Stage + '_window_state'); passed = $null; status = 'observed'; evidence = [BroTypistInstallerNative]::GuiObservation($gui) })
     Require ($window -ne [IntPtr]::Zero) 'Owned visible Settings HWND not observed before deadline'
     $button = [BroTypistInstallerNative]::GetDlgItem($window, 13)
     Require ($button -ne [IntPtr]::Zero) 'Canonical Quit control ID 13 missing'
@@ -839,14 +839,98 @@ public static class BroTypistInstallerNative {
     }
     [DllImport("msi.dll", CharSet=CharSet.Unicode, ExactSpelling=true)] public static extern uint MsiGetProductInfoExW(string product,string sid,uint context,string property,StringBuilder value,ref uint length);
     [DllImport("msi.dll", CharSet=CharSet.Unicode, ExactSpelling=true)] public static extern uint MsiEnumRelatedProductsW(string upgrade,uint reserved,uint index,StringBuilder product);
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    struct Startup {
+        public int size;
+        public string reserved,desktop,title;
+        public uint x,y,width,height,xChars,yChars,fill,flags;
+        public ushort show,reservedCount;
+        public IntPtr reservedBytes,input,output,error;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct ProcessInfo {
+        public IntPtr process,thread;
+        public uint processId,threadId;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern bool CreateProcessW(string application,StringBuilder command,IntPtr processAttributes,IntPtr threadAttributes,bool inherit,uint flags,IntPtr environment,string directory,ref Startup startup,out ProcessInfo process);
+    [DllImport("kernelbase.dll", ExactSpelling=true, SetLastError=true)] static extern bool CompareObjectHandles(IntPtr left,IntPtr right);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(IntPtr process,uint exit);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle,uint timeout);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetProcessWindowStation();
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetThreadDesktop(uint thread);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern bool GetUserObjectInformationW(IntPtr handle,int index,StringBuilder value,uint bytes,out uint needed);
+    public static bool GuiLaunchOwnershipUnresolved;
+    static string ObjectName(IntPtr handle) {
+        uint needed;
+        GetUserObjectInformationW(handle,2,null,0,out needed);
+        if(needed<2 || needed>65536 || (needed&1)!=0) throw new InvalidOperationException("Invalid owned desktop name length");
+        var value=new StringBuilder((int)needed/2);
+        if(!GetUserObjectInformationW(handle,2,value,needed,out needed))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return value.ToString();
+    }
+    static string PrivateDesktop() {
+        string station=ObjectName(GetProcessWindowStation());
+        string desktop=ObjectName(GetThreadDesktop(GetCurrentThreadId()));
+        if(station.Length!=37 || !station.StartsWith("btci-",StringComparison.Ordinal) || !desktop.Equals("Probe",StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Owned private desktop connection required");
+        for(int index=5;index<station.Length;index++) {
+            char value=station[index];
+            if(!((value>='0'&&value<='9')||(value>='a'&&value<='f')))
+                throw new InvalidOperationException("Private station identity differs");
+        }
+        return station+@"\"+desktop;
+    }
+    public static System.Diagnostics.Process StartSettings(string executable,string directory,System.Collections.Generic.List<System.Diagnostics.Process> owned) {
+        if(GuiLaunchOwnershipUnresolved || !System.IO.Path.IsPathFullyQualified(executable) || !System.IO.Path.IsPathFullyQualified(directory))
+            throw new InvalidOperationException("Invalid owned GUI launch");
+        foreach(char value in executable)
+            if(value=='"' || value=='\r' || value=='\n' || value=='\0')
+                throw new InvalidOperationException("Unsafe GUI executable path");
+        var startup=new Startup { size=Marshal.SizeOf<Startup>(),desktop=PrivateDesktop() };
+        var command=new StringBuilder("\""+executable+"\" --paused --settings --no-tray --pane about");
+        ProcessInfo info;
+        if(!CreateProcessW(executable,command,IntPtr.Zero,IntPtr.Zero,false,4,IntPtr.Zero,directory,ref startup,out info))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        GuiLaunchOwnershipUnresolved=true;
+        System.Diagnostics.Process process=null;
+        bool tracked=false;
+        try {
+            process=System.Diagnostics.Process.GetProcessById(checked((int)info.processId));
+            // Open and compare while suspended: never adopt a reused PID.
+            if(!CompareObjectHandles(info.process,process.Handle))
+                throw new InvalidOperationException("GUI process handle identity differs");
+            owned.Add(process); tracked=true; GuiLaunchOwnershipUnresolved=false;
+            uint previous=ResumeThread(info.thread);
+            if(previous==0xffffffff) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            if(previous!=1) throw new InvalidOperationException("Unexpected GUI suspend count");
+            return process;
+        } finally {
+            if(!tracked) {
+                // Never-resumed and held by its original creation handle.
+                bool exited=WaitForSingleObject(info.process,0)==0;
+                if(!exited) {
+                    TerminateProcess(info.process,1);
+                    exited=WaitForSingleObject(info.process,30000)==0;
+                }
+                GuiLaunchOwnershipUnresolved=!exited;
+                if(process!=null) process.Dispose();
+            }
+            CloseHandle(info.thread); CloseHandle(info.process);
+        }
+    }
     delegate bool EnumProc(IntPtr hwnd,IntPtr data);
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc callback,IntPtr data);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool EnumWindows(EnumProc callback,IntPtr data);
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr hwnd,int id);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd,out uint process);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool IsHungAppWindow(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll", SetLastError=true)] static extern uint GetGuiResources(IntPtr process,uint flags);
     [StructLayout(LayoutKind.Sequential)] struct Rect { public int left,top,right,bottom; }
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd,out Rect rect);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr hwnd,StringBuilder text,int length);
@@ -854,6 +938,72 @@ public static class BroTypistInstallerNative {
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd,uint flags);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)] public static extern IntPtr SendMessageTimeoutW(IntPtr hwnd,uint message,UIntPtr wp,IntPtr lp,uint flags,uint timeout,out UIntPtr result);
     static string Class(IntPtr hwnd) { var text=new StringBuilder(256); GetClassNameW(hwnd,text,text.Capacity); return text.ToString(); }
+    static string DesktopKind(string name) {
+        if(name.Equals("Probe",StringComparison.OrdinalIgnoreCase)) return "owned_probe";
+        if(name.Equals("Default",StringComparison.OrdinalIgnoreCase)) return "default";
+        return "other";
+    }
+    public static System.Collections.Generic.Dictionary<string,object> GuiObservation(System.Diagnostics.Process process) {
+        var facts=new System.Collections.Generic.Dictionary<string,object> {
+            {"explicit_private_desktop",true}, {"stderr_captured",false}
+        };
+        bool alive=false;
+        try {
+            alive=!process.HasExited;
+            facts["exited"]=!alive;
+            facts["exit_code"]=alive ? (object)null : process.ExitCode;
+            uint resources=GetGuiResources(process.Handle,1);
+            facts["user_objects"]=resources;
+            facts["user_objects_error"]=resources==0 ? Marshal.GetLastWin32Error() : 0;
+        } catch(System.ComponentModel.Win32Exception error) { facts["process_query_error"]=error.NativeErrorCode; }
+        catch(InvalidOperationException) { facts["process_query_unavailable"]=true; }
+        try {
+            string station=ObjectName(GetProcessWindowStation());
+            IntPtr observerDesktop=GetThreadDesktop(GetCurrentThreadId());
+            facts["observer_station_kind"]=station.StartsWith("btci-",StringComparison.Ordinal) ? "owned_private" : station.Equals("WinSta0",StringComparison.OrdinalIgnoreCase) ? "interactive" : "other";
+            facts["observer_desktop_kind"]=DesktopKind(ObjectName(observerDesktop));
+            if(alive) {
+                var desktops=new System.Collections.Generic.List<object>();
+                facts["thread_desktops"]=desktops;
+                var threads=process.Threads;
+                facts["thread_count"]=threads.Count;
+                facts["thread_desktops_truncated"]=threads.Count>64;
+                for(int index=0;index<threads.Count && index<64;index++) {
+                    IntPtr childDesktop=GetThreadDesktop(unchecked((uint)threads[index].Id));
+                    if(childDesktop==IntPtr.Zero) {
+                        desktops.Add(new System.Collections.Generic.Dictionary<string,object> { {"query_error",Marshal.GetLastWin32Error()} });
+                        continue;
+                    }
+                    bool same=CompareObjectHandles(observerDesktop,childDesktop);
+                    int comparisonError=same ? 0 : Marshal.GetLastWin32Error();
+                    desktops.Add(new System.Collections.Generic.Dictionary<string,object> {
+                        {"desktop_kind",DesktopKind(ObjectName(childDesktop))},
+                        {"same_desktop_object",same}, {"comparison_error",comparisonError}
+                    });
+                }
+            }
+        } catch(System.ComponentModel.Win32Exception error) { facts["desktop_query_error"]=error.NativeErrorCode; }
+        catch(InvalidOperationException) { facts["desktop_query_unavailable"]=true; }
+        var windows=new System.Collections.Generic.List<object>();
+        bool truncated=false;
+        uint pid=unchecked((uint)process.Id);
+        bool complete=EnumWindows((hwnd,data)=>{
+            uint owner; GetWindowThreadProcessId(hwnd,out owner);
+            if(owner!=pid) return true;
+            if(windows.Count>=32) { truncated=true; return false; }
+            windows.Add(new System.Collections.Generic.Dictionary<string,object> {
+                {"class",Class(hwnd)}, {"visible",IsWindowVisible(hwnd)},
+                {"iconic",IsIconic(hwnd)}, {"hung",IsHungAppWindow(hwnd)}
+            });
+            return true;
+        },IntPtr.Zero);
+        facts["owned_windows"]=windows;
+        facts["window_enumeration_complete"]=complete;
+        facts["window_enumeration_error"]=!complete && !truncated ? Marshal.GetLastWin32Error() : 0;
+        facts["windows_truncated"]=truncated;
+        // No HWNDs, thread IDs, titles, or private station nonces are retained.
+        return facts;
+    }
     public static IntPtr FindSettings(uint pid) {
         IntPtr found=IntPtr.Zero;
         EnumWindows((hwnd,data)=>{ uint owner; GetWindowThreadProcessId(hwnd,out owner); if(owner==pid && IsWindowVisible(hwnd) && !IsIconic(hwnd) && !IsHungAppWindow(hwnd) && Class(hwnd)=="BroTypist.Settings") { found=hwnd; return false; } return true; },IntPtr.Zero);
@@ -1031,7 +1181,8 @@ public static class BroTypistInstallerNative {
         try { Remove-Item -LiteralPath (Join-Path $Work 'CI-ONLY-NONDISTRIBUTABLE-rollback.msi') -Force }
         catch { $receipt.diagnostics.Add('Owned nondistributable rollback fixture cleanup failed') }
     }
-    $ownedQuiescent = $true
+    $nativeType = 'BroTypistInstallerNative' -as [type]
+    $ownedQuiescent = $null -eq $nativeType -or -not $nativeType::GuiLaunchOwnershipUnresolved
     foreach ($process in $owned) {
         try { if (-not $process.HasExited) { $ownedQuiescent = $false } }
         catch { $ownedQuiescent = $false }
