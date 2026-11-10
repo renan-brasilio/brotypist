@@ -173,6 +173,7 @@ public static class BroTypistStandardUserInstallerClient {
     public static bool StationAccessRestorationVerified, InputDesktopRestorationVerified, PrivateDesktopCleanupVerified;
     public static bool InteractiveStationAclModified { get { return stationAccess!=null && stationAccess.Modified; } }
     public static bool StationAclMutationAttempted { get { return stationAccess!=null && stationAccess.MutationAttempted; } }
+    public static System.Collections.Generic.Dictionary<string,object> DeadlineObservation;
     static IntPtr station,desktop,originalInput,job;
     static ProcessInfo process;
     static string desktopName,originalInputName;
@@ -213,6 +214,16 @@ public static class BroTypistStandardUserInstallerClient {
     delegate bool DesktopVisitor([MarshalAs(UnmanagedType.LPWStr)] string name,IntPtr state);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
     static extern bool EnumDesktopsW(IntPtr station,DesktopVisitor visitor,IntPtr state);
+    delegate bool WindowVisitor(IntPtr window,IntPtr state);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool EnumDesktopWindows(IntPtr desktop,WindowVisitor visitor,IntPtr state);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr window,WindowVisitor visitor,IntPtr state);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window,out uint owner);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)] static extern int GetClassNameW(IntPtr window,StringBuilder text,int capacity);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)] static extern int GetWindowTextW(IntPtr window,StringBuilder text,int capacity);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll", SetLastError=true)] static extern uint GetGuiResources(IntPtr process,uint kind);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern IntPtr SendMessageTimeoutW(IntPtr window,uint message,UIntPtr wp,StringBuilder text,uint flags,uint timeout,out UIntPtr result);
     [DllImport("user32.dll", SetLastError=true)] static extern bool CloseWindowStation(IntPtr station);
     [DllImport("user32.dll", SetLastError=true)] static extern bool CloseDesktop(IntPtr desktop);
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)] static extern IntPtr CreateJobObjectW(IntPtr attributes,string name);
@@ -222,6 +233,10 @@ public static class BroTypistStandardUserInstallerClient {
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(IntPtr process,uint exit);
     [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle,uint timeout);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process,out uint exit);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetProcessTimes(IntPtr process,out long created,out long exited,out long kernel,out long user);
+    [DllImport("kernel32.dll", EntryPoint="QueryInformationJobObject", ExactSpelling=true, SetLastError=true)]
+    static extern bool QueryJobProcesses(IntPtr job,int kind,IntPtr information,uint size,out uint needed);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
     [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
     [DllImport("userenv.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
@@ -292,9 +307,100 @@ public static class BroTypistStandardUserInstallerClient {
         failure.Data["deadline_exceeded"]=DeadlineExceeded;
         throw failure;
     }
+    static void ObserveDeadline() {
+        // Parent-owned bounded diagnostics only. Never read live private files,
+        // dismiss dialogs, signal processes, or use this snapshot as cleanup proof.
+        var facts=new System.Collections.Generic.Dictionary<string,object> { {"diagnostic_only",true} };
+        DeadlineObservation=facts;
+        try {
+            uint code;
+            if(GetExitCodeProcess(process.process,out code)) facts["client_exit_status"]=code;
+            long created,exited,kernel,user;
+            if(GetProcessTimes(process.process,out created,out exited,out kernel,out user)) {
+                facts["client_kernel_cpu_ms"]=kernel/10000;
+                facts["client_user_cpu_ms"]=user/10000;
+            }
+            uint resources=GetGuiResources(process.process,1);
+            facts["client_user_objects"]=resources;
+            facts["client_user_objects_error"]=resources==0 ? Marshal.GetLastWin32Error() : 0;
+            JobAccounting accounting;
+            if(job!=IntPtr.Zero && QueryInformationJobObject(job,1,out accounting,Marshal.SizeOf<JobAccounting>(),IntPtr.Zero)) {
+                facts["job_total_processes"]=accounting.total;
+                facts["job_active_processes"]=accounting.active;
+            }
+            var members=new System.Collections.Generic.HashSet<uint>();
+            bool membershipKnown=false;
+            IntPtr ids=Marshal.AllocHGlobal(8+64*IntPtr.Size);
+            try {
+                uint needed;
+                if(job!=IntPtr.Zero && QueryJobProcesses(job,3,ids,(uint)(8+64*IntPtr.Size),out needed)) {
+                    int count=Marshal.ReadInt32(ids,4);
+                    if(count>=0 && count<=64) {
+                        for(int index=0;index<count;index++)
+                            members.Add(unchecked((uint)Marshal.ReadIntPtr(ids,8+index*IntPtr.Size).ToInt64()));
+                        membershipKnown=true;
+                    }
+                }
+            } finally { Marshal.FreeHGlobal(ids); }
+            facts["job_pid_snapshot_available"]=membershipKnown;
+            if(!DesktopCreated || desktop==IntPtr.Zero) return;
+            var windows=new System.Collections.Generic.List<object>();
+            facts["owned_desktop_windows"]=windows;
+            var clock=System.Diagnostics.Stopwatch.StartNew();
+            var classText=new StringBuilder(128);
+            bool truncated=false; int dialogCount=0;
+            WindowVisitor visitor=(window,state) => {
+                try {
+                    if(windows.Count>=32 || clock.ElapsedMilliseconds>=10000) { truncated=true; return false; }
+                    uint owner; GetWindowThreadProcessId(window,out owner);
+                    classText.Clear(); GetClassNameW(window,classText,classText.Capacity);
+                    string kind=classText.ToString();
+                    var row=new System.Collections.Generic.Dictionary<string,object> {
+                        {"class",kind}, {"visible",IsWindowVisible(window)},
+                        {"owner",owner==process.processId ? "client_pid_snapshot" : membershipKnown ? members.Contains(owner) ? "job_pid_snapshot" : "other_pid_snapshot" : "unknown"}
+                    };
+                    windows.Add(row);
+                    if(kind=="#32770" && dialogCount++<4) {
+                        var title=new StringBuilder(256); GetWindowTextW(window,title,title.Capacity);
+                        string caption=title.ToString();
+                        row["dialog_kind"]=caption.EndsWith("Application Error",StringComparison.OrdinalIgnoreCase) ? "application_error" :
+                            caption=="Windows Installer" ? "windows_installer" : caption=="Unsaved settings" ? "unsaved_settings" : "other";
+                        var codes=new System.Collections.Generic.HashSet<string>();
+                        var text=new StringBuilder(1024); int controls=0,failedReads=0;
+                        WindowVisitor child=(control,unused) => {
+                            try {
+                                if(controls++>=16 || clock.ElapsedMilliseconds>=10000) return false;
+                                classText.Clear(); GetClassNameW(control,classText,classText.Capacity);
+                                if(!classText.ToString().Equals("Static",StringComparison.OrdinalIgnoreCase)) return true;
+                                text.Clear(); UIntPtr result;
+                                if(SendMessageTimeoutW(control,0x000d,new UIntPtr(1024),text,0x0003,200,out result)==IntPtr.Zero) { failedReads++; return true; }
+                                // Only known numeric failure signatures leave this scope.
+                                foreach(System.Text.RegularExpressions.Match match in System.Text.RegularExpressions.Regex.Matches(text.ToString(),@"0x(?:c0000142|c0000145|c0000022|c0000135|c000007b|c000012f|c0000139|80070005)\b",System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                                    codes.Add(match.Value.ToLowerInvariant());
+                                return true;
+                            } catch { failedReads++; return false; }
+                        };
+                        EnumChildWindows(window,child,IntPtr.Zero); GC.KeepAlive(child);
+                        row["error_signatures"]=new System.Collections.Generic.List<string>(codes);
+                        row["dialog_text_query_failures"]=failedReads;
+                        row["dialog_controls_truncated"]=controls>16 || clock.ElapsedMilliseconds>=10000;
+                    }
+                    return true;
+                } catch(Exception failure) {
+                    facts["window_query_error_type"]=failure.GetType().FullName;
+                    return false;
+                }
+            };
+            bool complete=EnumDesktopWindows(desktop,visitor,IntPtr.Zero);
+            facts["window_enumeration_error"]=!complete && !truncated ? Marshal.GetLastWin32Error() : 0;
+            facts["window_enumeration_complete"]=complete;
+            facts["windows_truncated"]=truncated;
+            GC.KeepAlive(visitor);
+        } catch(Exception failure) { facts["capture_error_type"]=failure.GetType().FullName; }
+    }
     static void WaitOwned(IntPtr process,uint timeout) {
         uint wait=WaitForSingleObject(process,timeout);
-        if(wait==258) DeadlineExceeded=true;
+        if(wait==258) { DeadlineExceeded=true; ObserveDeadline(); }
         if(wait!=0) {
             if(wait==0xffffffff) LastNativeError=Marshal.GetLastWin32Error();
             FailOwnership();
@@ -628,6 +734,7 @@ function Observe-NativeDesktopLease {
     $metadata.native_ownership_unresolved = [BroTypistStandardUserInstallerClient]::OwnershipUnresolved
     $metadata.desktop_creator_outstanding = [BroTypistStandardUserInstallerClient]::CreatorOutstanding
     $metadata.child_deadline_exceeded = [BroTypistStandardUserInstallerClient]::DeadlineExceeded
+    $metadata.native_deadline_observation = [BroTypistStandardUserInstallerClient]::DeadlineObservation
     $metadata.native_cleanup_failure_stage = [BroTypistStandardUserInstallerClient]::CleanupFailureStage
     $metadata.native_cleanup_error_code = [BroTypistStandardUserInstallerClient]::CleanupNativeError
 }
