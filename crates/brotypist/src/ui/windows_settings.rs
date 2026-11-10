@@ -501,13 +501,40 @@ pub struct WelcomeState {
     pub selected: String,
     pub ready: String,
     pub access_reviewed: bool,
+    /// Only the explicitly requested, still-selected download may start validation.
+    pub downloading: Option<String>,
 }
 impl WelcomeState {
     pub fn select(&mut self, id: String) {
         if self.selected != id {
+            self.downloading = None;
             self.ready.clear();
         }
         self.selected = id;
+    }
+    pub fn begin_download(&mut self, id: String) {
+        self.select(id.clone());
+        self.ready.clear();
+        self.downloading = Some(id);
+    }
+    pub fn completed_download(&mut self, id: &str) -> bool {
+        if self.downloading.as_deref() != Some(id) {
+            return false;
+        }
+        self.downloading = None;
+        self.selected == id
+    }
+    pub fn saved_model(&mut self, id: &str, config: &Config) {
+        let active = if config.backend != "gguf" {
+            format!("{}:{}", config.backend, config.model)
+        } else if config.model_id.is_empty() {
+            config.model_path.clone()
+        } else {
+            config.model_id.clone()
+        };
+        if self.selected == id && active == id {
+            self.ready = id.into();
+        }
     }
     pub fn can_continue(&self) -> bool {
         match self.step {
@@ -810,6 +837,39 @@ mod tests {
         assert!(!w.can_continue());
         w.ready = "one".into();
         assert!(!w.can_continue());
+    }
+    #[test]
+    fn completed_download_requires_matching_saved_selection_before_continue() {
+        let mut w = WelcomeState {
+            step: 3,
+            ..Default::default()
+        };
+        w.begin_download("tiny".into());
+        assert!(!w.can_continue());
+        assert!(!w.completed_download("other"));
+        assert!(w.completed_download("tiny"));
+        assert!(!w.can_continue()); // Transfer success is not validation or persistence.
+        let mut config = Config::default();
+        config.model_id = "other".into();
+        w.saved_model("tiny", &config);
+        assert!(!w.can_continue());
+        config.model_id = "tiny".into();
+        w.saved_model("tiny", &config);
+        assert!(w.can_continue());
+    }
+    #[test]
+    fn changing_selection_cannot_revive_abandoned_download_intent() {
+        let mut w = WelcomeState {
+            step: 3,
+            ..Default::default()
+        };
+        w.begin_download("tiny".into());
+        w.select("another".into());
+        assert!(!w.completed_download("tiny"));
+        w.saved_model("tiny", &Config::default());
+        assert!(!w.can_continue());
+        w.select("tiny".into());
+        assert!(!w.completed_download("tiny")); // Browsing back cannot revive intent.
     }
     #[test]
     fn system_access_review_is_explicit_not_permission_success() {

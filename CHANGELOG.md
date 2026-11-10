@@ -5,6 +5,13 @@ was redacted with maintainer approval; unchanged native downloads retain their
 original signed provenance, not the source identity of rewritten tags. Legacy
 Python-era downloads were withdrawn; their release pages remain historical records.
 
+## Unreleased — Windows setup progression and layout
+
+- Connect a completed, explicitly requested Windows Welcome model download to the existing integrity, preparation and persistence transaction. Enable Continue only after the matching selected model receives its Saved receipt; browsing another model, failed validation, cancellation and superseded operations do not borrow readiness. Preserve independent settings drafts and the isolated Try it preview's release/ownership boundaries.
+- Retain asynchronous model-download terminal events when the download owner finishes between polling and retirement. Complete, error and cancelled outcomes remain observable; no integrity requirement, model-validation owner or production timeout changes.
+- Rework the native six-step Welcome into distinct system-face step/title/body typography, a bounded content column, aligned model actions and clear transfer/verification/error status. Scale native fonts and geometry with monitor DPI, apply the operating system's suggested DPI-change rectangle, keep navigation anchored below scrollable content and use system colors consistently.
+- Extend the Windows native desktop smoke with an actual fresh pinned-model download into its empty private profile, its matching saved selection and immediately enabled Continue, an invalid-GGUF refusal, actual-monitor-DPI resize checks and retained pending/ready screenshots. The independently supplied cached model still covers native import and real preview inference; it cannot satisfy the fresh-download assertion. These are source changes, not a claim of native execution or release verification.
+
 ## 0.6.1 — Native verification and Welcome ownership
 
 macOS Apple Silicon patch release from merged PR #5. Native CI passes on all

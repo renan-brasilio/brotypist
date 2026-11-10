@@ -102,6 +102,9 @@ const W_SUGGESTION: usize = 84;
 const W_WORD: usize = 85;
 const W_ALL: usize = 86;
 const W_LANGUAGE: usize = 87;
+const W_STEP: usize = 92;
+const W_TITLE: usize = 93;
+const W_MODEL_STATUS: usize = 94;
 const FIELD_BASE: usize = 1000;
 const SHORTCUT_BASE: usize = 2000;
 const RULE_FLAG_BASE: usize = 2100;
@@ -136,6 +139,12 @@ pub(super) fn wide(s: &str) -> Vec<u16> {
 }
 unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => unsafe {
+            let dc = HDC(wp.0 as *mut _);
+            SetTextColor(dc, COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
+            SetBkColor(dc, COLORREF(GetSysColor(COLOR_WINDOW)));
+            return LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize);
+        },
         WM_COMMAND => queue(Event::Command(
             wp.0 & 0xffff,
             ((wp.0 >> 16) & 0xffff) as u16,
@@ -147,7 +156,32 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_TIMER => queue(Event::Tick),
         CONTROLLER_WAKE => queue(Event::Wake),
         WM_SIZE => queue(Event::Resize),
-        WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => queue(Event::Display),
+        WM_DPICHANGED => {
+            // The suggested rectangle is valid only during this callback.
+            unsafe {
+                let rect = &*(lp.0 as *const RECT);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            queue(Event::Display);
+        }
+        WM_GETMINMAXINFO => unsafe {
+            let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+            let info = &mut *(lp.0 as *mut MINMAXINFO);
+            info.ptMinTrackSize = POINT {
+                x: 680 * dpi / 96,
+                y: 600 * dpi / 96,
+            };
+            return LRESULT(0);
+        },
+        WM_DISPLAYCHANGE | WM_SETTINGCHANGE => queue(Event::Display),
         WM_MOUSEWHEEL => queue(Event::Scroll(-((wp.0 >> 16) as u16 as i16 as i32) / 3)),
         WM_VSCROLL => {
             let kind = wp.0 & 0xffff;
@@ -197,8 +231,65 @@ enum AfterSave {
     Welcome,
     OpenWelcome,
 }
+/// Owned system-face fonts; controls release their references before deletion.
+struct ShellFonts {
+    body: HFONT,
+    step: HFONT,
+    title: HFONT,
+    dpi: u32,
+}
+impl ShellFonts {
+    fn new(window: HWND) -> Result<Self> {
+        unsafe {
+            let dpi = GetDpiForWindow(window).max(96);
+            let mut metrics = NONCLIENTMETRICSW {
+                cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+                ..Default::default()
+            };
+            SystemParametersInfoForDpi(
+                SPI_GETNONCLIENTMETRICS.0,
+                metrics.cbSize,
+                Some((&mut metrics as *mut NONCLIENTMETRICSW).cast()),
+                0,
+                dpi,
+            )?;
+            let mut fonts = Self {
+                body: HFONT::default(),
+                step: HFONT::default(),
+                title: HFONT::default(),
+                dpi,
+            };
+            for (handle, points, weight) in [
+                (&mut fonts.body, 11, FW_NORMAL.0 as i32),
+                (&mut fonts.step, 11, FW_SEMIBOLD.0 as i32),
+                (&mut fonts.title, 20, FW_SEMIBOLD.0 as i32),
+            ] {
+                let mut description = metrics.lfMessageFont;
+                description.lfHeight = -(points * dpi as i32 / 72);
+                description.lfWeight = weight;
+                *handle = CreateFontIndirectW(&description);
+                ensure!(!handle.0.is_null(), "The system UI font is unavailable.");
+            }
+            Ok(fonts)
+        }
+    }
+}
+impl Drop for ShellFonts {
+    fn drop(&mut self) {
+        unsafe {
+            for font in [self.body, self.step, self.title] {
+                if !font.0.is_null() {
+                    let _ = DeleteObject(font.into());
+                }
+            }
+        }
+    }
+}
 struct Shell {
     window: HWND,
+    fonts: ShellFonts,
+    model_transfer: Value,
+    model_message: String,
     instance: HINSTANCE,
     controller: Controller,
     draft: SettingsDraft,
@@ -297,6 +388,9 @@ impl Shell {
             })));
             let mut s = Self {
                 window,
+                fonts: ShellFonts::new(window)?,
+                model_transfer: Value::Null,
+                model_message: String::new(),
                 instance,
                 controller,
                 draft,
@@ -351,6 +445,28 @@ impl Shell {
             s.chooser
                 .set_paint_reporter(Some(s.controller.paint_reporter()));
             s.build()?;
+            // Initial dimensions are logical pixels too. Keep the window inside
+            // the current work area; the setup content scrolls above its footer.
+            let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+            let mut monitor_info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
+                let work = monitor_info.rcWork;
+                let dpi = s.fonts.dpi as i32;
+                let width = (920 * dpi / 96).min(work.right - work.left);
+                let height = (760 * dpi / 96).min(work.bottom - work.top);
+                let _ = SetWindowPos(
+                    window,
+                    None,
+                    work.left + (work.right - work.left - width) / 2,
+                    work.top + (work.bottom - work.top - height) / 2,
+                    width,
+                    height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
             s.preview_ghost = Some(owned_preview::PreviewGhost::new(s.h(W_EDIT))?);
             s.new_rule();
             s.refresh_controls()?;
@@ -405,7 +521,7 @@ impl Shell {
             SendMessageW(
                 h,
                 WM_SETFONT,
-                Some(WPARAM(GetStockObject(DEFAULT_GUI_FONT).0 as usize)),
+                Some(WPARAM(self.fonts.body.0 as usize)),
                 Some(LPARAM(1)),
             );
             self.controls.push(Control {
@@ -823,8 +939,50 @@ impl Shell {
             yy += 38;
         }
         self.label(3,"Language quality depends on the selected model; there is no separate quality selector. Instructions append in order: language defaults, nonempty global text, app text, then exact-host text. Empty scoped text does not erase inherited instructions. Native spelling corrections are unavailable on Windows.",y[3]+10,80)?;
-        self.label(6, "", 100, 180)?;
-        self.control(W_TEXT, 6, "STATIC", "", WINDOW_STYLE(0), 32, 100, 790, 180)?;
+        self.control(
+            W_STEP,
+            6,
+            "STATIC",
+            "",
+            WINDOW_STYLE(SS_NOPREFIX.0),
+            32,
+            28,
+            790,
+            24,
+        )?;
+        self.control(
+            W_TITLE,
+            6,
+            "STATIC",
+            "",
+            WINDOW_STYLE(SS_NOPREFIX.0),
+            32,
+            60,
+            790,
+            40,
+        )?;
+        self.control(
+            W_TEXT,
+            6,
+            "STATIC",
+            "",
+            WINDOW_STYLE(SS_NOPREFIX.0),
+            32,
+            116,
+            790,
+            100,
+        )?;
+        self.control(
+            W_MODEL_STATUS,
+            6,
+            "STATIC",
+            "",
+            WINDOW_STYLE(SS_NOPREFIX.0),
+            32,
+            432,
+            790,
+            60,
+        )?;
         self.combo(
             W_LANGUAGE,
             6,
@@ -868,10 +1026,11 @@ impl Shell {
             750,
             64,
         )?;
-        self.button(W_WORD, 6, "Accept next word in owned preview", 562)?;
-        self.button(W_ALL, 6, "Accept full owned preview", 600)?;
+        self.button(W_WORD, 6, "Accept next &word", 562)?;
+        self.button(W_ALL, 6, "Accept &full suggestion", 600)?;
         self.button(W_BACK, 6, "&Back", 650)?;
         self.button(W_NEXT, 6, "&Continue", 688)?;
+        self.apply_fonts();
         Ok(())
     }
     fn h(&self, id: usize) -> HWND {
@@ -881,10 +1040,209 @@ impl Shell {
             .map(|c| c.hwnd)
             .unwrap_or_default()
     }
+    fn apply_fonts(&self) {
+        for control in &self.controls {
+            let font = match control.id {
+                W_TITLE => self.fonts.title,
+                W_STEP => self.fonts.step,
+                _ => self.fonts.body,
+            };
+            unsafe {
+                SendMessageW(
+                    control.hwnd,
+                    WM_SETFONT,
+                    Some(WPARAM(font.0 as usize)),
+                    Some(LPARAM(1)),
+                );
+            }
+        }
+    }
+    fn refresh_fonts(&mut self) -> Result<()> {
+        // Keep old fonts until every control has adopted its replacement.
+        let fonts = ShellFonts::new(self.window)?;
+        let old = std::mem::replace(&mut self.fonts, fonts);
+        self.apply_fonts();
+        drop(old);
+        Ok(())
+    }
+    fn layout_welcome(&mut self, client: RECT) {
+        let dpi = self.fonts.dpi as i32;
+        let px = |value: i32| value * dpi / 96;
+        let width = client.right * 96 / dpi;
+        let height = client.bottom * 96 / dpi;
+        let content = (width - 64).clamp(200, 800);
+        let left = (width - content) / 2;
+        let footer = height - 72;
+        let step = self.welcome.as_ref().unwrap().step;
+        let bottom = match step {
+            2 => 344,
+            3 => 624,
+            4 => 526,
+            _ => 216,
+        };
+        let max_scroll = (bottom + 16 - footer).max(0);
+        self.scroll = self.scroll.clamp(0, max_scroll);
+        let column = (content - 12) / 2;
+        for c in &self.controls {
+            let mut visible = true;
+            let (mut x, mut y, mut w, mut h) = (left, 0, content, 32);
+            let scrolling = match c.id {
+                W_STEP => {
+                    y = 28;
+                    h = 24;
+                    false
+                }
+                W_TITLE => {
+                    y = 60;
+                    h = 42;
+                    false
+                }
+                W_TEXT => {
+                    y = 116;
+                    h = 100;
+                    false
+                }
+                W_BACK => {
+                    y = height - 52;
+                    w = 112;
+                    visible = step > 0;
+                    false
+                }
+                W_NEXT => {
+                    y = height - 52;
+                    x = left + content - 152;
+                    w = 152;
+                    false
+                }
+                QUIT => {
+                    y = height - 52;
+                    x = left + (content - 180) / 2;
+                    w = 180;
+                    false
+                }
+                88 => {
+                    y = 236;
+                    h = 48;
+                    visible = step == 2;
+                    true
+                }
+                PERMISSIONS => {
+                    y = 300;
+                    w = 260;
+                    visible = step == 2;
+                    true
+                }
+                MODEL_LIST => {
+                    y = 228;
+                    h = 300;
+                    visible = step == 3;
+                    true
+                }
+                DIAGNOSTICS => {
+                    y = 276;
+                    h = 112;
+                    visible = step == 3;
+                    true
+                }
+                MODEL_PROGRESS => {
+                    y = 400;
+                    h = 20;
+                    visible = step == 3;
+                    true
+                }
+                W_MODEL_STATUS => {
+                    y = 432;
+                    h = 60;
+                    visible = step == 3;
+                    true
+                }
+                MODEL_SELECT | MODEL_DOWNLOAD | MODEL_IMPORT | MODEL_CANCEL | MODEL_LICENSE => {
+                    visible = step == 3;
+                    let (row, right) = match c.id {
+                        MODEL_SELECT => (0, false),
+                        MODEL_DOWNLOAD => (0, true),
+                        MODEL_IMPORT => (1, false),
+                        MODEL_LICENSE => (1, true),
+                        _ => (2, false),
+                    };
+                    y = 504 + row * 44;
+                    w = column;
+                    if right {
+                        x += column + 12;
+                    }
+                    true
+                }
+                W_LANGUAGE => {
+                    y = 228;
+                    h = 200;
+                    visible = step == 4;
+                    true
+                }
+                W_EDIT => {
+                    y = 276;
+                    h = 112;
+                    visible = step == 4;
+                    true
+                }
+                W_SUGGESTION => {
+                    y = 400;
+                    h = 68;
+                    visible = step == 4;
+                    true
+                }
+                W_WORD | W_ALL => {
+                    y = 484;
+                    w = column;
+                    visible = step == 4;
+                    if c.id == W_ALL {
+                        x += column + 12;
+                    }
+                    true
+                }
+                _ => {
+                    visible = false;
+                    false
+                }
+            };
+            if scrolling {
+                y -= self.scroll;
+                let painted_height = if [MODEL_LIST, W_LANGUAGE].contains(&c.id) {
+                    32
+                } else {
+                    h
+                };
+                visible &= y >= 224 && y + painted_height <= footer;
+            }
+            unsafe {
+                let _ = SetWindowPos(
+                    c.hwnd,
+                    None,
+                    px(x),
+                    px(y),
+                    px(w),
+                    px(h),
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                let _ = ShowWindow(c.hwnd, if visible { SW_SHOW } else { SW_HIDE });
+            }
+        }
+        unsafe {
+            SetScrollRange(self.window, SB_VERT, 0, max_scroll, false);
+            SetScrollPos(self.window, SB_VERT, self.scroll, true);
+        }
+    }
     fn layout(&mut self) {
         unsafe {
             let mut r = RECT::default();
             let _ = GetClientRect(self.window, &mut r);
+            if self.welcome.is_some() {
+                self.layout_welcome(r);
+                return;
+            }
+            let dpi = self.fonts.dpi as i32;
+            let px = |value: i32| value * dpi / 96;
+            r.right = r.right * 96 / dpi;
+            r.bottom = r.bottom * 96 / dpi;
             let height = (r.bottom - 100).max(220);
             let width = (r.right - 64).max(200);
             let active = self.welcome.as_ref().map_or(self.pane, |_| 6);
@@ -941,66 +1299,18 @@ impl Shell {
                         base_max + 20 - self.scroll
                     };
                 }
-                if let Some(welcome) = &self.welcome {
-                    let step = welcome.step;
-                    if [W_EDIT, W_SUGGESTION, W_WORD, W_ALL, W_LANGUAGE].contains(&c.id) {
-                        visible = step == 4;
-                    }
-                    if c.id == 88 {
-                        visible = step == 2;
-                    }
-                    if c.id == PERMISSIONS {
-                        visible = step == 2;
-                        y = 380 - self.scroll;
-                    }
-                    if [
-                        MODEL_LIST,
-                        MODEL_SELECT,
-                        MODEL_DOWNLOAD,
-                        MODEL_CANCEL,
-                        MODEL_IMPORT,
-                        MODEL_LICENSE,
-                        DIAGNOSTICS,
-                        MODEL_PROGRESS,
-                    ]
-                    .contains(&c.id)
-                    {
-                        visible = step == 3;
-                        y = match c.id {
-                            MODEL_LIST => 300,
-                            DIAGNOSTICS => 350,
-                            MODEL_PROGRESS => 434,
-                            MODEL_SELECT => 460,
-                            MODEL_DOWNLOAD => 498,
-                            MODEL_CANCEL => 536,
-                            MODEL_IMPORT => 574,
-                            _ => 612,
-                        } - self.scroll;
-                    }
-                    if c.id == W_BACK {
-                        y = r.bottom - 50;
-                        x = 32;
-                        w = 135;
-                    }
-                    if c.pane == 6 && c.id == 0 {
-                        visible = false;
-                    }
-                    if c.id == QUIT {
-                        visible = true;
-                        x = (r.right / 2 - 90).max(180);
-                        w = 180;
-                        y = r.bottom - 50;
-                    }
-                    if c.id == W_NEXT {
-                        y = r.bottom - 50;
-                        x = r.right - 200;
-                        w = 168;
-                    }
-                }
                 if visible && c.pane != usize::MAX && c.id != W_BACK && c.id != W_NEXT {
                     visible = y >= 86 && y < r.bottom - 60;
                 }
-                let _ = SetWindowPos(c.hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+                let _ = SetWindowPos(
+                    c.hwnd,
+                    None,
+                    px(x),
+                    px(y),
+                    px(w),
+                    px(h),
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
                 let _ = ShowWindow(c.hwnd, if visible { SW_SHOW } else { SW_HIDE });
             }
             SetScrollRange(self.window, SB_VERT, 0, (max - height).max(0), false);
@@ -1113,6 +1423,7 @@ impl Shell {
         }
         self.refresh_effective_scope();
         self.refresh_rules();
+        self.update_model_actions();
         set_selection(self.h(ROOT_PANE), self.pane);
         self.loading = false;
         self.layout();
@@ -1252,13 +1563,15 @@ impl Shell {
                         self.draft_generation,
                     )?;
                     if let (Some(id), Some(w)) = (op.welcome_model, &mut self.welcome) {
-                        if w.selected == id
-                            && !self
-                                .operations
-                                .iter()
-                                .any(|pending| pending.welcome_model.is_some())
+                        if !self
+                            .operations
+                            .iter()
+                            .any(|pending| pending.welcome_model.is_some())
                         {
-                            w.ready = id;
+                            w.saved_model(&id, &config);
+                            if !w.ready.is_empty() && w.selected == w.ready {
+                                self.model_message = "Ready — your selected model is verified and saved. Continue to Try it.".into();
+                            }
                         }
                     }
                     self.last_config = config;
@@ -1289,7 +1602,7 @@ impl Shell {
                         self.after_save = None;
                     }
                     self.refresh_controls()?;
-                    let message = match outcome {
+                    let message = match &outcome {
                         ConfigApplyReceipt::Failed { stage, message } => format!(
                             "Settings/model operation failed at {stage:?}: {message}. Your edits remain available."
                         ),
@@ -1302,9 +1615,12 @@ impl Shell {
                         _ => "Operation stopped. Your edits remain available.".into(),
                     };
                     set_text(self.h(DIAGNOSTICS), &message);
-                    if self.welcome.is_some() {
-                        set_text(self.h(W_TEXT), &message);
-                    }
+                    self.model_message = match outcome {
+                        ConfigApplyReceipt::Cancelled => "Cancelled. Select a model to verify and save it before continuing.",
+                        ConfigApplyReceipt::Superseded => "Selection superseded. Select the model you want to use.",
+                        _ => "Not ready — verification or saving failed. Review the details above, then select a model to retry.",
+                    }.into();
+                    self.welcome_text();
                     set_text(self.h(RESULTS), &message);
                     if matching {
                         self.error(message);
@@ -1668,9 +1984,26 @@ impl Shell {
         );
         Ok(())
     }
+    fn update_model_actions(&self) {
+        let installed = self.selected_model().is_ok_and(|m| m["installed"] == true);
+        let busy = !self.operations.is_empty();
+        let transfer = self.model_transfer["state"] == "downloading";
+        for (id, enabled) in [
+            (MODEL_SELECT, installed && !busy && !transfer),
+            (MODEL_DOWNLOAD, !busy && !transfer),
+            (MODEL_IMPORT, !busy && !transfer),
+            (MODEL_CANCEL, busy || transfer),
+        ] {
+            unsafe {
+                let _ = EnableWindow(self.h(id), enabled);
+            }
+        }
+    }
     fn selected_model(&self) -> Result<Value> {
-        self.models
-            .get(selection(self.h(MODEL_LIST)))
+        let index = unsafe { SendMessageW(self.h(MODEL_LIST), CB_GETCURSEL, None, None).0 };
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| self.models.get(index))
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Choose a catalog model."))
     }
@@ -1683,10 +2016,21 @@ impl Shell {
             .as_str()
             .unwrap_or("continuation")
             .to_owned();
+        self.select_catalog_model(id, path, prompt_style)
+    }
+    fn select_catalog_model(
+        &mut self,
+        id: String,
+        path: String,
+        prompt_style: String,
+    ) -> Result<()> {
         if let Some(w) = &mut self.welcome {
             w.select(id.clone());
             w.ready.clear();
         }
+        self.model_message =
+            "Verifying and saving your selected model… Continue will be available after success."
+                .into();
         let pending = self
             .controller
             .select_model(path, prompt_style, Some(id.clone()))?;
@@ -1714,8 +2058,19 @@ impl Shell {
                 ),
             );
         ensure!(accept, "License was not accepted.");
+        let id = m["id"].as_str().unwrap_or("").to_owned();
+        if let Some(w) = &mut self.welcome {
+            w.begin_download(id.clone());
+        }
+        self.model_message =
+            "Starting download… The model will be verified before Continue is enabled.".into();
+        self.model_transfer =
+            json!({"id":id,"state":"downloading","received":0,"total":m["size_bytes"]});
+        progress(self.h(MODEL_PROGRESS), &self.model_transfer);
+        self.welcome_text();
+        self.update_model_actions();
         self.controller.send(Command::DownloadModel {
-            id: m["id"].as_str().unwrap_or("").into(),
+            id,
             accept_license: accept,
         })
     }
@@ -1731,6 +2086,16 @@ impl Shell {
             w.select(path.clone());
             w.ready.clear();
         }
+        unsafe {
+            SendMessageW(
+                self.h(MODEL_LIST),
+                CB_SETCURSEL,
+                Some(WPARAM(usize::MAX)),
+                None,
+            );
+        }
+        self.model_details();
+        self.model_message = "Verifying and saving your imported GGUF…".into();
         let prompt_style = self.controller.config().prompt_style;
         let pending = self
             .controller
@@ -1748,6 +2113,33 @@ impl Shell {
     }
     fn model_details(&mut self) {
         if let Ok(m) = self.selected_model() {
+            if self.welcome.is_some() {
+                let minimum = crate::models::ram_label(
+                    m["minimum_memory_bytes"]
+                        .as_u64()
+                        .filter(|bytes| *bytes > 0),
+                    "Unspecified",
+                );
+                set_text(
+                    self.h(DIAGNOSTICS),
+                    &format!(
+                        "{}\r\n{} bytes · {} · {}\r\nMinimum physical RAM: {} — not measured usage or a fit guarantee.\r\n{}",
+                        m["description"].as_str().unwrap_or("Local GGUF model"),
+                        m["size_bytes"],
+                        if m["installed"] == true {
+                            "Installed"
+                        } else {
+                            "Not installed"
+                        },
+                        m["license_name"].as_str().unwrap_or("See model license"),
+                        minimum,
+                        m["availability"]
+                            .as_str()
+                            .unwrap_or("Selection is verified before saving."),
+                    ),
+                );
+                return;
+            }
             set_text(
                 self.h(DIAGNOSTICS),
                 &format!(
@@ -1774,6 +2166,17 @@ impl Shell {
                         "Unavailable",
                     ),
                     m["prompt_style"].as_str().unwrap_or("Unavailable"),
+                ),
+            );
+        } else if let Some(w) = &self.welcome {
+            let name = std::path::Path::new(&w.selected)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Imported model");
+            set_text(
+                self.h(DIAGNOSTICS),
+                &format!(
+                    "User-owned GGUF: {name}\r\nYour original file is referenced, not copied.\r\nCatalog license and minimum-RAM metadata are unavailable for imports."
                 ),
             );
         }
@@ -1938,9 +2341,23 @@ impl Shell {
             let w = self.welcome.as_mut().unwrap();
             w.selected = id.clone();
             if ready {
-                w.ready = id;
+                w.ready = id.clone();
             }
         }
+        self.model_message.clear();
+        if let Some(index) = self
+            .models
+            .iter()
+            .position(|m| m["id"].as_str() == Some(id.as_str()))
+        {
+            set_selection(self.h(MODEL_LIST), index);
+        }
+        self.model_details();
+        set_text(self.h(MODEL_SELECT), "Use &installed model");
+        set_text(self.h(MODEL_DOWNLOAD), "&Download model");
+        set_text(self.h(MODEL_IMPORT), "&Import GGUF…");
+        set_text(self.h(MODEL_LICENSE), "Read model &license…");
+        set_text(self.h(MODEL_CANCEL), "Cancel model operation");
         self.scroll = 0;
         self.show();
         self.welcome_text();
@@ -1948,40 +2365,58 @@ impl Shell {
     }
     fn welcome_text(&mut self) {
         let Some(w) = &self.welcome else { return };
-        let titles = [
-            "1 of 6 — Welcome to BroTypist\r\nLocal typing assistance, not a writing editor. No account or cloud subscription. Predictions stay on your computer. Existing user documents are never used as this preview.",
-            "2 of 6 — How it works\r\nEligible text before your cursor → selected local model → grey same-line suggestion. Protected controls, selections, IME composition and unverified geometry remain unchanged. Your Word shortcut accepts a word; your All shortcut accepts the full visible completion. Customize shortcuts in Autocomplete.",
-            "3 of 6 — Review system access\r\nWindows uses native UI Automation/Edit controls and a paired keyboard hook. Website URLs are unavailable. A settings page opening is not proof of access. No permission or registration is granted by continuing. Explicitly review these limitations below.",
-            "4 of 6 — Choose your local model\r\nSelect an installed catalog model, explicitly accept and download its license, or import your own GGUF. Continue is tied to that selected model, never another model's readiness. Local server availability is checked by Try it.",
-            "5 of 6 — Try your selected model\r\nType in this owned ephemeral field. Predictions use only this field and your pending model, never clipboard, window, screenshot or history context. Acceptance is counted here only after exact widget readback. Use your configured Word and All shortcuts, or the explicit acceptance buttons.",
-            "6 of 6 — Ready when you are\r\nClose Settings keeps BroTypist resident only when the tray is available. The tray opens Settings, pause and actual Quit. Review Privacy for independent context and encrypted learning consent. Completing Welcome saves your selected draft, not preview text.",
+        let pages = [
+            (
+                "Welcome to BroTypist",
+                "Local typing assistance, right where you write.\r\n\r\nNo account or cloud subscription. Predictions stay on your computer. This setup uses only an owned preview field, never your existing documents.",
+            ),
+            (
+                "A suggestion, not a rewrite",
+                "Eligible text before your cursor → your local model → a grey same-line suggestion.\r\n\r\nAccept the next word or the full visible completion. Protected fields, selections, text composition and unverified geometry remain unchanged.",
+            ),
+            (
+                "Review system access",
+                "Windows uses native UI Automation/Edit controls and a paired keyboard hook. Website URLs are unavailable.\r\n\r\nContinuing does not grant permissions or register anything. Review these limitations before moving on.",
+            ),
+            (
+                "Choose your local model",
+                "Choose an installed model, download one after reviewing its license, or import your own GGUF.\r\n\r\nDownloads are verified and the selection is saved before Continue becomes available. Local-server availability is checked in Try it.",
+            ),
+            (
+                "Try your selected model",
+                "Write in the temporary field below. Only this field and your selected model are used — never clipboard, other windows, screenshots or history.\r\n\r\nAccept a word or the full visible suggestion with the buttons or your configured shortcuts.",
+            ),
+            (
+                "Ready when you are",
+                "Finish saves your settings, not the preview text.\r\n\r\nThe tray opens Settings, Pause and Quit. Closing Settings keeps BroTypist resident only when the tray is available. Review Privacy for independent context and encrypted-learning choices.",
+            ),
         ];
-        let text = if w.step == 3 {
-            format!(
-                "{}\r\n\r\nPending selected model: {}",
-                titles[w.step],
-                if w.selected.is_empty() {
-                    "None"
-                } else {
-                    &w.selected
-                }
-            )
-        } else if w.step == 4 {
-            let shortcuts = self.draft.value("shortcuts");
-            format!(
-                "{}\r\nWord: {} · All: {}",
-                titles[w.step],
-                shortcuts
-                    .and_then(|v| v["word"].as_str())
-                    .unwrap_or("Not assigned"),
-                shortcuts
-                    .and_then(|v| v["all"].as_str())
-                    .unwrap_or("Not assigned")
-            )
+        set_text(self.h(W_STEP), &format!("SETUP  ·  {} OF 6", w.step + 1));
+        set_text(self.h(W_TITLE), pages[w.step].0);
+        set_text(self.h(W_TEXT), pages[w.step].1);
+        let selected = self
+            .models
+            .iter()
+            .find(|model| model["id"] == w.selected)
+            .and_then(|model| model["label"].as_str())
+            .or_else(|| {
+                std::path::Path::new(&w.selected)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+            })
+            .filter(|name| !name.is_empty())
+            .unwrap_or("No model selected");
+        let status = if !self.model_message.is_empty() {
+            self.model_message.clone()
+        } else if w.selected == w.ready && !w.ready.is_empty() {
+            "Selected model ready. Continue to Try it.".into()
         } else {
-            titles[w.step].into()
+            "Choose Use installed model, Download, or Import GGUF to continue.".into()
         };
-        set_text(self.h(W_TEXT), &text);
+        set_text(
+            self.h(W_MODEL_STATUS),
+            &format!("Selected: {selected}\r\n{status}"),
+        );
         unsafe {
             let _ = EnableWindow(self.h(W_BACK), w.step > 0);
             let _ = EnableWindow(self.h(W_NEXT), w.can_continue());
@@ -1994,6 +2429,7 @@ impl Shell {
                 "Continue"
             },
         );
+        self.update_model_actions();
         self.layout();
     }
     fn next_welcome(&mut self, back: bool) -> Result<()> {
@@ -2193,10 +2629,19 @@ impl Shell {
             MODEL_LIST if notification==CBN_SELCHANGE as u16=>{
                 let selected=self.models.get(selection(self.h(MODEL_LIST))).and_then(|m|m["id"].as_str()).map(str::to_owned);
                 if let (Some(w),Some(id))=(&mut self.welcome,selected){w.select(id);}
-                self.model_details();self.welcome_text();
+                self.model_message.clear();
+                self.model_details();self.welcome_text();self.update_model_actions();
             },
             88=>{let reviewed=is_checked(self.h(88));if let Some(w)=&mut self.welcome{w.access_reviewed=reviewed;}self.welcome_text();},
-            MODEL_SELECT=>self.use_model()?,MODEL_DOWNLOAD=>self.download()?,MODEL_CANCEL=>{self.cancel_operations()?;self.controller.send(Command::CancelDownload)?;},MODEL_IMPORT=>self.import()?,MODEL_REVEAL=>crate::system::reveal_models()?,MODEL_LICENSE=>{let m=self.selected_model()?;open_url(m["license_url"].as_str().unwrap_or(""))?;},
+            MODEL_SELECT=>self.use_model()?,MODEL_DOWNLOAD=>self.download()?,
+            MODEL_CANCEL=>{
+                if let Some(w)=&mut self.welcome{w.downloading=None;w.ready.clear();}
+                self.cancel_operations()?;
+                self.controller.send(Command::CancelDownload)?;
+                self.model_message="Cancelling… Continue stays unavailable until a selected model is verified and saved.".into();
+                self.welcome_text();
+            },
+            MODEL_IMPORT=>self.import()?,MODEL_REVEAL=>crate::system::reveal_models()?,MODEL_LICENSE=>{let m=self.selected_model()?;open_url(m["license_url"].as_str().unwrap_or(""))?;},
             RULE_LIST if notification==LBN_SELCHANGE as u16=>self.load_rule()?,
             RULE_NEW=>{if self.resolve_rule_editor()?{self.new_rule();}},
             RULE_APPLY=>self.apply_rule()?,
@@ -2307,28 +2752,107 @@ impl Shell {
                         );
                     }
                 }
-                set_selection(
-                    self.h(MODEL_LIST),
-                    old.and_then(|id| self.models.iter().position(|m| m["id"] == id))
-                        .unwrap_or(0),
-                );
+                let wanted = self
+                    .welcome
+                    .as_ref()
+                    .map(|w| w.selected.clone())
+                    .filter(|id| !id.is_empty())
+                    .or(old)
+                    .unwrap_or_else(|| self.controller.config().model_id);
+                if let Some(index) = self.models.iter().position(|m| m["id"] == wanted) {
+                    set_selection(self.h(MODEL_LIST), index);
+                } else if self
+                    .welcome
+                    .as_ref()
+                    .is_some_and(|w| !w.selected.is_empty())
+                {
+                    // An imported model has no catalog row. Do not display a
+                    // different model as though it were the pending selection.
+                    unsafe {
+                        SendMessageW(
+                            self.h(MODEL_LIST),
+                            CB_SETCURSEL,
+                            Some(WPARAM(usize::MAX)),
+                            None,
+                        );
+                    }
+                } else if !self.models.is_empty() {
+                    let recommended =
+                        crate::models::recommended_preset(crate::models::physical_memory_bytes());
+                    let index = self
+                        .models
+                        .iter()
+                        .position(|m| m["id"] == recommended.id)
+                        .unwrap_or(0);
+                    set_selection(self.h(MODEL_LIST), index);
+                    if let Some(w) = &mut self.welcome {
+                        w.select(self.models[index]["id"].as_str().unwrap_or("").into());
+                    }
+                }
                 self.model_details();
+                self.welcome_text();
+                self.update_model_actions();
             }
             "download" => {
-                set_text(
-                    self.h(DIAGNOSTICS),
-                    &format!(
-                        "{}: {} / {} bytes\r\n{}",
-                        event["state"].as_str().unwrap_or(""),
-                        event["received"],
-                        event["total"],
-                        event["error"].as_str().unwrap_or("")
-                    ),
-                );
+                self.model_transfer = event.clone();
                 progress(self.h(MODEL_PROGRESS), &event);
-                if event["state"] == "complete" {
-                    self.controller.send(Command::Models)?;
+                let id = event["id"].as_str().unwrap_or("");
+                let state = event["state"].as_str().unwrap_or("");
+                match state {
+                    "downloading" => {
+                        let received = event["received"].as_u64().unwrap_or(0);
+                        let total = event["total"].as_u64().unwrap_or(0);
+                        self.model_message = format!(
+                            "Downloading: {:.1} / {:.1} MiB. Continue waits for verification and saving.",
+                            received as f64 / 1_048_576.0,
+                            total as f64 / 1_048_576.0
+                        );
+                    }
+                    "complete" => {
+                        self.controller.send(Command::Models)?;
+                        let select = self
+                            .welcome
+                            .as_mut()
+                            .is_some_and(|w| w.completed_download(id));
+                        if select {
+                            let path = event["path"].as_str().unwrap_or("").to_owned();
+                            let preset = crate::models::get_preset(id)?;
+                            // Transfer completion is never readiness: use the
+                            // same integrity/preparation/persistence transaction
+                            // as an explicit installed-model selection.
+                            if let Err(error) = self.select_catalog_model(
+                                id.into(),
+                                path,
+                                preset.prompt_style.clone(),
+                            ) {
+                                set_text(
+                                    self.h(DIAGNOSTICS),
+                                    &format!("Model selection failed: {error}"),
+                                );
+                                self.model_message = "Not ready — model selection failed. Review the details above and retry.".into();
+                            }
+                        } else {
+                            self.model_message = "Download complete. Use the selected installed model to verify and save it.".into();
+                        }
+                    }
+                    "error" | "cancelled" => {
+                        if let Some(w) = &mut self.welcome {
+                            if w.downloading.as_deref() == Some(id) {
+                                w.downloading = None;
+                            }
+                        }
+                        self.model_message = event["error"]
+                            .as_str()
+                            .unwrap_or("Download stopped.")
+                            .into();
+                    }
+                    _ => {}
                 }
+                if self.welcome.is_none() {
+                    set_text(self.h(DIAGNOSTICS), &self.model_message);
+                }
+                self.welcome_text();
+                self.update_model_actions();
             }
             "history_counts" | "statistics" | "history_info" => {
                 set_text(self.h(RESULTS), &human_report(&event["result"]))
@@ -2707,6 +3231,7 @@ fn dispatch_event(shell: &mut Shell, event: Event) -> Result<bool> {
         Event::Display => {
             shell.disarm();
             shell.accessory.hide();
+            shell.refresh_fonts()?;
             shell.layout();
         }
         Event::Accessory => shell.field_menu()?,
