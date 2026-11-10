@@ -22,7 +22,7 @@ $metadata = [ordered]@{
     private_tree_cleanup_verified = $false; alternate_credentials = $true
     interactive_station_acl_modified = $false; station_access_restoration_verified = $false
     input_desktop_restoration_verified = $false; private_desktop_cleanup_verified = $false
-    station_user_access_mask = '0x00020337'; desktop_user_access_mask = '0x000f01ff'
+    station_user_access_mask = '0x0002037f'; desktop_user_access_mask = '0x000f01ff'
     station_acl_mutation_attempted = $false; private_desktop_creation_attempted = $false
     private_desktop_created = $false; input_desktop_activation_attempted = $false; input_desktop_activated = $false
     owned_interactive_desktop_verified = $false
@@ -75,7 +75,9 @@ using System.Security.Principal;
 // Win32 offers no ACL compare-and-swap. A changed snapshot is refused, and
 // every write is read back; this lease is only for a disposable isolated runner.
 public sealed class BroTypistWindowStationAccess {
-    public const int UserAccessMask=0x20337;
+    // READ_CONTROL | WINSTA_ALL_ACCESS: documented operational read/write/execute
+    // rights, without DELETE, WRITE_DAC or WRITE_OWNER on the shared station.
+    public const int UserAccessMask=0x2037f;
     readonly IntPtr station;
     readonly RawSecurityDescriptor original,granted;
     bool applicationAttempted,restorationAttempted;

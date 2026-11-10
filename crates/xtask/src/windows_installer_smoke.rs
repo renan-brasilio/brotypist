@@ -776,7 +776,7 @@ public sealed class PrivateStationAclFixture : IDisposable {
             if(common!=null && common.SecurityIdentifier.Value==Target) {
                 targets++;
                 if(common.AceQualifier!=AceQualifier.AccessAllowed || common.AceFlags!=AceFlags.None ||
-                    common.IsCallback || common.AccessMask!=0x20337)
+                    common.IsCallback || common.AccessMask!=0x2037f)
                     throw new InvalidOperationException("Grant is not the exact noninheriting station access ACE");
             } else {
                 if(originalIndex>=before.DiscretionaryAcl.Count ||
