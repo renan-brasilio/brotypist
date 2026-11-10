@@ -5,7 +5,12 @@ was redacted with maintainer approval; unchanged native downloads retain their
 original signed provenance, not the source identity of rewritten tags. Legacy
 Python-era downloads were withdrawn; their release pages remain historical records.
 
-## Unreleased
+## 0.6.1 — Native verification and Welcome ownership
+
+macOS Apple Silicon patch release from merged PR #5. Native CI passes on all
+three platforms; Windows and Linux distribution remain alpha. The macOS
+change separates smoke model readiness from generation deadlines; it does
+not change production inference policy or claim a prediction speed improvement.
 
 - Replace the Windows installer's synthetic restricted-administrator CI client with an explicitly approved disposable standard-user logon, private profile and private desktop. Keep canonical package hashes and the native per-user context assertions unchanged; require actual child-token validation, quiescence, uninstall and account/profile cleanup evidence. This fixture is not shipped with the application and never creates accounts on a normal workstation.
 - Verify installer identity inside the authenticated standard-user core before MSI work, including its actual primary token and each `msiexec` token; do not require supervisor debug privilege for cross-account token inspection. Publish bounded failed client receipts and exit nonzero on unresolved ownership instead of hanging; never claim cleanup or restore/delete unverified resources, which remain for disposable VM teardown.
