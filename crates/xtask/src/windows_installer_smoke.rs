@@ -153,10 +153,23 @@ fn execute(bundle: &Path, assets: &Path, output: &Path, receipt: &mut Value) -> 
         .arg(&*external_tool_path(&input))
         .arg("-Work")
         .arg(&*external_tool_path(&work))
+        .arg("-ReportDirectory")
+        .arg(&*external_tool_path(output))
         .stdin(std::process::Stdio::null())
         .status()
         .context("cannot invoke owned native installer probe")?;
-    let client_path = work.join("client-observations.json");
+    retain_native_evidence(&work, output, status.success(), receipt)?;
+    receipt["stage"] = json!("completed_core_scope_only");
+    Ok(())
+}
+
+fn retain_native_evidence(
+    work: &Path,
+    output: &Path,
+    client_succeeded: bool,
+    receipt: &mut Value,
+) -> Result<()> {
+    let client_path = output.join("client-observations.json");
     regular(&client_path)
         .context("shared standard-user client did not produce lifecycle evidence")?;
     ensure!(
@@ -165,6 +178,12 @@ fn execute(bundle: &Path, assets: &Path, output: &Path, receipt: &mut Value) -> 
     );
     let client: Value = serde_json::from_slice(&fs::read(client_path)?)?;
     receipt["standard_user_client"] = client.clone();
+    // The public supervisor receipt is safe to retain even if the child never
+    // exits. Do not inspect or promote private native output without quiescence.
+    ensure!(
+        client["quiescence_verified"] == true,
+        "standard-user client quiescence is unverified; private evidence retained on disposable host"
+    );
     let observed_path = work.join("observations.json");
     regular(&observed_path).context("native installer probe did not produce evidence")?;
     ensure!(
@@ -191,9 +210,8 @@ fn execute(bundle: &Path, assets: &Path, output: &Path, receipt: &mut Value) -> 
             json_new(&output.join(format!("{name}.json")), &worker_observed)?;
         }
     }
-    ensure!(status.success(), "native installer client failed");
+    ensure!(client_succeeded, "native installer client failed");
     validate_native_evidence(&client, &observed)?;
-    receipt["stage"] = json!("completed_core_scope_only");
     Ok(())
 }
 
@@ -352,6 +370,208 @@ fn verify_zip(path: &Path, rows: &[Row]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_public_client_receipt_survives_missing_or_unreadable_core() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("reports");
+        let work = temp.path().join("private");
+        fs::create_dir(&output).unwrap();
+        fs::create_dir(&work).unwrap();
+        let client_path = output.join("client-observations.json");
+        let mut client = json!({
+            "passed": false, "genuine_standard_user": false,
+            "account_cleanup_verified": false, "profile_cleanup_verified": false,
+            "restoration_verified": false, "quiescence_verified": false,
+            "failure": "native_lifecycle_unresolved"
+        });
+        for quiescence in [json!(false), Value::Null, json!("true"), json!(true)] {
+            client["quiescence_verified"] = quiescence;
+            fs::write(&client_path, serde_json::to_vec(&client).unwrap()).unwrap();
+            let mut receipt = json!({"passed": false});
+            assert!(retain_native_evidence(&work, &output, false, &mut receipt).is_err());
+            assert_eq!(receipt["standard_user_client"], client);
+            assert_eq!(receipt["passed"], false);
+            assert!(receipt.get("observations").is_none());
+            assert!(work.is_dir());
+        }
+        // Even an existing private report must not be read or promoted when the
+        // supervisor cannot establish process/MSI quiescence.
+        fs::write(work.join("observations.json"), b"not safe to read").unwrap();
+        client["quiescence_verified"] = json!(false);
+        fs::write(&client_path, serde_json::to_vec(&client).unwrap()).unwrap();
+        let mut receipt = json!({"passed": false});
+        assert!(retain_native_evidence(&work, &output, false, &mut receipt).is_err());
+        assert_eq!(receipt["standard_user_client"], client);
+        assert_eq!(
+            fs::read(work.join("observations.json")).unwrap(),
+            b"not safe to read"
+        );
+        let mut artifacts = fs::read_dir(&output).unwrap();
+        assert_eq!(
+            artifacts.next().unwrap().unwrap().file_name(),
+            "client-observations.json"
+        );
+        assert!(artifacts.next().is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unresolved_client_exits_and_retains_public_failure_without_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let reports = temp.path().join("reports");
+        let private = temp.path().join("private");
+        fs::create_dir(&reports).unwrap();
+        fs::create_dir(&private).unwrap();
+        for name in ["policy", "account", "profile", "tree"] {
+            fs::write(private.join(name), b"must remain unresolved").unwrap();
+        }
+        let script = temp.path().join("unresolved-client-fixture.ps1");
+        // Extract only the public failure/receipt seam. Never execute launcher
+        // preflight, native initialization, account creation, policy or MSI APIs.
+        fs::write(
+            &script,
+            r#"
+param([string]$Source, [string]$ReportDirectory, [string]$Work)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($Source, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'Client syntax errors' }
+foreach ($name in @('Require', 'Write-NewJson', 'Save-ClientReceipt', 'Stop-OwnedVm')) {
+    $definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name }, $true)
+    if ($null -eq $definition) { throw "Missing failure guard: $name" }
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$reportDirectoryValidated = $true
+$metadata = [ordered]@{
+    schema = 1; passed = $false; classification = 'failed'; teardown_required = $false
+    stage = 'fixture_unresolved'; failure = $null; cleanup_failure = $null
+    genuine_standard_user = $false; account_cleanup_verified = $false
+    profile_cleanup_verified = $false; restoration_verified = $false
+    quiescence_verified = $false; uninstall_verified = $false
+    diagnostics = [Collections.Generic.List[string]]::new()
+}
+try { Stop-OwnedVm 'Fixture: process/MSI quiescence is unresolved' } catch {
+    [Console]::Error.WriteLine('Failure boundary threw instead of exiting with its public receipt')
+    exit 2
+}
+# These are inert file stand-ins, not actual policy/accounts/profiles. A return
+# from the fail-fast boundary would unsafely continue restoration and deletion.
+[IO.File]::WriteAllText((Join-Path $Work 'policy'), 'restored unsafely')
+foreach ($name in @('account', 'profile', 'tree')) { [IO.File]::Delete((Join-Path $Work $name)) }
+exit 0
+"#,
+        )
+        .unwrap();
+        let native = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/native");
+        let mut child = Command::new("pwsh.exe")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+            .arg(&script)
+            .arg(native.join("windows-installer-client.ps1"))
+            .arg(&reports)
+            .arg(&private)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("unresolved client retained an infinite-running process");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        assert_eq!(status.code(), Some(1));
+        let mut receipt = json!({"passed": false});
+        assert!(
+            retain_native_evidence(&private, &reports, status.success(), &mut receipt).is_err()
+        );
+        let client = &receipt["standard_user_client"];
+        assert_eq!(client["passed"], false);
+        assert_eq!(client["classification"], "unresolved");
+        assert_eq!(client["teardown_required"], true);
+        for field in [
+            "genuine_standard_user",
+            "account_cleanup_verified",
+            "profile_cleanup_verified",
+            "restoration_verified",
+            "quiescence_verified",
+            "uninstall_verified",
+        ] {
+            assert_eq!(client[field], false);
+        }
+        assert!(receipt.get("observations").is_none());
+        assert!(!private.join("client-observations.json").exists());
+        for name in ["policy", "account", "profile", "tree"] {
+            assert_eq!(
+                fs::read(private.join(name)).unwrap(),
+                b"must remain unresolved"
+            );
+        }
+
+        let reuse_script = temp.path().join("reuse-failure-fixture.ps1");
+        fs::write(
+            &reuse_script,
+            r#"
+param([string]$Source, [string]$Reports, [string]$Work)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($Source, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'Reuse syntax errors' }
+foreach ($name in @('Require', 'Write-NewBytes', 'Write-NewJson', 'Assert-StandardUserEvidence', 'Retain-StandardUserEvidence')) {
+    $definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name }, $true)
+    if ($null -eq $definition) { throw "Missing evidence guard: $name" }
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$metadata = [ordered]@{ passed = $false; native_exit_code = 1 }
+$refused = $false
+try { Retain-StandardUserEvidence $Reports $Work $metadata } catch { $refused = $true }
+if (-not $refused -or $metadata.passed -or $metadata.standard_user_client.classification -cne 'unresolved' -or -not $metadata.standard_user_client.teardown_required) { throw 'Reuse lost unresolved failure evidence' }
+if (Test-Path -LiteralPath (Join-Path $Reports 'windows-core-installer-smoke.json')) { throw 'Reuse promoted unverified native evidence' }
+Write-NewJson (Join-Path $Reports 'reuse-failure.json') $metadata
+$missingCoreReports = Join-Path $Reports 'missing-core'
+[void][IO.Directory]::CreateDirectory($missingCoreReports)
+$failedClient = Get-Content -LiteralPath (Join-Path $Reports 'client-observations.json') -Raw | ConvertFrom-Json
+$failedClient.quiescence_verified = $true
+$failedClient.classification = 'failed'
+Write-NewJson (Join-Path $missingCoreReports 'client-observations.json') $failedClient
+$metadata = [ordered]@{ passed = $false; native_exit_code = 1 }
+$refused = $false
+try { Retain-StandardUserEvidence $missingCoreReports $Work $metadata } catch { $refused = $true }
+if (-not $refused -or $metadata.passed -or $metadata.standard_user_client.classification -cne 'failed' -or $metadata.standard_user_client.account_cleanup_verified) { throw 'Reuse discarded client metadata when core receipt was absent' }
+"#,
+        )
+        .unwrap();
+        let status = Command::new("pwsh.exe")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+            .arg(reuse_script)
+            .arg(native.join("windows-installer-reuse.ps1"))
+            .arg(&reports)
+            .arg(&private)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let reuse: Value =
+            serde_json::from_slice(&fs::read(reports.join("reuse-failure.json")).unwrap()).unwrap();
+        assert_eq!(reuse["passed"], false);
+        assert_eq!(reuse["native_exit_code"], 1);
+        assert_eq!(
+            reuse["standard_user_client"],
+            receipt["standard_user_client"]
+        );
+        for name in ["policy", "account", "profile", "tree"] {
+            assert_eq!(
+                fs::read(private.join(name)).unwrap(),
+                b"must remain unresolved"
+            );
+        }
+    }
+
     #[test]
     fn native_evidence_requires_genuine_identity_and_complete_cleanup() {
         let client = json!({

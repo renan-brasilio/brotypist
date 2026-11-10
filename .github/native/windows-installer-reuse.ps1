@@ -137,6 +137,22 @@ function Assert-StandardUserEvidence($Client, $Core) {
     Require ($Core.passed -is [bool] -and $Core.passed -eq $true) 'Native installer core assertions failed; inspect retained native receipt'
 }
 
+function Retain-StandardUserEvidence([string]$ReportDirectory, [string]$CoreWork, $Metadata) {
+    $clientPath = Join-Path $ReportDirectory 'client-observations.json'
+    $clientFile = Get-Item -LiteralPath $clientPath
+    Require (-not $clientFile.PSIsContainer -and ($clientFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and $clientFile.Length -le 262144) 'Public standard-user receipt missing/linked/oversized'
+    $clientObserved = Get-Content -LiteralPath $clientPath -Raw | ConvertFrom-Json
+    $Metadata.standard_user_client = $clientObserved
+    # Keep supervisor failure facts even when native output cannot safely be read.
+    Require ($clientObserved.quiescence_verified -is [bool] -and $clientObserved.quiescence_verified -eq $true) 'Native quiescence unverified; private evidence retained on disposable host'
+    $observationsPath = Join-Path $CoreWork 'observations.json'
+    $observationsFile = Get-Item -LiteralPath $observationsPath
+    Require (-not $observationsFile.PSIsContainer -and ($observationsFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and $observationsFile.Length -le 262144) 'Native core receipt missing/linked/oversized'
+    $observations = Get-Content -LiteralPath $observationsPath -Raw | ConvertFrom-Json
+    Write-NewJson (Join-Path $ReportDirectory 'windows-core-installer-smoke.json') $observations
+    Assert-StandardUserEvidence $clientObserved $observations
+}
+
 try {
     Require ($IsWindows -and [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [Runtime.InteropServices.Architecture]::X64) 'Native Windows x86_64 required'
     Require ($env:CI -ceq 'true' -and $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted' -and $env:RUNNER_OS -ceq 'Windows' -and $env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch') 'Disposable manual GitHub-hosted probe required'
@@ -325,23 +341,10 @@ try {
     $client = Join-Path $PSScriptRoot 'windows-installer-client.ps1'
     $metadata.probe_client_sha256 = (Get-FileHash -LiteralPath $client -Algorithm SHA256).Hash.ToLowerInvariant()
     $metadata.client_experiment = @{ method = 'fresh nonadministrator local account; LOGON_WITH_PROFILE; private window station and desktop'; child_verification_before_installer_required = $true; policy_changes = 'only approved absent HKLM64 DisableMSI-to-DWORD0 fixture; restored in finally'; global_acl_changes = $false; account_and_profile_cleanup_required = $true }
-    & $pwsh -NoLogo -NoProfile -NonInteractive -File $client -InputFile $inputPath -Work $coreWork
+    & $pwsh -NoLogo -NoProfile -NonInteractive -File $client -InputFile $inputPath -Work $coreWork -ReportDirectory $Reports
     $nativeExit = $LASTEXITCODE
-    foreach ($name in @('client-observations.json', 'observations.json')) {
-        $path = Join-Path $coreWork $name
-        if (Test-Path -LiteralPath $path) {
-            Require ((Get-Item -LiteralPath $path).Length -le 262144) 'Native evidence oversized'
-            $nameInReports = if ($name -ceq 'observations.json') { 'windows-core-installer-smoke.json' } else { 'windows-installer-client.json' }
-            Copy-Item -LiteralPath $path -Destination (Join-Path $Reports $nameInReports)
-        }
-    }
     $metadata.native_exit_code = $nativeExit
-    $observationsPath = Join-Path $coreWork 'observations.json'
-    Require ((Get-Item -LiteralPath $observationsPath).Length -le 262144) 'Native core receipt missing/oversized'
-    $clientObserved = Get-Content -LiteralPath (Join-Path $coreWork 'client-observations.json') -Raw | ConvertFrom-Json
-    $metadata.standard_user_client = $clientObserved
-    $observations = Get-Content -LiteralPath $observationsPath -Raw | ConvertFrom-Json
-    Assert-StandardUserEvidence $clientObserved $observations
+    Retain-StandardUserEvidence $Reports $coreWork $metadata
     Require ($nativeExit -eq 0) 'Native standard-user client failed; inspect retained native receipt'
     $metadata.passed = $true
     $stage = 'completed_core_scope_only_standard_user'
