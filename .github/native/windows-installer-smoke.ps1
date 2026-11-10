@@ -351,12 +351,16 @@ function Contexts([string]$Product) {
         if ($null -ne $state) { @{ context = $context; state = $state } }
     }
 }
-function Arp-Keys([string]$Product) {
+function Packed-Code([string]$Product) {
     $parts = $Product.Trim('{}').Split('-')
     $packed = ''
     foreach ($part in $parts[0..2]) { $chars = $part.ToCharArray(); [array]::Reverse($chars); $packed += -join $chars }
     $tail = $parts[3] + $parts[4]
     for ($index = 0; $index -lt $tail.Length; $index += 2) { $packed += [string]$tail[$index + 1] + [string]$tail[$index] }
+    return $packed
+}
+function Arp-Keys([string]$Product) {
+    $packed = Packed-Code $Product
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     # This exact SID-scoped MSI database entry is not machine installation.
     # Read-only here: the separate CI launcher owns only the bounded DisableMSI
@@ -540,13 +544,27 @@ function Assert-Installed($Package) {
     Equal (Product-Info $product 2 'InstalledProductName') 'BroTypist' 'Registered name differs'
     Equal (Product-Info $product 2 'VersionString') $Package.version 'Registered version differs'
     Equal ((Product-Info $product 2 'InstallLocation').TrimEnd('\')) $installDirectory.TrimEnd('\') 'Default per-user install directory differs'
-    $machineArp = Test-Path -LiteralPath "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$product"
+    # Windows Installer's own RegisterProduct records a per-user product's
+    # Uninstall entry beneath HKLM, even for a genuine non-administrator client
+    # that cannot write there (wixtoolset/issues#9323). Its presence is engine
+    # bookkeeping, not machine assignment. Ownership is the native per-user
+    # context above plus no machine-assigned registration, payload or shortcut;
+    # the Installer record itself must describe exactly this per-user product.
+    $installerArp = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$product"
+    $installerArpPresent = Test-Path -LiteralPath $installerArp
     $machineArp32 = Test-Path -LiteralPath "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$product"
-    Observe 'native_per_user_context' @{ contexts = $contexts; assignment_type = $assignment; machine_arp_present = $machineArp; machine_arp_32_present = $machineArp32 }
-    Require (-not $machineArp) 'Machine ARP registration exists'
+    $packed = Packed-Code $product
+    $machineRegistration = @(@("HKLM:\Software\Classes\Installer\Products\$packed", "HKLM:\Software\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$packed") | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0
+    $machinePayload = @(@($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath (Join-Path $_ 'BroTypist')) }).Count -gt 0
+    $commonShortcut = Test-Path -LiteralPath (Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'BroTypist.lnk')
+    Observe 'native_per_user_context' @{ contexts = $contexts; assignment_type = $assignment; installer_hklm_uninstall_record_present = $installerArpPresent; machine_arp_32_present = $machineArp32; machine_assigned_registration_present = $machineRegistration; machine_payload_present = $machinePayload; all_users_shortcut_present = $commonShortcut }
+    Require (-not $machineRegistration) 'Machine-assigned MSI product registration exists'
+    Require (-not $machinePayload) 'Machine payload directory exists'
+    Require (-not $commonShortcut) 'All-users Start Menu shortcut exists'
     Require (-not $machineArp32) '32-bit machine ARP registration exists'
-    $arpKeys = @(Arp-Keys $product | Where-Object { Test-Path -LiteralPath $_ })
-    Require ($arpKeys.Count -gt 0) 'Per-user Installed Apps registration is missing'
+    $perUserArp = @(Arp-Keys $product | Where-Object { Test-Path -LiteralPath $_ })
+    Require ($perUserArp.Count -gt 0) 'Per-user Installed Apps registration is missing'
+    $arpKeys = @($perUserArp) + @(@($installerArp) | Where-Object { $installerArpPresent })
     foreach ($key in $arpKeys) {
         $arp = Get-ItemProperty -LiteralPath $key
         Equal $arp.DisplayName 'BroTypist' 'ARP name differs'

@@ -346,7 +346,7 @@ try {
     $env:GH_TOKEN = $null; $script:headers = $null
     $client = Join-Path $PSScriptRoot 'windows-installer-client.ps1'
     $metadata.probe_client_sha256 = (Get-FileHash -LiteralPath $client -Algorithm SHA256).Hash.ToLowerInvariant()
-    $metadata.client_experiment = @{ method = 'fresh nonadministrator local account; LOGON_WITH_PROFILE; owned private input desktop on disposable interactive station'; child_verification_before_installer_required = $true; policy_changes = 'only approved absent HKLM64 DisableMSI-to-DWORD0 fixture; restored in finally'; interactive_station_acl_fixture = 'temporary exact new-user allow ACE; verified restoration required'; station_access_mask = '00020337'; account_and_profile_cleanup_required = $true; station_input_and_desktop_cleanup_required = $true }
+    $metadata.client_experiment = @{ method = 'fresh nonadministrator local account; LOGON_WITH_PROFILE; owned private input desktop on disposable interactive station'; child_verification_before_installer_required = $true; policy_changes = 'only approved absent HKLM64 DisableMSI-to-DWORD0 fixture; restored in finally'; interactive_station_acl_fixture = 'temporary exact new-user allow ACE; verified restoration required'; station_access_mask = '0002037f'; session_namespace_acl_fixture = 'temporary exact new-user allow ACE on the session named-object directory; verified restoration required'; session_namespace_access_mask = '0000000f'; account_and_profile_cleanup_required = $true; station_input_and_desktop_cleanup_required = $true }
     & $pwsh -NoLogo -NoProfile -NonInteractive -File $client -InputFile $inputPath -Work $coreWork -ReportDirectory $Reports
     $nativeExit = $LASTEXITCODE
     $metadata.native_exit_code = $nativeExit
