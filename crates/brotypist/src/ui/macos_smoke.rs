@@ -4812,6 +4812,8 @@ fn owned_welcome_case(
     );
     let deadline = Instant::now() + Duration::from_secs(120);
     row["observations"] = json!([]);
+    row["observation_interval_ms"] = json!(250);
+    let mut next_observation = Instant::now();
     let mut offered = None;
     while Instant::now() < deadline {
         owner.pump()?;
@@ -4819,12 +4821,15 @@ fn owned_welcome_case(
         let inference_error = observed["last_poll"]["state"] == "error";
         let editor_focused = observed["focused"] == true;
         let states = row["observations"].as_array_mut().unwrap();
-        if states.last() != Some(&observed) {
+        // Session counters/ages advance even without a new offer. Keep their
+        // diagnostic sampling bounded independently of the native pump rate.
+        if Instant::now() >= next_observation || inference_error || !editor_focused {
             ensure!(
                 states.len() < 4096,
                 "Preview observation history exceeded its bound"
             );
             states.push(observed);
+            next_observation = Instant::now() + Duration::from_millis(250);
         }
         row["controller_status"] = owner.controller.status();
         ensure!(editor_focused, OwnedInterruption::EditorFocus);
@@ -6463,6 +6468,98 @@ fn choose(shell: &mut Shell, id: &str, index: isize) -> Result<()> {
     }
     settle(shell)
 }
+struct PreviewBudget {
+    started: Instant,
+    proceeded: Option<Instant>,
+}
+impl PreviewBudget {
+    const READINESS: Duration = Duration::from_secs(120);
+    const GENERATION_DRAW_ACCEPTANCE: Duration = Duration::from_secs(30);
+
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            proceeded: None,
+        }
+    }
+    fn observe_proceed(&mut self, authorized: Option<Instant>) -> Result<()> {
+        if let (None, Some(at)) = (self.proceeded, authorized) {
+            ensure!(
+                at >= self.started && at < self.started + Self::READINESS,
+                "Preview generation authorization fell outside its single readiness budget"
+            );
+            self.proceeded = Some(at);
+        }
+        Ok(())
+    }
+    fn deadline(&self) -> Instant {
+        match self.proceeded {
+            Some(at) => at + Self::GENERATION_DRAW_ACCEPTANCE,
+            None => self.started + Self::READINESS,
+        }
+    }
+    fn phase(&self) -> &'static str {
+        if self.proceeded.is_some() {
+            "generation_draw_acceptance"
+        } else {
+            "readiness"
+        }
+    }
+    fn check(&self, now: Instant) -> Result<()> {
+        ensure!(
+            now < self.deadline(),
+            "Preview {} deadline expired; no retry or budget renewal",
+            self.phase()
+        );
+        Ok(())
+    }
+    fn observation(&self, now: Instant) -> Value {
+        json!({
+            "phase":self.phase(),
+            "readiness_budget_ms":Self::READINESS.as_millis(),
+            "generation_draw_acceptance_budget_ms":Self::GENERATION_DRAW_ACCEPTANCE.as_millis(),
+            "authorized_proceed_at_ms":self.proceeded.map(|at| at.duration_since(self.started).as_millis()),
+            "readiness_elapsed_ms":self.proceeded.unwrap_or(now).saturating_duration_since(self.started).as_millis(),
+            "generation_draw_acceptance_elapsed_ms":self.proceeded.map(|at| now.saturating_duration_since(at).as_millis()),
+            "deadline_at_ms":self.deadline().duration_since(self.started).as_millis(),
+            "deadline_expired":now >= self.deadline(),
+            "origin":"attempt start before native language action; generation starts at first current-field consumer-authorized proceed",
+        })
+    }
+}
+fn preview_progress(shell: &Shell, budget: &PreviewBudget, pumps: usize) -> Value {
+    let controller = shell.controller.borrow().status();
+    let mut welcome = shell.welcome.smoke_observation();
+    if let Some(poll) = welcome["last_poll"].as_object_mut() {
+        let suggestion = poll.remove("suggestion");
+        poll.remove("message");
+        poll.insert(
+            "suggestion_scalars".into(),
+            json!(
+                suggestion
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .map(|text| text.chars().count())
+            ),
+        );
+    }
+    if let Some(welcome) = welcome.as_object_mut() {
+        welcome.remove("message");
+    }
+    json!({
+        "elapsed_ms":budget.started.elapsed().as_millis(),
+        "timing":budget.observation(Instant::now()),
+        "pump_turns":pumps,
+        "refresh_due":Instant::now() >= shell.next_refresh,
+        "menu_tracking":shell.kit.queue.borrow().tracking,
+        "welcome":welcome,
+        "controller_state":controller["state"],
+        "controller_preview":controller["preview"],
+        "controller_preview_suspended":controller["preview_suspended"],
+        "last_shell_refresh_state":shell.status["state"],
+        "last_shell_refresh_preview_suspended":shell.status["preview_suspended"],
+    })
+}
 fn welcome(shell: &mut Shell, receipt: &mut Value, output: &Path) -> Result<()> {
     navigate(shell, "setup")?;
     action(shell, "inklow.setup.welcome")?;
@@ -6540,10 +6637,13 @@ fn welcome(shell: &mut Shell, receipt: &mut Value, output: &Path) -> Result<()> 
         native_id(&editor) == "inklow.welcome.preview",
         json!({"native_id":native_id(&editor)}),
     )?;
+    receipt["preview_attempts"] = json!([]);
     for (index, language, prefix) in [
         (0isize, "en", "I was thinking we could"),
         (1isize, "pt", "Amanhã vamos nos encontrar para"),
     ] {
+        let started = Instant::now();
+        let mut budget = PreviewBudget::new(started);
         choose(shell, "inklow.welcome.previewLanguage", index)?;
         let window = window(&shell.app, "inklow.welcome")?;
         let editor = control(shell, "inklow.welcome.preview")?;
@@ -6552,28 +6652,95 @@ fn welcome(shell: &mut Shell, receipt: &mut Value, output: &Path) -> Result<()> 
             ensure!(accepted, "Owned preview refused first responder");
         }
         insert_owned(&editor, prefix)?;
-        let deadline = Instant::now() + Duration::from_secs(30);
         let config = shell.config();
+        let seed = macos_welcome::read_editor(&editor)?;
+        let mut attempt = json!({
+            "language":language,
+            "readiness_budget_ms":PreviewBudget::READINESS.as_millis(),
+            "generation_draw_acceptance_budget_ms":PreviewBudget::GENERATION_DRAW_ACCEPTANCE.as_millis(),
+            "input_scalars":prefix.chars().count(),
+            "seed_matches":seed.text.as_ref() == prefix
+                && seed.caret == prefix.chars().count()
+                && seed.selection_length == 0,
+            "config":{
+                "backend":config.backend,
+                "prompt_style":config.prompt_style,
+                "requested_acceleration":config.acceleration,
+                "completion_length":config.completion_length,
+                "max_tokens":config.max_tokens,
+                "context_chars":config.context_chars,
+                "min_chars":config.min_chars,
+                "debounce_ms":config.debounce_ms,
+                "trailing_space":config.trailing_space,
+                "punctuation_mode":config.punctuation_mode,
+                "instruction_scalars":config.custom_instructions.chars().count(),
+            },
+            "sampling":"read-only snapshots every 250ms; one readiness phase followed by one generation/draw/acceptance phase; no reseeding or retry",
+            "observations":[preview_progress(shell, &budget, 0)],
+            "dropped_observations":0,
+        });
+        let mut next_observation = started + Duration::from_millis(250);
+        let mut pumps = 0;
         let mut offered = None;
-        while Instant::now() < deadline {
-            pump(shell, deadline)?;
-            if let Some((before, generated, visible)) = shell.welcome.preview_offer() {
-                if let Some((insertion, expected)) =
-                    preview_word_expectation(&before, &generated, &visible, &config)
+        let waited = (|| -> Result<()> {
+            ensure!(
+                attempt["seed_matches"] == true,
+                "Owned preview input did not retain its exact text/caret/selection"
+            );
+            loop {
+                budget.observe_proceed(shell.welcome.preview_proceeded_at())?;
+                budget.check(Instant::now())?;
+                pump(shell, budget.deadline())?;
+                pumps += 1;
+                budget.observe_proceed(shell.welcome.preview_proceeded_at())?;
+                let now = Instant::now();
+                budget.check(now)?;
+                if now >= next_observation {
+                    let observations = attempt["observations"].as_array_mut().unwrap();
+                    if observations.len() < 640 {
+                        observations.push(preview_progress(shell, &budget, pumps));
+                    } else {
+                        let dropped = attempt["dropped_observations"].as_u64().unwrap();
+                        attempt["dropped_observations"] = json!(dropped + 1);
+                    }
+                    next_observation = now + Duration::from_millis(250);
+                }
+                if budget.proceeded.is_some()
+                    && let Some((before, generated, visible)) = shell.welcome.preview_offer()
                 {
-                    offered = Some((before, generated, visible, insertion, expected));
-                    break;
+                    if let Some((insertion, expected)) =
+                        preview_word_expectation(&before, &generated, &visible, &config)
+                    {
+                        offered = Some((before, generated, visible, insertion, expected));
+                        break;
+                    }
                 }
             }
+            Ok(())
+        })();
+        // Record before screenshots/cleanup can pump, cancel or release the
+        // pending preview. Observation never drains or authorizes worker events.
+        attempt["at_exit"] = preview_progress(shell, &budget, pumps);
+        attempt["failure_phase"] = json!(waited.as_ref().err().map(|_| {
+            if attempt["seed_matches"] == true {
+                budget.phase()
+            } else {
+                "input"
+            }
+        }));
+        attempt["drawn_word_acceptable"] = json!(offered.is_some());
+        attempt["wait_error"] = json!(waited.as_ref().err().map(|error| format!("{error:#}")));
+        if waited.is_err() {
+            receipt["preview_failure"] = attempt["at_exit"].clone();
+            receipt["preview_failure"]["language"] = json!(language);
+            receipt["preview_failure"]["failure_phase"] = attempt["failure_phase"].clone();
         }
-        if offered.is_none() {
-            receipt["preview_failure"] = json!({
-                "language": language,
-                "welcome": shell.welcome.smoke_observation(),
-                "controller_state": shell.status["state"],
-                "controller_preview": shell.status["preview"],
-                "controller_preview_suspended": shell.status["preview_suspended"],
-            });
+        let attempt_index = receipt["preview_attempts"].as_array().unwrap().len();
+        receipt["preview_attempts"]
+            .as_array_mut()
+            .unwrap()
+            .push(attempt);
+        if waited.is_err() {
             snapshot(
                 shell,
                 receipt,
@@ -6582,31 +6749,49 @@ fn welcome(shell: &mut Shell, receipt: &mut Value, output: &Path) -> Result<()> 
                 &format!("preview-{language}-deadline"),
             )?;
         }
-        let (before, generated, visible, insertion, expected) = offered.with_context(|| {
-            format!("Actual {language} preview did not expose a drawn, word-acceptable suggestion before its deadline")
-        })?;
-        snapshot(
-            shell,
-            receipt,
-            output,
-            "inklow.welcome",
-            &format!("preview-{language}-offered"),
-        )?;
-        unsafe {
-            let key: *mut AnyObject = msg_send![AnyClass::get(c"NSEvent").unwrap(),keyEventWithType:10usize,location:NSPoint::new(0.,0.),modifierFlags:0usize,timestamp:0.0f64,windowNumber:{let n:isize=msg_send![&*window,windowNumber];n},context:std::ptr::null::<AnyObject>(),characters:&*NSString::from_str("\t"),charactersIgnoringModifiers:&*NSString::from_str("\t"),isARepeat:false,keyCode:48u16];
-            ensure!(!key.is_null(), "AppKit refused an owned Tab event");
-            let _: () = msg_send![&*editor,keyDown:key];
+        waited?;
+        let (before, generated, visible, insertion, expected) =
+            offered.context("Successful preview wait lost its actual drawn offer")?;
+        let accepted = (|| -> Result<()> {
+            budget.check(Instant::now())?;
+            snapshot(
+                shell,
+                receipt,
+                output,
+                "inklow.welcome",
+                &format!("preview-{language}-offered"),
+            )?;
+            budget.check(Instant::now())?;
+            unsafe {
+                let key: *mut AnyObject = msg_send![AnyClass::get(c"NSEvent").unwrap(),keyEventWithType:10usize,location:NSPoint::new(0.,0.),modifierFlags:0usize,timestamp:0.0f64,windowNumber:{let n:isize=msg_send![&*window,windowNumber];n},context:std::ptr::null::<AnyObject>(),characters:&*NSString::from_str("\t"),charactersIgnoringModifiers:&*NSString::from_str("\t"),isARepeat:false,keyCode:48u16];
+                ensure!(!key.is_null(), "AppKit refused an owned Tab event");
+                let _: () = msg_send![&*editor,keyDown:key];
+            }
+            settle(shell)?;
+            let actual = macos_welcome::read_editor(&editor)?;
+            budget.check(Instant::now())?;
+            assert_record(
+                receipt,
+                &format!("welcome.preview_acceptance.{language}"),
+                before.text.as_ref() == prefix
+                    && before.caret == prefix.chars().count()
+                    && expected.same_key(&actual),
+                json!({"before":prefix,"generated_offer":generated,"rendered_offer":visible,"expected_word_insertion":insertion,"expected_widget_readback":expected.text.as_ref(),"expected_caret":expected.caret,"actual_widget_readback":actual.text.as_ref(),"actual_caret":actual.caret,"actual_selection_length":actual.selection_length,"event":"NSEvent sent only to the owned canonical preview NSTextView"}),
+            )?;
+            Ok(())
+        })();
+        let acceptance_exit = preview_progress(shell, &budget, pumps);
+        receipt["preview_attempts"][attempt_index]["acceptance_at_exit"] = acceptance_exit.clone();
+        receipt["preview_attempts"][attempt_index]["acceptance_error"] =
+            json!(accepted.as_ref().err().map(|error| format!("{error:#}")));
+        if accepted.is_err() {
+            receipt["preview_attempts"][attempt_index]["failure_phase"] = json!(budget.phase());
+            receipt["preview_failure"] = acceptance_exit;
+            receipt["preview_failure"]["language"] = json!(language);
+            receipt["preview_failure"]["failure_phase"] = json!(budget.phase());
+            receipt["preview_failure"]["stage"] = json!("native_acceptance");
         }
-        settle(shell)?;
-        let actual = macos_welcome::read_editor(&editor)?;
-        assert_record(
-            receipt,
-            &format!("welcome.preview_acceptance.{language}"),
-            before.text.as_ref() == prefix
-                && before.caret == prefix.chars().count()
-                && expected.same_key(&actual),
-            json!({"before":prefix,"generated_offer":generated,"rendered_offer":visible,"expected_word_insertion":insertion,"expected_widget_readback":expected.text.as_ref(),"expected_caret":expected.caret,"actual_widget_readback":actual.text.as_ref(),"actual_caret":actual.caret,"actual_selection_length":actual.selection_length,"event":"NSEvent sent only to the owned canonical preview NSTextView"}),
-        )?;
+        accepted?;
     }
     action(shell, "inklow.welcome.back")?;
     action(shell, "inklow.welcome.next")?;
@@ -6792,6 +6977,36 @@ pub(super) fn run(output: &Path) -> Result<i32> {
 mod tests {
     use super::*;
     use crate::core::Snapshot;
+
+    #[test]
+    fn preview_preparation_cannot_consume_or_renew_the_generation_budget() {
+        let start = Instant::now();
+        let mut budget = PreviewBudget::new(start);
+        let authorized = start + Duration::from_secs(119);
+        budget.check(authorized).unwrap();
+        budget.observe_proceed(Some(authorized)).unwrap();
+        budget.check(start + Duration::from_secs(148)).unwrap();
+        // Later polling/duplicate notifications cannot buy another interval.
+        budget
+            .observe_proceed(Some(start + Duration::from_secs(148)))
+            .unwrap();
+        assert!(budget.check(start + Duration::from_secs(149)).is_err());
+    }
+
+    #[test]
+    fn preview_without_timely_authorization_cannot_enter_generation() {
+        let early = Instant::now();
+        let start = early + Duration::from_secs(1);
+        let mut budget = PreviewBudget::new(start);
+        budget.observe_proceed(None).unwrap();
+        assert!(budget.check(start + Duration::from_secs(120)).is_err());
+        assert!(
+            budget
+                .observe_proceed(Some(start + Duration::from_secs(120)))
+                .is_err()
+        );
+        assert!(budget.observe_proceed(Some(early)).is_err());
+    }
 
     #[test]
     fn owned_matrix_continuation_stops_after_retaining_an_interrupted_case() {

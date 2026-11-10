@@ -231,7 +231,7 @@ fn screenshot(shell: &Shell, output: &Path, name: &str, receipt: &mut Value) -> 
         "No visible owned Shell to capture."
     );
     let path = output.join(format!("{name}.png"));
-    capture(shell.window, &path)?;
+    capture(shell.window, &path, &[])?;
     receipt["screenshots"].as_array_mut().unwrap().push(json!({"file":path.file_name().unwrap().to_string_lossy(),"method":"PrintWindow-owned-hwnd","pid":std::process::id()}));
     Ok(())
 }
@@ -643,8 +643,78 @@ fn chooser_fixture(instance: HINSTANCE, output: &Path, receipt: &mut Value) -> R
         paints.lock().unwrap().len() == 1,
         "Repainting counted one chooser view twice."
     );
+    // Exercise WM_PRINTCLIENT itself on a private DC. PrintWindow may also
+    // request ordinary window painting, which is a separate native boundary.
+    unsafe {
+        let mut client = RECT::default();
+        GetClientRect(chooser.labels[0], &mut client)?;
+        let dc = CreateCompatibleDC(None);
+        ensure!(!dc.0.is_null(), "Chooser print DC is unavailable.");
+        let bitmap =
+            CreateCompatibleBitmap(dc, client.right - client.left, client.bottom - client.top);
+        if bitmap.0.is_null() {
+            let _ = DeleteDC(dc);
+            anyhow::bail!("Chooser print bitmap is unavailable.");
+        }
+        let old = SelectObject(dc, bitmap.into());
+        let _print = Capture { dc, bitmap, old };
+        ensure!(
+            !old.0.is_null() && old.0 as isize != -1,
+            "Chooser print bitmap could not be selected."
+        );
+        let painted = chooser.paint.painted.replace(0);
+        let observed_rows = chooser.paint.observed_rows.replace(0);
+        let diagnostic = chooser.paint.diagnostic.replace(Some((71, 19)));
+        SendMessageW(
+            chooser.labels[0],
+            WM_PRINTCLIENT,
+            Some(WPARAM(dc.0 as usize)),
+            None,
+        );
+        let print_preserved_authority = chooser.paint.painted.get() == 0
+            && chooser.paint.observed_rows.get() == 0
+            && chooser.paint.diagnostic.get() == Some((71, 19))
+            && chooser.paint.foreground == foreground
+            && GetForegroundWindow() == foreground
+            && paints.lock().unwrap().len() == 1;
+        chooser.paint.painted.set(painted);
+        chooser.paint.observed_rows.set(observed_rows);
+        chooser.paint.diagnostic.set(diagnostic);
+        ensure!(
+            print_preserved_authority,
+            "WM_PRINTCLIENT changed visible-paint authority or foreground."
+        );
+    }
     let path = output.join("chooser-eligible-subsequence.png");
-    capture(chooser.window, &path)?;
+    capture(chooser.window, &path, &chooser.labels[..chooser.rows])?;
+    // Keep the frame, second row and native label text intact. Only the custom
+    // renderer's first row is empty: border/background contrast must not pass.
+    let row_text = std::mem::take(&mut chooser.paint.text[0]);
+    let missing_row = capture(
+        chooser.window,
+        &output.join("chooser-missing-row-rejected.png"),
+        &chooser.labels[..chooser.rows],
+    );
+    chooser.paint.text[0] = row_text;
+    unsafe {
+        let _ = InvalidateRect(Some(chooser.labels[0]), None, false);
+        ensure!(
+            UpdateWindow(chooser.labels[0]).as_bool(),
+            "Chooser row did not repaint after the missing-text control."
+        );
+    }
+    ensure!(
+        missing_row
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<MissingRowPixels>())
+            .is_some_and(|missing| missing.0 == 0),
+        "A chooser screenshot without the first row's text was not specifically rejected."
+    );
+    passed(
+        receipt,
+        "chooser-print-preserves-authority-and-rejects-missing-row",
+    );
     receipt["screenshots"].as_array_mut().unwrap().push(json!({"file":"chooser-eligible-subsequence.png","method":"PrintWindow-owned-hwnd","pid":std::process::id()}));
     unsafe {
         for (i, label) in chooser.labels.iter().enumerate() {
@@ -782,6 +852,14 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
         native.instance,
     )?;
     let scenario = (|| -> Result<bool> {
+        ensure!(
+            unsafe { IsWindowVisible(shell.window).as_bool() },
+            "Settings did not become visible during normal no-tray startup."
+        );
+        passed(
+            receipt,
+            "initial-settings-visible-before-observer-activation",
+        );
         shell.show();
         pump(&mut shell, &clipboard)?;
         ensure!(
@@ -814,7 +892,7 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             &mut shell,
             &clipboard,
             "No system tray",
-            IDNO.0,
+            DialogButton::Id(IDNO.0),
             None,
             |s, c| {
                 owned(s.window)?;
@@ -858,7 +936,7 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             &mut shell,
             &clipboard,
             "Unsaved settings",
-            IDCANCEL.0,
+            DialogButton::Id(IDCANCEL.0),
             None,
             |s, c| {
                 owned(s.window)?;
@@ -930,10 +1008,17 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
                 if let Some(value) = instructions {
                     edit(&mut shell, "custom_instructions", value, &clipboard)?;
                 }
-                modal(&mut shell, &clipboard, "BroTypist", IDOK.0, None, |s, c| {
-                    click(s, SAVE, c)?;
-                    until(s, c, Duration::from_secs(30), |s| s.operations.is_empty())
-                })?;
+                modal(
+                    &mut shell,
+                    &clipboard,
+                    "BroTypist",
+                    DialogButton::OperationFailureAcknowledgement,
+                    None,
+                    |s, c| {
+                        click(s, SAVE, c)?;
+                        until(s, c, Duration::from_secs(30), |s| s.operations.is_empty())
+                    },
+                )?;
                 ensure!(
                     shell.controller.config() == active,
                     "Failed persistence installed the candidate."
@@ -1024,11 +1109,27 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             "terminal_completion",
         ];
         for key in consents {
+            // OCR and terminal completion are retained preferences, not Windows
+            // capabilities. Prove their native refusal instead of requesting consent.
+            if matches!(key, "screenshot_context" | "terminal_completion") {
+                let control = reveal(&mut shell, field_id(key)?, &clipboard)?;
+                ensure!(
+                    !unsafe { IsWindowEnabled(control).as_bool() }
+                        && !is_checked(control)
+                        && shell.draft.value(key) == Some(&json!(false)),
+                    "An unavailable Windows privacy source became enabled or consented."
+                );
+                receipt["not_exercised"].as_array_mut().unwrap().push(json!({
+                    "scenario": format!("{key}-consent-interaction"),
+                    "reason": "Unavailable on Windows. The native control was verified disabled and unchecked with draft consent unchanged; no click or consent dialog was attempted."
+                }));
+                continue;
+            }
             modal(
                 &mut shell,
                 &clipboard,
                 "Optional local data access",
-                IDYES.0,
+                DialogButton::Id(IDYES.0),
                 None,
                 |s, c| click(s, field_id(key)?, c),
             )?;
@@ -1046,13 +1147,13 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
         }
         passed(
             receipt,
-            "each-context-history-terminal-consent-is-independent-and-draft-only",
+            "supported-context-history-consents-independent-and-unavailable-ocr-terminal-disabled",
         );
         modal(
             &mut shell,
             &clipboard,
             "Optional local data access",
-            IDYES.0,
+            DialogButton::Id(IDYES.0),
             None,
             |s, c| click(s, field_id("screen_context")?, c),
         )?;
@@ -1104,6 +1205,12 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
                 && !unsafe { IsWindowEnabled(shell.h(W_NEXT)).as_bool() },
             "No selected model borrowed readiness."
         );
+        ensure!(
+            shell.preview.is_none()
+                && !shell.preview_suspended
+                && shell.controller.status()["preview"] == false,
+            "Welcome claimed preview ownership before the model-selection step completed."
+        );
         passed(
             receipt,
             "welcome-system-review-and-selected-model-readiness-refuse-unmet-prerequisites",
@@ -1133,7 +1240,7 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             &mut shell,
             &clipboard,
             "Import GGUF model",
-            IDOK.0,
+            DialogButton::Id(IDOK.0),
             Some(model.clone()),
             |s, c| click(s, MODEL_IMPORT, c),
         )?;
@@ -1184,6 +1291,10 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             receipt,
             "preview-english-timeout",
         )?;
+        ensure!(
+            shell.preview_suspended && shell.controller.status()["preview_suspended"] == true,
+            "Preview inference began before the main owner acknowledged its release."
+        );
         let preview_config = &shell.preview.as_ref().unwrap().config;
         ensure!(
             !preview_config.clipboard_context
@@ -1290,9 +1401,32 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
             receipt,
             "portuguese-owned-preview-renders-and-confirms-visible-full-acceptance",
         );
+        click(&mut shell, W_BACK, &clipboard)?;
+        until(&mut shell, &clipboard, Duration::from_secs(30), |s| {
+            s.welcome
+                .as_ref()
+                .is_some_and(|w| w.step == 3 && w.can_continue())
+                && s.preview.is_none()
+                && !s.preview_suspended
+                && s.controller.status()["preview"] == false
+        })?;
         click(&mut shell, W_NEXT, &clipboard)?;
         until(&mut shell, &clipboard, Duration::from_secs(30), |s| {
-            s.welcome.as_ref().is_some_and(|w| w.step == 5) && s.preview.is_none()
+            s.welcome.as_ref().is_some_and(|w| w.step == 4)
+                && s.preview.is_some()
+                && s.preview_suspended
+                && s.controller.status()["preview_suspended"] == true
+        })?;
+        passed(
+            receipt,
+            "native-preview-back-releases-worker-and-reentry-reacquires-owner",
+        );
+        click(&mut shell, W_NEXT, &clipboard)?;
+        until(&mut shell, &clipboard, Duration::from_secs(30), |s| {
+            s.welcome.as_ref().is_some_and(|w| w.step == 5)
+                && s.preview.is_none()
+                && !s.preview_suspended
+                && s.controller.status()["preview"] == false
         })?;
         screenshot(&shell, output, "welcome-5", receipt)?;
         click(&mut shell, W_NEXT, &clipboard)?;
@@ -1362,10 +1496,18 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
     scenario
 }
 
+#[derive(Clone, Copy, Debug)]
+enum DialogButton {
+    Id(i32),
+    OperationFailureAcknowledgement,
+}
+
 struct DialogRequest {
     owner: usize,
     title: String,
-    button: i32,
+    button: DialogButton,
+    operation_result: usize,
+    operation_message_matches: bool,
     path: Option<Vec<u16>>,
     responded: bool,
     emergency: bool,
@@ -1447,6 +1589,9 @@ unsafe extern "system" fn dialog(hwnd: HWND, param: LPARAM) -> BOOL {
                 LPARAM((&mut request.controls as *mut Vec<(i32, String, bool, bool)>) as isize),
             );
         }
+        if !request.foreground {
+            return BOOL(1);
+        }
         if let Some(path) = &request.path {
             let Ok(combo) = GetDlgItem(Some(hwnd), cmb13 as i32) else {
                 return BOOL(1);
@@ -1476,10 +1621,54 @@ unsafe extern "system" fn dialog(hwnd: HWND, param: LPARAM) -> BOOL {
                 return BOOL(1);
             }
         }
-        if let Ok(control) = GetDlgItem(Some(hwnd), request.button) {
+        let button = match request.button {
+            DialogButton::Id(id) => id,
+            DialogButton::OperationFailureAcknowledgement => {
+                // Shell::poll_operations copies the same failure into RESULTS and
+                // Shell::error's MB_OK message. Match that actual message, not
+                // merely another owned dialog with the generic application title.
+                let result = HWND(request.operation_result as *mut _);
+                if owned(result).is_err() {
+                    return BOOL(1);
+                }
+                let expected = text(result);
+                request.operation_message_matches = !expected.is_empty()
+                    && request.controls.iter().any(|(id, class, _, _)| {
+                        class == "Static"
+                            && GetDlgItem(Some(hwnd), *id).is_ok_and(|control| {
+                                owned(control).is_ok()
+                                    && IsWindowVisible(control).as_bool()
+                                    && text(control) == expected
+                            })
+                    });
+                if !request.operation_message_matches {
+                    return BOOL(1);
+                }
+                // MB_OK's return value is not its child control ID: the hosted
+                // Windows dialog exposes its sole OK button as IDCANCEL. Resolve
+                // only this single-button acknowledgement, never a choice dialog.
+                let mut buttons = request
+                    .controls
+                    .iter()
+                    .filter(|(_, class, _, _)| class == "Button");
+                let Some((id, _, _, _)) = buttons.next() else {
+                    return BOOL(1);
+                };
+                if buttons.next().is_some() || ![IDOK.0, IDCANCEL.0].contains(id) {
+                    return BOOL(1);
+                }
+                *id
+            }
+        };
+        if let Ok(control) = GetDlgItem(Some(hwnd), button) {
             request.button_enabled = IsWindowEnabled(control).as_bool();
-            let _ = PostMessageW(Some(control), BM_CLICK, WPARAM(0), LPARAM(0));
-            request.responded = true;
+            if owned(control).is_err()
+                || !IsWindowVisible(control).as_bool()
+                || !request.button_enabled
+            {
+                return BOOL(1);
+            }
+            request.responded = PostMessageW(Some(control), BM_CLICK, WPARAM(0), LPARAM(0)).is_ok();
         }
         BOOL(1)
     }
@@ -1488,12 +1677,13 @@ fn modal<T>(
     shell: &mut Shell,
     clipboard: &crate::system::ClipboardService,
     title: &str,
-    button: i32,
+    button: DialogButton,
     path: Option<PathBuf>,
     action: impl FnOnce(&mut Shell, &crate::system::ClipboardService) -> Result<T>,
 ) -> Result<T> {
     owned(shell.window)?;
     let owner = shell.window.0 as usize;
+    let operation_result = shell.h(RESULTS).0 as usize;
     let thread_id = unsafe { GetCurrentThreadId() };
     let title = title.to_owned();
     let path = path.map(|p| wide(&p.to_string_lossy()));
@@ -1504,6 +1694,8 @@ fn modal<T>(
             owner,
             title,
             button,
+            operation_result,
+            operation_message_matches: false,
             path,
             responded: false,
             emergency: false,
@@ -1551,6 +1743,8 @@ fn modal<T>(
         "The expected owned native dialog did not complete: {}",
         json!({
             "expected_dialog": response.title,
+            "expected_button": format!("{:?}", response.button),
+            "operation_message_matches": response.operation_message_matches,
             "owned_dialog_seen": response.owned_dialog_seen,
             "matched_dialog": response.matched_dialog,
             "foreground": response.foreground,
@@ -1566,6 +1760,19 @@ fn modal<T>(
     );
     Ok(result)
 }
+#[derive(Debug)]
+struct MissingRowPixels(usize);
+impl std::fmt::Display for MissingRowPixels {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Owned screenshot row {} has no text pixels in its client area.",
+            self.0 + 1
+        )
+    }
+}
+impl std::error::Error for MissingRowPixels {}
+
 struct Capture {
     dc: HDC,
     bitmap: HBITMAP,
@@ -1580,7 +1787,7 @@ impl Drop for Capture {
         }
     }
 }
-fn capture(hwnd: HWND, path: &Path) -> Result<()> {
+fn capture(hwnd: HWND, path: &Path, text_rows: &[HWND]) -> Result<()> {
     unsafe {
         owned(hwnd)?;
         let mut rect = RECT::default();
@@ -1619,16 +1826,66 @@ fn capture(hwnd: HWND, path: &Path) -> Result<()> {
             !bits.is_null() && !old.0.is_null() && old.0 as isize != -1,
             "The owned screenshot bitmap could not be selected."
         );
+        // These are GDI windows: use the documented whole-window WM_PRINT path,
+        // not PW_RENDERFULLCONTENT's DirectComposition capture mode.
         ensure!(
-            PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool(),
+            PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(0)).as_bool(),
             "The actual owned Shell could not render its screenshot."
+        );
+        // Direct DIB access must wait for the calling thread's GDI batch.
+        // https://learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-createdibsection
+        ensure!(
+            GdiFlush().as_bool(),
+            "Owned screenshot drawing did not complete successfully."
         );
         let bytes =
             std::slice::from_raw_parts_mut(bits.cast::<u8>(), width as usize * height as usize * 4);
-        ensure!(
-            bytes.chunks_exact(4).any(|pixel| pixel[..3] != bytes[..3]),
-            "The native screenshot is blank; no UI rendering proof is recorded."
-        );
+        let nonblank = bytes.chunks_exact(4).any(|pixel| pixel[..3] != bytes[..3]);
+        let mut missing_row = None;
+        for (index, label) in text_rows.iter().enumerate() {
+            owned(*label)?;
+            ensure!(
+                IsChild(hwnd, *label).as_bool() && IsWindowVisible(*label).as_bool(),
+                "Required screenshot text is not a visible child of the owned window."
+            );
+            let mut client = RECT::default();
+            GetClientRect(*label, &mut client)?;
+            let mut corners = [
+                POINT {
+                    x: client.left,
+                    y: client.top,
+                },
+                POINT {
+                    x: client.right,
+                    y: client.bottom,
+                },
+            ];
+            MapWindowPoints(Some(*label), None, &mut corners);
+            let left = corners[0].x - rect.left;
+            let top = corners[0].y - rect.top;
+            let right = corners[1].x - rect.left;
+            let bottom = corners[1].y - rect.top;
+            ensure!(
+                0 <= left
+                    && left < right
+                    && right <= width
+                    && 0 <= top
+                    && top < bottom
+                    && bottom <= height,
+                "Required screenshot text falls outside the owned bitmap."
+            );
+            let first = ((top * width + left) * 4) as usize;
+            let varied = (top..bottom).any(|y| {
+                let start = ((y * width + left) * 4) as usize;
+                let end = ((y * width + right) * 4) as usize;
+                bytes[start..end]
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[..3] != bytes[first..first + 3])
+            });
+            if !varied && missing_row.is_none() {
+                missing_row = Some(index);
+            }
+        }
         // PrintWindow's BI_RGB DIB has BGRA color bytes with unspecified alpha.
         // Convert this owned offscreen bitmap in place; no desktop pixels are read.
         for pixel in bytes.chunks_exact_mut(4) {
@@ -1643,6 +1900,14 @@ fn capture(hwnd: HWND, path: &Path) -> Result<()> {
         let mut writer = encoder.write_header()?;
         writer.write_image_data(bytes)?;
         writer.finish()?;
+        // Preserve the actual failed bitmap for diagnosis; it is not UI proof.
+        ensure!(
+            nonblank,
+            "The native screenshot is blank; failed pixels were retained, not UI rendering proof."
+        );
+        if let Some(index) = missing_row {
+            return Err(MissingRowPixels(index).into());
+        }
         Ok(())
     }
 }

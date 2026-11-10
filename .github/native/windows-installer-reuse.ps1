@@ -129,6 +129,36 @@ function Redact([string]$Text) {
     return $Text
 }
 
+function Assert-StandardUserEvidence($Client, $Core) {
+    foreach ($field in @('passed', 'genuine_standard_user', 'account_cleanup_verified', 'profile_cleanup_verified', 'restoration_verified', 'quiescence_verified', 'station_access_restoration_verified', 'session_namespace_restoration_verified', 'input_desktop_restoration_verified', 'private_desktop_cleanup_verified')) {
+        Require ($Client.$field -is [bool] -and $Client.$field -eq $true) 'Shared standard-user identity, cleanup, quiescence, desktop, session namespace or policy restoration evidence missing'
+    }
+    Require (@($Core.observations | Where-Object { $_.check -ceq 'genuine_standard_user_verified_before_installer' -and $_.passed -is [bool] -and $_.passed -eq $true }).Count -eq 1) 'Child did not independently verify genuine standard-user identity before installer access'
+    $desktop = @($Core.observations | Where-Object { $_.check -ceq 'owned_interactive_desktop_verified_before_installer' })
+    Require ($desktop.Count -eq 1) 'Owned interactive desktop proof missing or duplicated'
+    Require ($desktop[0].passed -is [bool] -and $desktop[0].passed -eq $true) 'Owned interactive desktop verification failed'
+    foreach ($field in @('interactive_station', 'expected_desktop_matches', 'station_visible', 'input_desktop_matches')) {
+        Require ($desktop[0].evidence.$field -is [bool] -and $desktop[0].evidence.$field -eq $true) 'Owned interactive desktop evidence missing or untyped'
+    }
+    Require ($Core.passed -is [bool] -and $Core.passed -eq $true) 'Native installer core assertions failed; inspect retained native receipt'
+}
+
+function Retain-StandardUserEvidence([string]$ReportDirectory, [string]$CoreWork, $Metadata) {
+    $clientPath = Join-Path $ReportDirectory 'client-observations.json'
+    $clientFile = Get-Item -LiteralPath $clientPath
+    Require (-not $clientFile.PSIsContainer -and ($clientFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and $clientFile.Length -le 262144) 'Public standard-user receipt missing/linked/oversized'
+    $clientObserved = Get-Content -LiteralPath $clientPath -Raw | ConvertFrom-Json
+    $Metadata.standard_user_client = $clientObserved
+    # Keep supervisor failure facts even when native output cannot safely be read.
+    Require ($clientObserved.quiescence_verified -is [bool] -and $clientObserved.quiescence_verified -eq $true) 'Native quiescence unverified; private evidence retained on disposable host'
+    $observationsPath = Join-Path $CoreWork 'observations.json'
+    $observationsFile = Get-Item -LiteralPath $observationsPath
+    Require (-not $observationsFile.PSIsContainer -and ($observationsFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and $observationsFile.Length -le 262144) 'Native core receipt missing/linked/oversized'
+    $observations = Get-Content -LiteralPath $observationsPath -Raw | ConvertFrom-Json
+    Write-NewJson (Join-Path $ReportDirectory 'windows-core-installer-smoke.json') $observations
+    Assert-StandardUserEvidence $clientObserved $observations
+}
+
 try {
     Require ($IsWindows -and [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [Runtime.InteropServices.Architecture]::X64) 'Native Windows x86_64 required'
     Require ($env:CI -ceq 'true' -and $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted' -and $env:RUNNER_OS -ceq 'Windows' -and $env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch') 'Disposable manual GitHub-hosted probe required'
@@ -306,7 +336,7 @@ try {
     }
     $metadata.rollback_fixture_requested = [bool]$ExerciseRollback
 
-    $stage = 'existing_guarded_native_core_restricted_rights'
+    $stage = 'existing_guarded_native_core_standard_user'
     $pwsh = (Get-Process -Id $PID).Path
     $core = Join-Path $PSScriptRoot 'windows-installer-smoke.ps1'
     $metadata.probe_core_sha256 = (Get-FileHash -LiteralPath $core -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -316,27 +346,14 @@ try {
     $env:GH_TOKEN = $null; $script:headers = $null
     $client = Join-Path $PSScriptRoot 'windows-installer-client.ps1'
     $metadata.probe_client_sha256 = (Get-FileHash -LiteralPath $client -Algorithm SHA256).Hash.ToLowerInvariant()
-    $metadata.client_experiment = @{ method = 'shared SAFER NORMALUSER restricted primary rights + medium integrity + CreateProcessAsUserW'; genuine_uac_filtered_logon = $false; retained_elevation_metadata_reported = $true; child_verification_before_installer_required = $true; policy_changes = 'only approved absent HKLM64 DisableMSI-to-DWORD0 fixture; restored in finally'; global_acl_changes = $false; alternate_credentials = $false }
-    & $pwsh -NoLogo -NoProfile -NonInteractive -File $client -InputFile $inputPath -Work $coreWork
+    $metadata.client_experiment = @{ method = 'fresh nonadministrator local account; LOGON_WITH_PROFILE; owned private input desktop on disposable interactive station'; child_verification_before_installer_required = $true; policy_changes = 'only approved absent HKLM64 DisableMSI-to-DWORD0 fixture; restored in finally'; interactive_station_acl_fixture = 'temporary exact new-user allow ACE; verified restoration required'; station_access_mask = '0002037f'; session_namespace_acl_fixture = 'temporary exact new-user allow ACE on the session named-object directory; verified restoration required'; session_namespace_access_mask = '0000000f'; account_and_profile_cleanup_required = $true; station_input_and_desktop_cleanup_required = $true }
+    & $pwsh -NoLogo -NoProfile -NonInteractive -File $client -InputFile $inputPath -Work $coreWork -ReportDirectory $Reports
     $nativeExit = $LASTEXITCODE
-    foreach ($name in @('client-observations.json', 'observations.json')) {
-        $path = Join-Path $coreWork $name
-        if (Test-Path -LiteralPath $path) {
-            Require ((Get-Item -LiteralPath $path).Length -le 262144) 'Native evidence oversized'
-            $nameInReports = if ($name -ceq 'observations.json') { 'windows-core-installer-smoke.json' } else { 'windows-installer-client.json' }
-            Copy-Item -LiteralPath $path -Destination (Join-Path $Reports $nameInReports)
-        }
-    }
     $metadata.native_exit_code = $nativeExit
-    $observationsPath = Join-Path $coreWork 'observations.json'
-    Require ((Get-Item -LiteralPath $observationsPath).Length -le 262144) 'Native core receipt missing/oversized'
-    $clientObserved = Get-Content -LiteralPath (Join-Path $coreWork 'client-observations.json') -Raw | ConvertFrom-Json
-    Require ($clientObserved.passed -eq $true -and $clientObserved.restoration_verified -eq $true -and $clientObserved.quiescence_verified -eq $true) 'Shared restricted client/quiescence/policy restoration failed'
-    $observations = Get-Content -LiteralPath $observationsPath -Raw | ConvertFrom-Json
-    Require (@($observations.observations | Where-Object { $_.check -ceq 'restricted_rights_client_verified_before_installer' -and $_.passed -eq $true }).Count -eq 1) 'Child did not independently verify restricted primary rights before installer access'
-    Require ($nativeExit -eq 0 -and $observations.passed -eq $true) 'Native installer core assertions failed; inspect retained native receipt'
+    Retain-StandardUserEvidence $Reports $coreWork $metadata
+    Require ($nativeExit -eq 0) 'Native standard-user client failed; inspect retained native receipt'
     $metadata.passed = $true
-    $stage = 'completed_core_scope_only_restricted_rights'
+    $stage = 'completed_core_scope_only_standard_user'
 } catch {
     $metadata.diagnostics.Add((Redact $_.Exception.Message))
 } finally {

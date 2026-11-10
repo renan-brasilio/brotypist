@@ -18,6 +18,38 @@ struct Request {
     generation: u64,
     proceeded: bool,
 }
+
+#[cfg(feature = "native-smoke")]
+#[derive(Default, serde::Serialize)]
+struct SmokeEvents {
+    loading: u64,
+    ready: u64,
+    results: u64,
+    finals: u64,
+    done: u64,
+    errors: u64,
+    without_request: u64,
+    rejected_authority: u64,
+    last_result_scalars: usize,
+}
+
+#[cfg(feature = "native-smoke")]
+#[derive(Default)]
+struct SmokeProgress {
+    polls: u64,
+    submissions: u64,
+    proceed_calls: u64,
+    cancellation_calls: u64,
+    events: SmokeEvents,
+    request_id: Option<u64>,
+    last_poll: Option<Instant>,
+    submitted: Option<Instant>,
+    ready: Option<Instant>,
+    proceeded: Option<Instant>,
+    authorized_key: Option<(SnapshotKey, u64)>,
+    first_result: Option<Instant>,
+    terminal: Option<Instant>,
+}
 /// Calls are serialized by the widget owner. Returned acceptance text is only a
 /// proposal; update must confirm exact native-widget readback before accounting.
 pub struct PreviewSession {
@@ -36,6 +68,8 @@ pub struct PreviewSession {
     owner_released: bool,
     closed: bool,
     stopped: bool,
+    #[cfg(feature = "native-smoke")]
+    smoke: SmokeProgress,
 }
 impl PreviewSession {
     pub fn new(config: Config) -> Result<Self> {
@@ -73,11 +107,17 @@ impl PreviewSession {
             owner_released: false,
             closed: false,
             stopped: false,
+            #[cfg(feature = "native-smoke")]
+            smoke: SmokeProgress::default(),
         })
     }
     pub fn set_owner_released(&mut self, released: bool) {
         self.owner_released = released;
         if !released {
+            #[cfg(feature = "native-smoke")]
+            {
+                self.smoke.cancellation_calls += 1;
+            }
             let _ = self.worker.cancel();
             self.request = None;
             self.suggestion.invalidate();
@@ -90,6 +130,10 @@ impl PreviewSession {
             return;
         }
         self.active = active;
+        #[cfg(feature = "native-smoke")]
+        {
+            self.smoke.cancellation_calls += 1;
+        }
         let _ = self.worker.cancel();
         self.request = None;
         self.expected = None;
@@ -112,6 +156,10 @@ impl PreviewSession {
         current.selection_length = selection_length;
         if current.same_key(&self.snapshot) {
             return Ok(());
+        }
+        #[cfg(feature = "native-smoke")]
+        {
+            self.smoke.cancellation_calls += 1;
         }
         self.worker.cancel()?;
         self.request = None;
@@ -139,12 +187,52 @@ impl PreviewSession {
                 || features::mid_word(self.snapshot.prefix()))
     }
     pub fn poll(&mut self) -> Value {
+        #[cfg(feature = "native-smoke")]
+        {
+            self.smoke.polls += 1;
+            self.smoke.last_poll = Some(self.clock.now());
+        }
         if self.closed {
             let _ = self.close();
             return json!({"state":"idle","suggestion":"","message":"Preview closed.","accepted":self.accepted,"stopped":self.stopped});
         }
         for event in self.worker.poll() {
+            #[cfg(feature = "native-smoke")]
+            {
+                let now = self.clock.now();
+                let matches_submission = self.smoke.request_id == Some(event.id);
+                let events = &mut self.smoke.events;
+                match event.kind.as_str() {
+                    "loading" => events.loading += 1,
+                    "ready" => {
+                        events.ready += 1;
+                        if matches_submission {
+                            self.smoke.ready = Some(now);
+                        }
+                    }
+                    "result" => {
+                        events.results += 1;
+                        events.finals += u64::from(event.final_);
+                        events.last_result_scalars = event.text.chars().count();
+                        if matches_submission {
+                            self.smoke.first_result.get_or_insert(now);
+                        }
+                    }
+                    "done" => {
+                        events.done += 1;
+                        if matches_submission {
+                            self.smoke.terminal = Some(now);
+                        }
+                    }
+                    "error" => events.errors += 1,
+                    _ => {}
+                }
+            }
             let Some(mut request) = self.request.take() else {
+                #[cfg(feature = "native-smoke")]
+                {
+                    self.smoke.events.without_request += 1;
+                }
                 continue;
             };
             if event.id != request.id
@@ -153,6 +241,10 @@ impl PreviewSession {
                 || !self.active
                 || !self.owner_released
             {
+                #[cfg(feature = "native-smoke")]
+                {
+                    self.smoke.events.rejected_authority += 1;
+                }
                 if event.id != request.id {
                     self.request = Some(request);
                 }
@@ -164,6 +256,15 @@ impl PreviewSession {
                         && self.eligible()
                         && self.worker.proceed(request.id).is_ok()
                     {
+                        #[cfg(feature = "native-smoke")]
+                        {
+                            self.smoke.proceed_calls += 1;
+                            if self.smoke.proceeded.is_none() {
+                                self.smoke.proceeded = Some(self.clock.now());
+                                self.smoke.authorized_key =
+                                    Some((request.key.clone(), request.generation));
+                            }
+                        }
                         request.proceeded = true;
                         self.request = Some(request);
                     }
@@ -231,6 +332,17 @@ impl PreviewSession {
                 .collect();
             match self.worker.submit(&config, prefix, &suffix, &options) {
                 Ok(id) => {
+                    #[cfg(feature = "native-smoke")]
+                    {
+                        self.smoke.submissions += 1;
+                        self.smoke.request_id = Some(id);
+                        self.smoke.submitted = Some(self.clock.now());
+                        self.smoke.ready = None;
+                        self.smoke.proceeded = None;
+                        self.smoke.authorized_key = None;
+                        self.smoke.first_result = None;
+                        self.smoke.terminal = None;
+                    }
                     self.request = Some(Request {
                         id,
                         key: self.snapshot.key(),
@@ -290,6 +402,84 @@ impl PreviewSession {
         };
         json!({"state":state,"suggestion":suggestion,"message":message,"accepted":self.accepted})
     }
+    /// First matching ready event authorized by the normal consumer. Retained
+    /// across final/done delivery, but never valid for a changed or revoked field.
+    #[cfg(feature = "native-smoke")]
+    pub(crate) fn smoke_proceeded_at(&self, current: &Snapshot) -> Option<Instant> {
+        let (key, generation) = self.smoke.authorized_key.as_ref()?;
+        if self.closed
+            || !self.active
+            || !self.owner_released
+            || self.expected.is_some()
+            || !self.eligible()
+            || *generation != self.suggestion.generation
+            || !key.matches(&self.snapshot)
+            || !current.same_key(&self.snapshot)
+        {
+            return None;
+        }
+        self.smoke.proceeded
+    }
+    /// Content-free observation only: never polls, drains reports, retries, or
+    /// authorizes work. Relative timings describe consumer delivery, not GPU work.
+    #[cfg(feature = "native-smoke")]
+    pub(crate) fn smoke_observation(&self) -> Value {
+        let now = self.clock.now();
+        let worker = self.worker.status();
+        let offset = |at: Option<Instant>| {
+            self.smoke
+                .submitted
+                .zip(at)
+                .and_then(|(start, at)| at.checked_duration_since(start))
+                .map(|elapsed| elapsed.as_micros())
+        };
+        let request = self.request.as_ref();
+        json!({
+            "polls":self.smoke.polls,
+            "last_poll_age_us":self.smoke.last_poll.and_then(|at| now.checked_duration_since(at)).map(|elapsed| elapsed.as_micros()),
+            "submissions":self.smoke.submissions,
+            "proceed_calls":self.smoke.proceed_calls,
+            "cancellation_calls":self.smoke.cancellation_calls,
+            "delivered_events":self.smoke.events,
+            "pending":request.is_some(),
+            "pending_age_us":request.and(self.smoke.submitted).and_then(|at| now.checked_duration_since(at)).map(|elapsed| elapsed.as_micros()),
+            "request_proceeded":request.map(|request| request.proceeded),
+            "request_matches_snapshot":request.map(|request| request.key == self.snapshot.key()),
+            "request_matches_generation":request.map(|request| request.generation == self.suggestion.generation),
+            "attempted_current_snapshot":self.attempted.as_ref() == Some(&self.snapshot.key()),
+            "eligible":self.eligible(),
+            "owner_released":self.owner_released,
+            "active":self.active,
+            "acceptance_pending":self.expected.is_some(),
+            "suggestion_scalars":self.suggestion.text.chars().count(),
+            "accepted":self.accepted,
+            "closed":self.closed,
+            "stopped":self.stopped,
+            "consumer_delivery_us":{
+                "ready":offset(self.smoke.ready),
+                "proceed_call":offset(self.smoke.proceeded),
+                "first_result":offset(self.smoke.first_result),
+                "done":offset(self.smoke.terminal)
+            },
+            "worker":{
+                "state":worker["state"],
+                "lifecycle":worker["lifecycle"],
+                "present":worker["worker_pid"].as_u64().is_some(),
+                "model_loaded":worker["model_loaded"],
+                "initializing":worker["initializing"],
+                "evaluating":worker["evaluating"],
+                "awaiting_proceed":worker["awaiting_proceed"],
+                "terminating":worker["terminating"],
+                "owner_finished":worker["owner_finished"],
+                "release_pending":worker["release_pending"],
+                "release_complete":worker["release_complete"],
+                "active_request_matches":request.map(|request| worker["active_id"].as_u64() == Some(request.id)),
+                "latest_request_matches":request.map(|request| worker["latest_id"].as_u64() == Some(request.id)),
+                "inference":worker["inference"],
+                "lost_terminal_reports":worker["lost_terminal_reports"]
+            }
+        })
+    }
     fn accept(&mut self, full: bool, visible: Option<&str>) -> String {
         if self.closed
             || !self.active
@@ -311,6 +501,10 @@ impl PreviewSession {
             )
             .unwrap_or_default();
         if !text.is_empty() {
+            #[cfg(feature = "native-smoke")]
+            {
+                self.smoke.cancellation_calls += 1;
+            }
             let _ = self.worker.cancel();
             self.request = None;
             self.expected = self.suggestion.snapshot.clone();
@@ -331,6 +525,10 @@ impl PreviewSession {
     pub fn dismiss(&mut self) {
         if self.closed {
             return;
+        }
+        #[cfg(feature = "native-smoke")]
+        {
+            self.smoke.cancellation_calls += 1;
         }
         let _ = self.worker.cancel();
         self.request = None;
@@ -542,6 +740,118 @@ mod tests {
             event(1, "result", " escrita", true),
         ]);
         assert_eq!(preview.poll()["suggestion"], "");
+        assert!(state.borrow().proceeds.is_empty());
+    }
+
+    #[cfg(feature = "native-smoke")]
+    #[test]
+    fn smoke_observation_does_not_consume_or_authorize_preview_work() {
+        let (mut preview, state, time) = session();
+        let draft = "Private owned draft";
+        let result = " unpublished continuation";
+        preview.set_owner_released(true);
+        preview.update(draft, draft.chars().count(), 0).unwrap();
+        *time.borrow_mut() += Duration::from_secs(1);
+        preview.poll();
+        state.borrow_mut().events.push(event(1, "ready", "", false));
+        let before = preview.smoke_observation();
+        assert_eq!(before["pending"], true);
+        assert_eq!(before["request_proceeded"], false);
+        assert!(state.borrow().proceeds.is_empty());
+        preview.poll();
+        assert_eq!(state.borrow().proceeds, [1]);
+        state.borrow_mut().events.extend([
+            event(1, "result", result, true),
+            event(1, "done", "", false),
+        ]);
+        let pending = preview.smoke_observation();
+        assert_eq!(pending["pending"], true);
+        assert_eq!(pending["request_proceeded"], true);
+        assert_eq!(preview.poll()["suggestion"], result);
+        let complete = preview.smoke_observation();
+        assert_eq!(complete["pending"], false);
+        let serialized = complete.to_string();
+        for private in [
+            draft,
+            result,
+            "\"request_id\"",
+            "\"worker_pid\"",
+            "\"active_id\"",
+        ] {
+            assert!(!serialized.contains(private));
+        }
+    }
+
+    #[cfg(feature = "native-smoke")]
+    #[test]
+    fn smoke_observation_distinguishes_no_offer_from_pending_work() {
+        let (mut preview, state, time) = session();
+        preview.set_owner_released(true);
+        preview.update("Hello", 5, 0).unwrap();
+        *time.borrow_mut() += Duration::from_secs(1);
+        preview.poll();
+        state.borrow_mut().events.extend([
+            event(1, "ready", "", false),
+            event(1, "result", "", true),
+            event(1, "done", "", false),
+        ]);
+        preview.poll();
+        let observed = preview.smoke_observation();
+        assert_eq!(observed["pending"], false);
+        assert_eq!(observed["attempted_current_snapshot"], true);
+        *time.borrow_mut() += Duration::from_secs(30);
+        preview.poll();
+        assert_eq!(state.borrow().submits, 1);
+    }
+
+    #[cfg(feature = "native-smoke")]
+    #[test]
+    fn readiness_requires_current_authority_and_survives_terminal_delivery() {
+        let (mut preview, state, time) = session();
+        preview.set_owner_released(true);
+        preview.update("Hello", 5, 0).unwrap();
+        let current = preview.snapshot.clone();
+        *time.borrow_mut() += Duration::from_secs(1);
+        preview.poll();
+        state
+            .borrow_mut()
+            .events
+            .push(event(99, "ready", "", false));
+        preview.poll();
+        assert!(preview.smoke_proceeded_at(&current).is_none());
+        assert!(state.borrow().proceeds.is_empty());
+        state.borrow_mut().events.push(event(1, "ready", "", false));
+        assert!(preview.smoke_proceeded_at(&current).is_none());
+        preview.poll();
+        let authorized = preview.smoke_proceeded_at(&current).unwrap();
+        *time.borrow_mut() += Duration::from_secs(1);
+        state.borrow_mut().events.extend([
+            event(1, "ready", "", false),
+            event(1, "result", " world", true),
+            event(1, "done", "", false),
+        ]);
+        preview.poll();
+        assert_eq!(preview.smoke_proceeded_at(&current), Some(authorized));
+        let mut changed = current.clone();
+        changed.caret = 0;
+        assert!(preview.smoke_proceeded_at(&changed).is_none());
+        preview.set_owner_released(false);
+        assert!(preview.smoke_proceeded_at(&current).is_none());
+    }
+
+    #[cfg(feature = "native-smoke")]
+    #[test]
+    fn revoked_ready_event_cannot_start_the_generation_budget() {
+        let (mut preview, state, time) = session();
+        preview.set_owner_released(true);
+        preview.update("Hello", 5, 0).unwrap();
+        let current = preview.snapshot.clone();
+        *time.borrow_mut() += Duration::from_secs(1);
+        preview.poll();
+        state.borrow_mut().events.push(event(1, "ready", "", false));
+        preview.set_active(false);
+        preview.poll();
+        assert!(preview.smoke_proceeded_at(&current).is_none());
         assert!(state.borrow().proceeds.is_empty());
     }
 }

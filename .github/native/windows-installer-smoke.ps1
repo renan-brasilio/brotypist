@@ -3,8 +3,10 @@
 param(
     [Parameter(Mandatory)][string]$InputFile,
     [Parameter(Mandatory)][string]$Work,
-    [switch]$RequireRestrictedClient,
-    [string]$ExpectedUserSid
+    [switch]$RequireStandardUser,
+    [Parameter(Mandatory)][string]$ExpectedUserSid,
+    [Parameter(Mandatory)][string]$SupervisorSid,
+    [Parameter(Mandatory)][string]$ExpectedDesktopName
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -42,8 +44,12 @@ function Equal($Actual, $Expected, [string]$Message) { Require ($Actual -ceq $Ex
 function Observe([string]$Check, $Evidence) { $receipt.observations.Add(@{ check = $Check; passed = $true; evidence = $Evidence }) }
 function Redact([string]$Text) {
     foreach ($path in @($Work, $env:RUNNER_TEMP, $env:USERPROFILE)) {
-        if (-not [string]::IsNullOrWhiteSpace($path)) { $Text = $Text.Replace($path, '<private-path>') }
+        if (-not [string]::IsNullOrWhiteSpace($path)) { $Text = [regex]::Replace($Text, [regex]::Escape($path), '<private-path>', [Text.RegularExpressions.RegexOptions]::IgnoreCase) }
     }
+    foreach ($identityValue in @($ExpectedUserSid, $SupervisorSid, $ExpectedDesktopName, $env:USERNAME, $env:USERDOMAIN)) {
+        if (-not [string]::IsNullOrWhiteSpace($identityValue)) { $Text = [regex]::Replace($Text, [regex]::Escape($identityValue), '<private-identity>', [Text.RegularExpressions.RegexOptions]::IgnoreCase) }
+    }
+    $Text = [regex]::Replace($Text, '(?i)\bS-1-\d+(?:-\d+)+\b', '<private-sid>')
     $Text = [regex]::Replace($Text, '(?im)(token|password|secret|authorization|api[_-]?key)\s*[:=]\s*[^\r\n]+', '$1=<redacted>')
     if ($Text.Length -gt 8192) { $Text = $Text.Substring(0, 8192) + '[truncated]' }
     return $Text
@@ -66,6 +72,7 @@ function Bounded-Text([string]$Path, [int]$Limit = 32768) {
     } finally { $stream.Dispose() }
 }
 function New-PrivateDirectory([string]$Path) {
+    Assert-PrivatePath $Path $env:RUNNER_TEMP
     Require (-not (Test-Path -LiteralPath $Path)) 'Private smoke directory already exists'
     [void][IO.Directory]::CreateDirectory($Path)
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -74,6 +81,9 @@ function New-PrivateDirectory([string]$Path) {
     $acl.SetAccessRuleProtection($true, $false)
     $rule = [Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
     $acl.AddAccessRule($rule)
+    foreach ($reader in @($SupervisorSid, 'S-1-5-18')) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($reader), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+    }
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 function Hash-Equal([string]$Path, [string]$Hash) {
@@ -341,12 +351,16 @@ function Contexts([string]$Product) {
         if ($null -ne $state) { @{ context = $context; state = $state } }
     }
 }
-function Arp-Keys([string]$Product) {
+function Packed-Code([string]$Product) {
     $parts = $Product.Trim('{}').Split('-')
     $packed = ''
     foreach ($part in $parts[0..2]) { $chars = $part.ToCharArray(); [array]::Reverse($chars); $packed += -join $chars }
     $tail = $parts[3] + $parts[4]
     for ($index = 0; $index -lt $tail.Length; $index += 2) { $packed += [string]$tail[$index + 1] + [string]$tail[$index] }
+    return $packed
+}
+function Arp-Keys([string]$Product) {
+    $packed = Packed-Code $Product
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     # This exact SID-scoped MSI database entry is not machine installation.
     # Read-only here: the separate CI launcher owns only the bounded DisableMSI
@@ -356,17 +370,70 @@ function Arp-Keys([string]$Product) {
 function Machine-ArpKeys([string]$Product) {
     return @("HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$Product", "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$Product")
 }
+function Assert-StandardUserToken($Token) {
+    Require ($Token.matches_expected_user -is [bool] -and $Token.matches_expected_user -eq $true -and
+        $Token.is_system -is [bool] -and $Token.is_system -eq $false -and
+        $Token.administrator_role_enabled -is [bool] -and $Token.administrator_role_enabled -eq $false -and
+        $Token.administrator_group_present -is [bool] -and $Token.administrator_group_present -eq $false -and
+        $Token.token_elevation -eq 0 -and $Token.integrity_rid -eq 8192 -and
+        $Token.token_type -eq 1 -and $Token.impersonation_level -ceq 'None') 'Expected genuine nonadministrator unelevated medium-integrity primary token required'
+}
+function Assert-PrivatePath([string]$Path, [string]$Root) {
+    Require ([IO.Path]::IsPathFullyQualified($Path) -and [IO.Path]::IsPathFullyQualified($Root)) 'Absolute private paths required'
+    $relative = [IO.Path]::GetRelativePath([IO.Path]::GetFullPath($Root), [IO.Path]::GetFullPath($Path))
+    Require ($relative -ne '.' -and $relative -ne '..' -and -not $relative.StartsWith('..\') -and -not $relative.StartsWith('../') -and -not [IO.Path]::IsPathRooted($relative)) 'Path escaped its owned private root'
+    $ancestor = [IO.DirectoryInfo]::new([IO.Path]::GetFullPath($Path))
+    while ($null -ne $ancestor) {
+        if ($ancestor.Exists) { Require (($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Linked private path refused' }
+        $ancestor = $ancestor.Parent
+    }
+}
+function Assert-ValidationProfile {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        Require ($identity.User.Value -ceq $ExpectedUserSid -and $identity.ImpersonationLevel.ToString() -ceq 'None') 'Unexpected or impersonated profile identity'
+        Require ($identity.Name.Split('\')[-1] -cmatch '^btci-[0-9a-f]{12}$') 'Disposable validation account name required'
+        Require ($identity.Name.Split('\')[-1] -ieq $env:USERNAME) 'Environment identity differs from the validation account'
+        $nativeProfile = [BroTypistInstallerNative]::ProfileDirectory($identity.AccessToken.DangerousGetHandle())
+    } finally { $identity.Dispose() }
+    Require (-not [string]::IsNullOrWhiteSpace($nativeProfile) -and [IO.Path]::IsPathFullyQualified($env:USERPROFILE)) 'Loaded validation profile is missing'
+    Require ([IO.Path]::GetFullPath($env:USERPROFILE) -ieq [IO.Path]::GetFullPath($nativeProfile)) 'Environment does not belong to the loaded validation profile'
+    foreach ($folder in @('LocalApplicationData', 'ApplicationData', 'Programs')) {
+        Assert-PrivatePath ([Environment]::GetFolderPath($folder)) $nativeProfile
+    }
+    Require ($env:LOCALAPPDATA -ieq [Environment]::GetFolderPath('LocalApplicationData') -and $env:APPDATA -ieq [Environment]::GetFolderPath('ApplicationData')) 'Application-data environment does not match the validation profile'
+    Assert-PrivatePath $Work $env:RUNNER_TEMP
+    Assert-PrivatePath $InputFile $env:RUNNER_TEMP
+}
 function Observe-ClientAndPolicy {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     try {
         $token = [BroTypistInstallerNative]::TokenFacts($identity.AccessToken.DangerousGetHandle())
+        $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+        $groups = @(
+            foreach ($entry in @(
+                @{ name = 'interactive'; sid = 'S-1-5-4' },
+                @{ name = 'authenticated_users'; sid = 'S-1-5-11' },
+                @{ name = 'service'; sid = 'S-1-5-6' },
+                @{ name = 'batch'; sid = 'S-1-5-3' },
+                @{ name = 'network'; sid = 'S-1-5-2' },
+                @{ name = 'users'; sid = 'S-1-5-32-545' },
+                @{ name = 'everyone'; sid = 'S-1-1-0' }
+            )) {
+                $sid = [Security.Principal.SecurityIdentifier]::new($entry.sid)
+                @{ group = $entry.name; present = $identity.Groups -contains $sid; enabled = $principal.IsInRole($sid) }
+            }
+        )
+        $logonSids = @($identity.Groups | Where-Object { $_.Value -cmatch '^S-1-5-5-\d+-\d+$' })
+        $logonSidCount = $logonSids.Count
+        $enabledLogonSidCount = @($logonSids | Where-Object { $principal.IsInRole([Security.Principal.SecurityIdentifier]$_) }).Count
         $client = @{
             elevated = $token[0] -ne 0; elevation_type = $token[1]; integrity_rid = $token[2]
             token_elevation = $token[0]; token_has_restrictions = $token[3]; token_type = $token[4]
-            administrator_role_enabled = ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            administrator_role_enabled = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
             administrator_group_present = $identity.Groups -contains [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
             is_system = $identity.IsSystem; impersonation_level = $identity.ImpersonationLevel.ToString()
-            same_user_as_launcher = -not [string]::IsNullOrWhiteSpace($ExpectedUserSid) -and $identity.User.Value -ceq $ExpectedUserSid
+            matches_expected_user = $identity.User.Value -ceq $ExpectedUserSid
         }
     } finally { $identity.Dispose() }
     $policies = @(
@@ -383,12 +450,30 @@ function Observe-ClientAndPolicy {
             } finally { if ($null -ne $key) { $key.Dispose() }; $base.Dispose() }
         }
     )
+    $uac = @{ present = $false; dword = $false; value = $null; modified = $false }
+    $base = $null; $key = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        $key = $base.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Policies\System', $false)
+        $uac.present = $null -ne $key -and $key.GetValueNames() -contains 'EnableLUA'
+        $uac.dword = $uac.present -and $key.GetValueKind('EnableLUA') -eq [Microsoft.Win32.RegistryValueKind]::DWord
+        if ($uac.dword) { $uac.value = [int]$key.GetValue('EnableLUA') }
+    } catch { $uac.read_error_type = $_.Exception.GetType().FullName }
+    finally { if ($null -ne $key) { $key.Dispose() }; if ($null -ne $base) { $base.Dispose() } }
+    $receipt.observations.Add(@{ check = 'host_uac_policy'; status = 'observed'; passed = $null; evidence = $uac })
     $receipt.observations.Add(@{ check = 'installer_client_token_and_policies'; status = 'observed'; passed = $null; evidence = @{ client = $client; policies = $policies; modified_by_this_core = $false; launcher_policy_fixture = 'separate client-observations.json before/during/restored evidence, not a core claim of unchanged host policy' } })
-    if ($RequireRestrictedClient) {
-        Require ($client.same_user_as_launcher -and -not $client.is_system -and -not $client.administrator_role_enabled -and $client.integrity_rid -eq 8192 -and $client.token_has_restrictions -eq 1 -and $client.token_type -eq 1 -and $client.impersonation_level -ceq 'None') 'Restricted experiment requires verified same-user non-System Administrator-disabled medium-integrity restricted primary client'
-        Require (@($policies | Where-Object { $_.hive -ceq 'LocalMachine' -and $_.policy -ceq 'DisableMSI' -and $_.present -and $_.dword -and $_.value -eq 0 }).Count -eq 1) 'Restricted child did not observe the explicit bounded DisableMSI0 host fixture'
-        Observe 'restricted_rights_client_verified_before_installer' @{ same_user = $true; administrator_role_enabled = $false; integrity_rid = 8192; token_has_restrictions = 1; token_type = 1; token_elevation = $client.token_elevation; elevation_type = $client.elevation_type; scope = 'SAFER-restricted rights, not a genuine UAC-filtered logon or full desktop compatibility proof' }
-    }
+    Assert-StandardUserToken $client
+    $currentProcess = [Diagnostics.Process]::GetCurrentProcess()
+    try {
+        $sessionId = $currentProcess.SessionId
+        $processToken = [BroTypistInstallerNative]::ProcessTokenFacts($currentProcess.Handle, $ExpectedUserSid)
+    } finally { $currentProcess.Dispose() }
+    $receipt.observations.Add(@{ check = 'standard_user_logon_context'; status = 'observed'; passed = $null; evidence = @{ session_id = $sessionId; groups = $groups; logon_sid_count = $logonSidCount; enabled_logon_sid_count = $enabledLogonSidCount; raw_sids_retained = $false } })
+    Assert-StandardUserToken $processToken
+    Require (@($policies | Where-Object { $_.hive -ceq 'LocalMachine' -and $_.policy -ceq 'DisableMSI' -and $_.present -and $_.dword -and $_.value -eq 0 }).Count -eq 1) 'Standard-user child did not observe the explicit bounded DisableMSI0 host fixture'
+    Require (@($policies | Where-Object { $_.policy -ceq 'AlwaysInstallElevated' -and $_.present -and (-not $_.dword -or $_.value -ne 0) }).Count -eq 0) 'Elevating installer policy refused'
+    Assert-ValidationProfile
+    Observe 'genuine_standard_user_verified_before_installer' @{ client = $client; process_primary_token = $processToken; profile_matches_logon = $true; scope = 'genuine standard-user logon; not a UAC-filtered administrator or restricted administrator token' }
 }
 function Observe-ArpScope([string]$Stage, [string]$Product) {
     # Open explicit native views independently of PowerShell provider resolution.
@@ -459,13 +544,27 @@ function Assert-Installed($Package) {
     Equal (Product-Info $product 2 'InstalledProductName') 'BroTypist' 'Registered name differs'
     Equal (Product-Info $product 2 'VersionString') $Package.version 'Registered version differs'
     Equal ((Product-Info $product 2 'InstallLocation').TrimEnd('\')) $installDirectory.TrimEnd('\') 'Default per-user install directory differs'
-    $machineArp = Test-Path -LiteralPath "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$product"
+    # Windows Installer's own RegisterProduct records a per-user product's
+    # Uninstall entry beneath HKLM, even for a genuine non-administrator client
+    # that cannot write there (wixtoolset/issues#9323). Its presence is engine
+    # bookkeeping, not machine assignment. Ownership is the native per-user
+    # context above plus no machine-assigned registration, payload or shortcut;
+    # the Installer record itself must describe exactly this per-user product.
+    $installerArp = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$product"
+    $installerArpPresent = Test-Path -LiteralPath $installerArp
     $machineArp32 = Test-Path -LiteralPath "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$product"
-    Observe 'native_per_user_context' @{ contexts = $contexts; assignment_type = $assignment; machine_arp_present = $machineArp; machine_arp_32_present = $machineArp32 }
-    Require (-not $machineArp) 'Machine ARP registration exists'
+    $packed = Packed-Code $product
+    $machineRegistration = @(@("HKLM:\Software\Classes\Installer\Products\$packed", "HKLM:\Software\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$packed") | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0
+    $machinePayload = @(@($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath (Join-Path $_ 'BroTypist')) }).Count -gt 0
+    $commonShortcut = Test-Path -LiteralPath (Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'BroTypist.lnk')
+    Observe 'native_per_user_context' @{ contexts = $contexts; assignment_type = $assignment; installer_hklm_uninstall_record_present = $installerArpPresent; machine_arp_32_present = $machineArp32; machine_assigned_registration_present = $machineRegistration; machine_payload_present = $machinePayload; all_users_shortcut_present = $commonShortcut }
+    Require (-not $machineRegistration) 'Machine-assigned MSI product registration exists'
+    Require (-not $machinePayload) 'Machine payload directory exists'
+    Require (-not $commonShortcut) 'All-users Start Menu shortcut exists'
     Require (-not $machineArp32) '32-bit machine ARP registration exists'
-    $arpKeys = @(Arp-Keys $product | Where-Object { Test-Path -LiteralPath $_ })
-    Require ($arpKeys.Count -gt 0) 'Per-user Installed Apps registration is missing'
+    $perUserArp = @(Arp-Keys $product | Where-Object { Test-Path -LiteralPath $_ })
+    Require ($perUserArp.Count -gt 0) 'Per-user Installed Apps registration is missing'
+    $arpKeys = @($perUserArp) + @(@($installerArp) | Where-Object { $installerArpPresent })
     foreach ($key in $arpKeys) {
         $arp = Get-ItemProperty -LiteralPath $key
         Equal $arp.DisplayName 'BroTypist' 'ARP name differs'
@@ -474,10 +573,25 @@ function Assert-Installed($Package) {
         Equal $arp.WindowsInstaller 1 'ARP is not a Windows Installer product'
         Require ($arp.PSObject.Properties.Name -notcontains 'SystemComponent' -or $arp.SystemComponent -eq 0) 'ARP product is hidden'
         Require (-not [string]::IsNullOrWhiteSpace($arp.UninstallString) -and $arp.UninstallString.IndexOf($product, [StringComparison]::OrdinalIgnoreCase) -ge 0) 'ARP uninstall command does not reference owned product'
-        Require (-not [string]::IsNullOrWhiteSpace($arp.DisplayIcon)) 'ARP icon is missing'
-        $icon = ($arp.DisplayIcon -replace ',\s*-?\d+$', '').Trim('"')
-        Require (Test-Path -LiteralPath $icon -PathType Leaf) 'ARP icon file is missing'
     }
+    # Windows Installer does not write DisplayIcon into Uninstall records; Apps
+    # and Programs resolve an MSI product's icon from its ARPPRODUCTICON-derived
+    # ProductIcon registration. For a per-user product that value is an
+    # environment-relative path (%APPDATA%\...), so expand it before resolving.
+    $registeredIcon = Product-Info $product 2 'ProductIcon'
+    Require (-not [string]::IsNullOrWhiteSpace($registeredIcon)) 'Installed product icon is not registered'
+    $icon = [Environment]::ExpandEnvironmentVariables(($registeredIcon -replace ',\s*-?\d+$', '').Trim('"'))
+    $roamingCache = Join-Path ([Environment]::GetFolderPath('ApplicationData')) "Microsoft\Installer\$product"
+    $iconFacts = [ordered]@{
+        registered_with_environment_reference = $registeredIcon.Contains('%')
+        expanded_path_rooted = [IO.Path]::IsPathFullyQualified($icon)
+        in_roaming_installer_product_cache = [IO.Path]::IsPathFullyQualified($icon) -and [IO.Path]::GetDirectoryName($icon) -ieq $roamingCache
+        file_name_is_authored_icon = [IO.Path]::GetFileName($icon) -ceq 'Inklow.exe'
+        file_exists = [IO.Path]::IsPathFullyQualified($icon) -and (Test-Path -LiteralPath $icon -PathType Leaf)
+    }
+    $receipt.observations.Add(@{ check = 'installed_product_icon'; passed = [bool]$iconFacts.file_exists; evidence = $iconFacts })
+    Require ($iconFacts.expanded_path_rooted -and $iconFacts.file_name_is_authored_icon) 'Installed product icon registration differs'
+    Require $iconFacts.file_exists 'Installed product icon file is missing'
     $registration = Get-ItemProperty -LiteralPath 'HKCU:\Software\Inklow\Installer'
     Equal $registration.Version $Package.version 'HKCU version differs'
     Equal $registration.SourceCommit $Package.source_commit 'HKCU source differs'
@@ -529,17 +643,19 @@ function New-MsiStartInfo([string[]]$Arguments, [string]$Log) {
 }
 function Msi-Transaction([string]$Stage, [string[]]$Arguments, [switch]$ExpectedFailure, [switch]$RollbackFailure) {
     Require (-not ($ExpectedFailure -and $RollbackFailure)) 'Ambiguous expected MSI failure refused'
+    $receipt.observations.Add(@{ check = 'installer_mutex_access_before_client'; status = 'observed'; passed = $null; evidence = @{ stage = $Stage; diagnostic_only = $true; opens = [BroTypistInstallerNative]::InstallerMutexAccess() } })
     $log = Join-Path $Work ($Stage + '.msi.log')
     $logs.Add($log)
     # Set before launch and clear only after a synchronous client exit. Any
     # intervening exception leaves service transaction quiescence unprovable.
     $script:installerTransactionActive = $true
     # Start-Process defaults to ShellExecute on desktop Windows. That brokered
-    # path cannot establish inheritance of this verified restricted primary
+    # path cannot establish inheritance of this verified standard-user primary
     # token. Use direct process creation, with the identical MSI arguments.
     $start = New-MsiStartInfo $Arguments $log
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
+    $startedAt = [DateTime]::UtcNow
     Require ($process.Start()) 'Direct msiexec client creation failed'
     $owned.Add($process)
     [void]$process.Handle
@@ -549,9 +665,11 @@ function Msi-Transaction([string]$Stage, [string[]]$Arguments, [switch]$Expected
         # query is retained as failure, but still wait for synchronous MSI exit
         # before throwing so cleanup and the policy lease cannot race it.
         $actualClientToken = [BroTypistInstallerNative]::ProcessTokenFacts($process.Handle, $ExpectedUserSid)
-        $actualClientVerified = $actualClientToken.same_user_as_launcher -and -not $actualClientToken.is_system -and -not $actualClientToken.administrator_role_enabled -and $actualClientToken.integrity_rid -eq 8192 -and $actualClientToken.token_has_restrictions -eq 1 -and $actualClientToken.token_type -eq 1 -and $actualClientToken.impersonation_level -ceq 'None'
+        Assert-StandardUserToken $actualClientToken
+        $actualClientVerified = $true
     } catch { $actualClientVerified = $false }
-    $receipt.observations.Add(@{ check = 'msi_client_primary_token'; passed = $actualClientVerified; evidence = @{ stage = $Stage; shell_execute = $false; launch = 'direct ProcessStartInfo, inherited primary token/environment, no alternate credentials'; actual_child_token = $actualClientToken; token_query_succeeded = $null -ne $actualClientToken; genuine_uac_filtered_logon = $false; elevation_metadata_is_not_a_rights_assertion = $true } })
+    $receipt.observations.Add(@{ check = 'msi_client_primary_token'; passed = $actualClientVerified; evidence = @{ stage = $Stage; shell_execute = $false; launch = 'direct ProcessStartInfo, inherited primary token/environment, no alternate credentials'; actual_child_token = $actualClientToken; token_query_succeeded = $null -ne $actualClientToken; genuine_standard_user = $actualClientVerified } })
+    $receipt.observations.Add(@{ check = 'msi_client_desktop'; status = 'observed'; passed = $null; evidence = [BroTypistInstallerNative]::ProcessObservation($process, $null, $false) })
     if (-not $process.WaitForExit(180000)) {
         $script:transactionUnknown = $true
         try {
@@ -562,13 +680,43 @@ function Msi-Transaction([string]$Stage, [string[]]$Arguments, [switch]$Expected
     }
     $code = $process.ExitCode
     $script:installerTransactionActive = $false
-    Observe-MsiRouting $Stage $log
-    if ($RequireRestrictedClient) {
-        if (-not $actualClientVerified) {
-            foreach ($product in $products) { Observe-ArpScope ($Stage + '_after_unverified_child_exit') $product }
+    if ($code -notin @(0, 3010)) {
+        $receipt.observations.Add(@{ check = 'installer_mutex_access_after_failure'; status = 'observed'; passed = $null; evidence = @{ stage = $Stage; diagnostic_only = $true; opens = [BroTypistInstallerNative]::InstallerMutexAccess() } })
+        $environment = @{ stage = $Stage; service_status = $null; events_are_temporal_only = $true; events = @() }
+        $service = $null
+        try {
+            $service = Get-Service -Name 'msiserver'
+            $environment.service_status = $service.Status.ToString()
+        } catch { $environment.service_query_error_type = $_.Exception.GetType().FullName }
+        finally { if ($null -ne $service) { $service.Dispose() } }
+        try {
+            $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; Id = 1015; StartTime = $startedAt.AddSeconds(-2) } -MaxEvents 8)
+            $environment.events = @(
+                foreach ($event in $events) {
+                    try {
+                        $codes = @(
+                            foreach ($property in @($event.Properties | Select-Object -First 1)) {
+                                $value = $property.Value
+                                if ($value -is [string] -and $value -cmatch '^0[xX][0-9a-fA-F]{8}$') { $value.ToLowerInvariant() }
+                                elseif (($value -is [int] -or $value -is [uint32] -or $value -is [long]) -and [long]$value -ge [int]::MinValue -and [long]$value -le [uint32]::MaxValue) { '0x{0:x8}' -f ([uint32]([long]$value -band 0xffffffffL)) }
+                            }
+                        )
+                        @{ event_id = 1015; error_codes = $codes }
+                    } finally { $event.Dispose() }
+                }
+            )
+            $environment.event_query = 'observed'
+        } catch {
+            $environment.event_query = if ($_.FullyQualifiedErrorId.StartsWith('NoMatchingEventsFound', [StringComparison]::Ordinal)) { 'no_matching_events' } else { 'failed' }
+            if ($environment.event_query -ceq 'failed') { $environment.event_query_error_type = $_.Exception.GetType().FullName }
         }
-        Require $actualClientVerified 'Actual msiexec child primary token was not independently verified as same-user non-System Administrator-disabled medium restricted rights'
+        $receipt.observations.Add(@{ check = 'installer_service_after_failure'; status = 'observed'; passed = $null; evidence = $environment })
     }
+    Observe-MsiRouting $Stage $log
+    if (-not $actualClientVerified) {
+        foreach ($product in $products) { Observe-ArpScope ($Stage + '_after_unverified_child_exit') $product }
+    }
+    Require $actualClientVerified 'Actual msiexec child primary token was not independently verified as the expected genuine standard user'
     $rejected = $false
     if ($ExpectedFailure -and $code -eq 1603) {
         $text = Bounded-Text $log 65536
@@ -667,23 +815,24 @@ function Probe-TinyWorker([string]$Directory, [string]$Stage, [string]$OutputNam
     Assert-Run
 }
 function Probe-Gui([string]$Directory, [string]$Stage) {
-    $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $Directory 'BroTypist.exe'))
-    $start.UseShellExecute = $false; $start.WorkingDirectory = $profile
-    foreach ($arg in @('--paused', '--settings', '--no-tray', '--pane', 'about')) { $start.ArgumentList.Add($arg) }
-    $gui = [Diagnostics.Process]::new(); $gui.StartInfo = $start
-    Require ($gui.Start()) 'Could not start owned GUI'
-    $owned.Add($gui)
-    [void]$gui.Handle
+    $setupCompleted = (Get-Content -LiteralPath (Join-Path $profile 'settings.json') -Raw | ConvertFrom-Json).setup_completed
+    # Connection handles opened by Windows are not inheritable. Select the
+    # verified private desktop explicitly rather than the new logon's default.
+    $gui = [BroTypistInstallerNative]::StartSettings((Join-Path $Directory 'BroTypist.exe'), $profile, $owned)
     $children = [System.Collections.Generic.Dictionary[int,System.Diagnostics.Process]]::new()
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     $window = [IntPtr]::Zero
     do {
-        Require (-not $gui.HasExited) 'GUI exited before visible Settings'
+        if ($gui.HasExited) {
+            $receipt.observations.Add(@{ check = ($Stage + '_startup_exit'); passed = $false; evidence = [BroTypistInstallerNative]::ProcessObservation($gui, $setupCompleted, $true) })
+            throw 'GUI exited before visible Settings'
+        }
         Capture-Children $gui $children
         $window = [BroTypistInstallerNative]::FindSettings([uint32]$gui.Id)
         if ($window -ne [IntPtr]::Zero) { break }
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
+    $receipt.observations.Add(@{ check = ($Stage + '_window_state'); passed = $null; status = 'observed'; evidence = [BroTypistInstallerNative]::ProcessObservation($gui, $setupCompleted, $true) })
     Require ($window -ne [IntPtr]::Zero) 'Owned visible Settings HWND not observed before deadline'
     $button = [BroTypistInstallerNative]::GetDlgItem($window, 13)
     Require ($button -ne [IntPtr]::Zero) 'Canonical Quit control ID 13 missing'
@@ -709,6 +858,8 @@ function Probe-Gui([string]$Directory, [string]$Stage) {
 try {
     Require ($IsWindows -and [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [Runtime.InteropServices.Architecture]::X64) 'Native Windows x86_64 required'
     Require ($env:BROTYPIST_INSTALLER_SMOKE_DISPOSABLE -ceq '1' -and $env:CI -ceq 'true' -and $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted' -and $env:RUNNER_OS -ceq 'Windows') 'Explicit disposable GitHub-hosted Windows guard required'
+    Require ([bool]$RequireStandardUser) 'Genuine disposable standard-user launcher required'
+    Require ($ExpectedUserSid -cmatch '^S-1-5-21-\d+-\d+-\d+-\d+$' -and $SupervisorSid -cmatch '^S-1-5-21-\d+-\d+-\d+-\d+$' -and $ExpectedUserSid -cne $SupervisorSid) 'Distinct validation and supervisor account identities required'
     $Work = [IO.Path]::GetFullPath($Work)
     Require (Test-Path -LiteralPath $Work -PathType Container) 'Owned evidence work directory is missing'
     Require (-not (Test-Path -LiteralPath (Join-Path $Work 'observations.json'))) 'Refusing existing evidence output'
@@ -732,6 +883,53 @@ public static class BroTypistInstallerNative {
     [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthority(IntPtr sid,uint index);
     [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr process,uint access,out IntPtr token);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern IntPtr OpenMutexW(uint access,bool inherit,string name);
+    public static System.Collections.Generic.List<object> InstallerMutexAccess() {
+        // Open-only observations: never create, acquire, release, or change the
+        // security of an Installer mutex. Errors are observations, not absence.
+        var facts=new System.Collections.Generic.List<object>();
+        uint[] access={0x100000,0x1,0x20000,0x1f0001};
+        string[] kinds={"synchronize","modify_state","read_control","all_access"};
+        foreach(string scope in new[] { "Global","Local" }) {
+            // Never-created random controls distinguish object-specific denial
+            // from failure to traverse the Global/Local namespace itself.
+            IntPtr control=OpenMutexW(0x100000,false,scope+@"\btci-"+Guid.NewGuid().ToString("N"));
+            int controlError=control==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+            bool? controlClosed=control==IntPtr.Zero ? (bool?)null : CloseHandle(control);
+            facts.Add(new System.Collections.Generic.Dictionary<string,object> {
+                {"candidate_name","uncreated_random_control"}, {"scope",scope}, {"access","synchronize"},
+                {"opened",control!=IntPtr.Zero}, {"error",controlError}, {"handle_closed",controlClosed}
+            });
+            string name=scope+@"\_MSIExecute";
+            for(int index=0;index<access.Length;index++) {
+                IntPtr mutex=OpenMutexW(access[index],false,name);
+                int error=mutex==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+                bool? closed=mutex==IntPtr.Zero ? (bool?)null : CloseHandle(mutex);
+                facts.Add(new System.Collections.Generic.Dictionary<string,object> {
+                    {"candidate_name","_MSIExecute"}, {"scope",scope}, {"access",kinds[index]}, {"opened",mutex!=IntPtr.Zero},
+                    {"error",error}, {"handle_closed",closed}
+                });
+            }
+        }
+        return facts;
+    }
+    public static System.Collections.Generic.Dictionary<string,object> NamedObjectNamespace() {
+        // Open-only: a never-created name must be reported absent (2). Access
+        // denied means the namespace itself cannot be opened, so neither can
+        // any Windows Installer mutex. Nothing is created, acquired or changed.
+        var facts=new System.Collections.Generic.Dictionary<string,object>();
+        bool accessible=true;
+        foreach(string scope in new[] { "Local","Global" }) {
+            IntPtr control=OpenMutexW(0x100000,false,scope+@"\btci-"+Guid.NewGuid().ToString("N"));
+            int error=control==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+            if(control!=IntPtr.Zero) CloseHandle(control);
+            facts[scope.ToLowerInvariant()+"_uncreated_name_error"]=error;
+            if(error!=2) accessible=false;
+        }
+        facts["session_named_objects_accessible"]=accessible;
+        return facts;
+    }
     public static System.Collections.Generic.Dictionary<string,object> ProcessTokenFacts(IntPtr process,string expectedSid) {
         IntPtr token;
         // TOKEN_QUERY | TOKEN_DUPLICATE: WindowsPrincipal.IsInRole duplicates a
@@ -742,7 +940,7 @@ public static class BroTypistInstallerNative {
             uint[] facts=TokenFacts(token);
             using(var identity=new System.Security.Principal.WindowsIdentity(token)) {
                 return new System.Collections.Generic.Dictionary<string,object> {
-                    {"same_user_as_launcher",identity.User.Value==expectedSid},
+                    {"matches_expected_user",identity.User.Value==expectedSid},
                     {"is_system",identity.IsSystem},
                     {"administrator_role_enabled",new System.Security.Principal.WindowsPrincipal(identity).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator)},
                     {"administrator_group_present",identity.Groups.Contains(new System.Security.Principal.SecurityIdentifier("S-1-5-32-544"))},
@@ -769,6 +967,15 @@ public static class BroTypistInstallerNative {
             return new uint[] { elevated,type,integrity,restricted,tokenType };
         } finally { Marshal.FreeHGlobal(buffer); }
     }
+    [DllImport("userenv.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool GetUserProfileDirectoryW(IntPtr token,StringBuilder path,ref uint length);
+    public static string ProfileDirectory(IntPtr token) {
+        uint length=0;
+        GetUserProfileDirectoryW(token,null,ref length);
+        if(length==0 || length>32768) throw new InvalidOperationException("Invalid validation profile length");
+        var path=new StringBuilder((int)length);
+        if(!GetUserProfileDirectoryW(token,path,ref length)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return path.ToString();
+    }
     public static async System.Threading.Tasks.Task<long> Capture(System.IO.Stream source,System.IO.Stream destination,int limit) {
         byte[] buffer=new byte[8192]; long total=0; int retained=0;
         for (;;) {
@@ -783,21 +990,235 @@ public static class BroTypistInstallerNative {
     }
     [DllImport("msi.dll", CharSet=CharSet.Unicode, ExactSpelling=true)] public static extern uint MsiGetProductInfoExW(string product,string sid,uint context,string property,StringBuilder value,ref uint length);
     [DllImport("msi.dll", CharSet=CharSet.Unicode, ExactSpelling=true)] public static extern uint MsiEnumRelatedProductsW(string upgrade,uint reserved,uint index,StringBuilder product);
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    struct Startup {
+        public int size;
+        public string reserved,desktop,title;
+        public uint x,y,width,height,xChars,yChars,fill,flags;
+        public ushort show,reservedCount;
+        public IntPtr reservedBytes,input,output,error;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct ProcessInfo {
+        public IntPtr process,thread;
+        public uint processId,threadId;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern bool CreateProcessW(string application,StringBuilder command,IntPtr processAttributes,IntPtr threadAttributes,bool inherit,uint flags,IntPtr environment,string directory,ref Startup startup,out ProcessInfo process);
+    [DllImport("kernelbase.dll", ExactSpelling=true, SetLastError=true)] static extern bool CompareObjectHandles(IntPtr left,IntPtr right);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(IntPtr process,uint exit);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle,uint timeout);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetProcessWindowStation();
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetThreadDesktop(uint thread);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern bool GetUserObjectInformationW(IntPtr handle,int index,StringBuilder value,uint bytes,out uint needed);
+    [StructLayout(LayoutKind.Sequential)] struct UserFlags { public int inherit,reserved; public uint flags; }
+    [DllImport("user32.dll", EntryPoint="GetUserObjectInformationW", ExactSpelling=true, SetLastError=true)]
+    static extern bool ObjectFlags(IntPtr handle,int index,out UserFlags value,uint bytes,out uint needed);
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr OpenInputDesktop(uint flags,bool inherit,uint access);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool CloseDesktop(IntPtr desktop);
+    [DllImport("user32.dll")] static extern IntPtr GetDesktopWindow();
+    public static bool GuiLaunchOwnershipUnresolved;
+    static string ObjectName(IntPtr handle) {
+        uint needed;
+        GetUserObjectInformationW(handle,2,null,0,out needed);
+        if(needed<2 || needed>65536 || (needed&1)!=0) throw new InvalidOperationException("Invalid owned desktop name length");
+        var value=new StringBuilder((int)needed/2);
+        if(!GetUserObjectInformationW(handle,2,value,needed,out needed))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return value.ToString();
+    }
+    static string expectedDesktop;
+    static string PrivateDesktop() {
+        string station=ObjectName(GetProcessWindowStation());
+        string desktop=ObjectName(GetThreadDesktop(GetCurrentThreadId()));
+        if(!station.Equals("WinSta0",StringComparison.OrdinalIgnoreCase) || expectedDesktop==null || !desktop.Equals(expectedDesktop,StringComparison.Ordinal))
+            throw new InvalidOperationException("Authenticated owned interactive desktop connection required");
+        UserFlags flags; uint needed;
+        if(!ObjectFlags(GetProcessWindowStation(),1,out flags,(uint)Marshal.SizeOf<UserFlags>(),out needed))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        if((flags.flags&1)==0) throw new InvalidOperationException("Interactive station is not visible");
+        IntPtr input=OpenInputDesktop(0,false,1);
+        if(input==IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            if(!ObjectName(input).Equals(expectedDesktop,StringComparison.Ordinal))
+                throw new InvalidOperationException("Owned desktop is not the input desktop");
+        } finally {
+            if(!CloseDesktop(input)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        }
+        return @"WinSta0\"+expectedDesktop;
+    }
+    public static System.Collections.Generic.Dictionary<string,object> VerifyInteractiveDesktop(string expected) {
+        if(expectedDesktop!=null || expected==null || expected.Length!=37 || !expected.StartsWith("btci-",StringComparison.Ordinal))
+            throw new InvalidOperationException("Invalid authenticated desktop identity");
+        for(int index=5;index<expected.Length;index++) {
+            char value=expected[index];
+            if(!((value>='0'&&value<='9')||(value>='a'&&value<='f')))
+                throw new InvalidOperationException("Invalid authenticated desktop identity");
+        }
+        expectedDesktop=expected;
+        try { PrivateDesktop(); }
+        catch { expectedDesktop=null; throw; }
+        return new System.Collections.Generic.Dictionary<string,object> {
+            {"interactive_station",true}, {"expected_desktop_matches",true},
+            {"station_visible",true}, {"input_desktop_matches",true}
+        };
+    }
+    public static System.Diagnostics.Process StartSettings(string executable,string directory,System.Collections.Generic.List<System.Diagnostics.Process> owned) {
+        if(GuiLaunchOwnershipUnresolved || !System.IO.Path.IsPathFullyQualified(executable) || !System.IO.Path.IsPathFullyQualified(directory))
+            throw new InvalidOperationException("Invalid owned GUI launch");
+        foreach(char value in executable)
+            if(value=='"' || value=='\r' || value=='\n' || value=='\0')
+                throw new InvalidOperationException("Unsafe GUI executable path");
+        var startup=new Startup { size=Marshal.SizeOf<Startup>(),desktop=PrivateDesktop() };
+        var command=new StringBuilder("\""+executable+"\" --paused --settings --no-tray --pane about");
+        ProcessInfo info;
+        if(!CreateProcessW(executable,command,IntPtr.Zero,IntPtr.Zero,false,4,IntPtr.Zero,directory,ref startup,out info))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        GuiLaunchOwnershipUnresolved=true;
+        System.Diagnostics.Process process=null;
+        bool tracked=false;
+        try {
+            process=System.Diagnostics.Process.GetProcessById(checked((int)info.processId));
+            // Open and compare while suspended: never adopt a reused PID.
+            if(!CompareObjectHandles(info.process,process.Handle))
+                throw new InvalidOperationException("GUI process handle identity differs");
+            owned.Add(process); tracked=true; GuiLaunchOwnershipUnresolved=false;
+            uint previous=ResumeThread(info.thread);
+            if(previous==0xffffffff) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            if(previous!=1) throw new InvalidOperationException("Unexpected GUI suspend count");
+            return process;
+        } finally {
+            if(!tracked) {
+                // Never-resumed and held by its original creation handle.
+                bool exited=WaitForSingleObject(info.process,0)==0;
+                if(!exited) {
+                    TerminateProcess(info.process,1);
+                    exited=WaitForSingleObject(info.process,30000)==0;
+                }
+                GuiLaunchOwnershipUnresolved=!exited;
+                if(process!=null) process.Dispose();
+            }
+            CloseHandle(info.thread); CloseHandle(info.process);
+        }
+    }
     delegate bool EnumProc(IntPtr hwnd,IntPtr data);
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc callback,IntPtr data);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool EnumWindows(EnumProc callback,IntPtr data);
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr hwnd,int id);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd,out uint process);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool IsHungAppWindow(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll", SetLastError=true)] static extern uint GetGuiResources(IntPtr process,uint flags);
     [StructLayout(LayoutKind.Sequential)] struct Rect { public int left,top,right,bottom; }
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd,out Rect rect);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr hwnd,StringBuilder text,int length);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr hwnd,StringBuilder text,int length);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd,uint flags);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)] public static extern IntPtr SendMessageTimeoutW(IntPtr hwnd,uint message,UIntPtr wp,IntPtr lp,uint flags,uint timeout,out UIntPtr result);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)] public static extern IntPtr SendMessageTimeoutW(IntPtr hwnd,uint message,UIntPtr wp,IntPtr lp,uint flags,uint timeout,out UIntPtr result);
+    [DllImport("user32.dll", ExactSpelling=true, SetLastError=true)] static extern IntPtr GetWindowLongPtrW(IntPtr hwnd,int index);
     static string Class(IntPtr hwnd) { var text=new StringBuilder(256); GetClassNameW(hwnd,text,text.Capacity); return text.ToString(); }
+    static string DesktopKind(string name) {
+        if(expectedDesktop!=null && name.Equals(expectedDesktop,StringComparison.Ordinal)) return "owned_interactive";
+        if(name.Equals("Default",StringComparison.OrdinalIgnoreCase)) return "default";
+        return "other";
+    }
+    public static System.Collections.Generic.Dictionary<string,object> ProcessObservation(System.Diagnostics.Process process,bool? setupCompleted,bool explicitDesktop) {
+        var facts=new System.Collections.Generic.Dictionary<string,object> {
+            {"explicit_private_desktop",explicitDesktop}, {"stderr_captured",false},
+            {"profile_setup_completed_at_launch",setupCompleted}
+        };
+        bool alive=false;
+        try {
+            alive=!process.HasExited;
+            facts["exited"]=!alive;
+            facts["exit_code"]=alive ? (object)null : process.ExitCode;
+            uint resources=GetGuiResources(process.Handle,1);
+            facts["user_objects"]=resources;
+            facts["user_objects_error"]=resources==0 ? Marshal.GetLastWin32Error() : 0;
+        } catch(System.ComponentModel.Win32Exception error) { facts["process_query_error"]=error.NativeErrorCode; }
+        catch(InvalidOperationException) { facts["process_query_unavailable"]=true; }
+        try {
+            string station=ObjectName(GetProcessWindowStation());
+            IntPtr observerDesktop=GetThreadDesktop(GetCurrentThreadId());
+            facts["observer_station_kind"]=station.Equals("WinSta0",StringComparison.OrdinalIgnoreCase) ? "interactive" : "other";
+            facts["observer_desktop_kind"]=DesktopKind(ObjectName(observerDesktop));
+            UserFlags stationFlags; uint needed;
+            if(ObjectFlags(GetProcessWindowStation(),1,out stationFlags,(uint)Marshal.SizeOf<UserFlags>(),out needed))
+                facts["station_visible_surfaces"]=(stationFlags.flags&1)!=0;
+            else facts["station_flags_error"]=Marshal.GetLastWin32Error();
+            if(alive) {
+                var desktops=new System.Collections.Generic.List<object>();
+                facts["thread_desktops"]=desktops;
+                var threads=process.Threads;
+                facts["thread_count"]=threads.Count;
+                facts["thread_desktops_truncated"]=threads.Count>64;
+                for(int index=0;index<threads.Count && index<64;index++) {
+                    IntPtr childDesktop=GetThreadDesktop(unchecked((uint)threads[index].Id));
+                    if(childDesktop==IntPtr.Zero) {
+                        desktops.Add(new System.Collections.Generic.Dictionary<string,object> { {"query_error",Marshal.GetLastWin32Error()} });
+                        continue;
+                    }
+                    bool same=CompareObjectHandles(observerDesktop,childDesktop);
+                    int comparisonError=same ? 0 : Marshal.GetLastWin32Error();
+                    desktops.Add(new System.Collections.Generic.Dictionary<string,object> {
+                        {"desktop_kind",DesktopKind(ObjectName(childDesktop))},
+                        {"same_desktop_object",same}, {"comparison_error",comparisonError}
+                    });
+                }
+            }
+        } catch(System.ComponentModel.Win32Exception error) { facts["desktop_query_error"]=error.NativeErrorCode; }
+        catch(InvalidOperationException) { facts["desktop_query_unavailable"]=true; }
+        var windows=new System.Collections.Generic.List<object>();
+        bool truncated=false,probedSettings=false;
+        uint pid=unchecked((uint)process.Id);
+        bool complete=EnumWindows((hwnd,data)=>{
+            uint owner; GetWindowThreadProcessId(hwnd,out owner);
+            if(owner!=pid) return true;
+            if(windows.Count>=32) { truncated=true; return false; }
+            string windowClass=Class(hwnd);
+            IntPtr style=GetWindowLongPtrW(hwnd,-16);
+            int styleError=style==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+            var windowFacts=new System.Collections.Generic.Dictionary<string,object> {
+                {"class",windowClass}, {"visible",IsWindowVisible(hwnd)},
+                {"iconic",IsIconic(hwnd)}, {"hung",IsHungAppWindow(hwnd)},
+                {"style",unchecked((uint)style.ToInt64()).ToString("X8")}, {"style_error",styleError}
+            };
+            if(windowClass=="BroTypist.Settings" && !probedSettings) {
+                probedSettings=true;
+                UIntPtr result;
+                // WM_NULL observes startup/message-pump liveness without showing,
+                // activating, closing, or modifying an application window.
+                IntPtr sent=SendMessageTimeoutW(hwnd,0,UIntPtr.Zero,IntPtr.Zero,0x0003,2000,out result);
+                windowFacts["null_message_responded"]=sent!=IntPtr.Zero;
+                windowFacts["null_message_error"]=sent==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+                var ancestors=new System.Collections.Generic.List<object>();
+                IntPtr ancestor=GetAncestor(hwnd,1),desktopWindow=GetDesktopWindow();
+                while(ancestor!=IntPtr.Zero && ancestors.Count<16) {
+                    IntPtr ancestorStyle=GetWindowLongPtrW(ancestor,-16);
+                    int ancestorError=ancestorStyle==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+                    ancestors.Add(new System.Collections.Generic.Dictionary<string,object> {
+                        {"class",Class(ancestor)}, {"visible",IsWindowVisible(ancestor)},
+                        {"style",unchecked((uint)ancestorStyle.ToInt64()).ToString("X8")},
+                        {"style_error",ancestorError}, {"observer_desktop_window",ancestor==desktopWindow}
+                    });
+                    ancestor=GetAncestor(ancestor,1);
+                }
+                windowFacts["ancestors"]=ancestors;
+                windowFacts["ancestors_truncated"]=ancestor!=IntPtr.Zero;
+            }
+            windows.Add(windowFacts);
+            return true;
+        },IntPtr.Zero);
+        facts["owned_windows"]=windows;
+        facts["window_enumeration_complete"]=complete;
+        facts["window_enumeration_error"]=!complete && !truncated ? Marshal.GetLastWin32Error() : 0;
+        facts["windows_truncated"]=truncated;
+        // No HWNDs, thread IDs, titles, or private desktop nonces are retained.
+        return facts;
+    }
     public static IntPtr FindSettings(uint pid) {
         IntPtr found=IntPtr.Zero;
         EnumWindows((hwnd,data)=>{ uint owner; GetWindowThreadProcessId(hwnd,out owner); if(owner==pid && IsWindowVisible(hwnd) && !IsIconic(hwnd) && !IsHungAppWindow(hwnd) && Class(hwnd)=="BroTypist.Settings") { found=hwnd; return false; } return true; },IntPtr.Zero);
@@ -814,6 +1235,11 @@ public static class BroTypistInstallerNative {
 }
 '@
     Observe-ClientAndPolicy
+    Observe 'owned_interactive_desktop_verified_before_installer' ([BroTypistInstallerNative]::VerifyInteractiveDesktop($ExpectedDesktopName))
+    $receipt.observations.Add(@{ check = 'installer_mutex_access_before_api_preflight'; status = 'observed'; passed = $null; evidence = @{ diagnostic_only = $true; opens = [BroTypistInstallerNative]::InstallerMutexAccess() } })
+    $namedObjects = [BroTypistInstallerNative]::NamedObjectNamespace()
+    $receipt.observations.Add(@{ check = 'session_named_objects_accessible_before_installer'; passed = [bool]$namedObjects.session_named_objects_accessible; evidence = $namedObjects })
+    Require ([bool]$namedObjects.session_named_objects_accessible) 'Standard user cannot open the session named-object namespace; Windows Installer cannot acquire its execution mutex'
     $installDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\BroTypist'
     $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'BroTypist.lnk'
     Require (-not (Test-Path -LiteralPath $installDirectory) -and -not (Test-Path -LiteralPath $shortcut) -and -not (Test-Path -LiteralPath 'HKCU:\Software\Inklow\Installer')) 'Existing BroTypist installation/registration refused'
@@ -837,7 +1263,7 @@ public static class BroTypistInstallerNative {
         $products.Add($code)
     }
     $originalRun = Read-Run; $runObserved = $true
-    $root = Join-Path $env:RUNNER_TEMP ('brotypist-installer-' + [Guid]::NewGuid().ToString('N'))
+    $root = Join-Path $Work ('brotypist-installer-' + [Guid]::NewGuid().ToString('N'))
     New-PrivateDirectory $root
     $profile = Join-Path $root 'profile'
     New-PrivateDirectory $profile
@@ -975,7 +1401,8 @@ public static class BroTypistInstallerNative {
         try { Remove-Item -LiteralPath (Join-Path $Work 'CI-ONLY-NONDISTRIBUTABLE-rollback.msi') -Force }
         catch { $receipt.diagnostics.Add('Owned nondistributable rollback fixture cleanup failed') }
     }
-    $ownedQuiescent = $true
+    $nativeType = 'BroTypistInstallerNative' -as [type]
+    $ownedQuiescent = $null -eq $nativeType -or -not $nativeType::GuiLaunchOwnershipUnresolved
     foreach ($process in $owned) {
         try { if (-not $process.HasExited) { $ownedQuiescent = $false } }
         catch { $ownedQuiescent = $false }
@@ -983,6 +1410,7 @@ public static class BroTypistInstallerNative {
     $receipt.quiescence = @{
         installer_transactions_quiescent = -not $transactionUnknown -and -not $installerTransactionActive
         owned_processes_quiescent = $ownedQuiescent
+        uninstall_verified = -not $installAttempted -or @($receipt.observations | Where-Object { $_.check -ceq 'uninstall' -and $_.passed -eq $true }).Count -eq 1
         unknown_transaction_is_not_exit_evidence = $true
     }
     $receipt.passed = $receipt.diagnostics.Count -eq 0 -and $installAttempted -and $receipt.quiescence.installer_transactions_quiescent -and $receipt.quiescence.owned_processes_quiescent -and @($receipt.observations | Where-Object { $_.check -eq 'installed_native_settings_quit' }).Count -eq 1 -and @($receipt.observations | Where-Object { $_.check -eq 'uninstall' -and $_.passed }).Count -eq 1
@@ -992,3 +1420,4 @@ public static class BroTypistInstallerNative {
 }
 if (-not $receipt.passed) { [Console]::Error.WriteLine('Windows core installer smoke failed; see redacted observations'); exit 1 }
 Write-Output 'Windows core installer smoke passed within the explicitly recorded upgrade/rollback scope'
+exit 0

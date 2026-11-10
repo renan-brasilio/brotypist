@@ -153,17 +153,37 @@ fn execute(bundle: &Path, assets: &Path, output: &Path, receipt: &mut Value) -> 
         .arg(&*external_tool_path(&input))
         .arg("-Work")
         .arg(&*external_tool_path(&work))
+        .arg("-ReportDirectory")
+        .arg(&*external_tool_path(output))
         .stdin(std::process::Stdio::null())
         .status()
         .context("cannot invoke owned native installer probe")?;
-    let client_path = work.join("client-observations.json");
-    regular(&client_path).context("shared restricted client did not produce policy evidence")?;
+    retain_native_evidence(&work, output, status.success(), receipt)?;
+    receipt["stage"] = json!("completed_core_scope_only");
+    Ok(())
+}
+
+fn retain_native_evidence(
+    work: &Path,
+    output: &Path,
+    client_succeeded: bool,
+    receipt: &mut Value,
+) -> Result<()> {
+    let client_path = output.join("client-observations.json");
+    regular(&client_path)
+        .context("shared standard-user client did not produce lifecycle evidence")?;
     ensure!(
         fs::metadata(&client_path)?.len() <= 256 * 1024,
-        "restricted client evidence exceeds limit"
+        "standard-user client evidence exceeds limit"
     );
     let client: Value = serde_json::from_slice(&fs::read(client_path)?)?;
-    receipt["restricted_client"] = client.clone();
+    receipt["standard_user_client"] = client.clone();
+    // The public supervisor receipt is safe to retain even if the child never
+    // exits. Do not inspect or promote private native output without quiescence.
+    ensure!(
+        client["quiescence_verified"] == true,
+        "standard-user client quiescence is unverified; private evidence retained on disposable host"
+    );
     let observed_path = work.join("observations.json");
     regular(&observed_path).context("native installer probe did not produce evidence")?;
     ensure!(
@@ -190,25 +210,70 @@ fn execute(bundle: &Path, assets: &Path, output: &Path, receipt: &mut Value) -> 
             json_new(&output.join(format!("{name}.json")), &worker_observed)?;
         }
     }
+    ensure!(client_succeeded, "native installer client failed");
+    validate_native_evidence(&client, &observed)?;
+    Ok(())
+}
+
+fn validate_native_evidence(client: &Value, observed: &Value) -> Result<()> {
+    for field in [
+        "passed",
+        "genuine_standard_user",
+        "account_cleanup_verified",
+        "profile_cleanup_verified",
+        "restoration_verified",
+        "quiescence_verified",
+        "station_access_restoration_verified",
+        "session_namespace_restoration_verified",
+        "input_desktop_restoration_verified",
+        "private_desktop_cleanup_verified",
+    ] {
+        ensure!(
+            client[field] == true,
+            "standard-user lifecycle evidence missing: {field}"
+        );
+    }
     ensure!(
-        status.success()
-            && client["passed"] == true
-            && client["restoration_verified"] == true
-            && client["quiescence_verified"] == true
-            && observed["passed"] == true
+        observed["passed"] == true
             && observed["observations"]
                 .as_array()
                 .context("native observations missing")?
                 .iter()
                 .filter(|row| {
-                    row["check"] == "restricted_rights_client_verified_before_installer"
+                    row["check"] == "genuine_standard_user_verified_before_installer"
                         && row["passed"] == true
                 })
                 .count()
                 == 1,
         "native installer assertions failed"
     );
-    receipt["stage"] = json!("completed_core_scope_only");
+    let mut desktops = observed["observations"]
+        .as_array()
+        .context("native observations missing")?
+        .iter()
+        .filter(|row| row["check"] == "owned_interactive_desktop_verified_before_installer");
+    let desktop = desktops
+        .next()
+        .context("owned interactive desktop proof missing")?;
+    ensure!(
+        desktops.next().is_none(),
+        "owned interactive desktop proof duplicated"
+    );
+    ensure!(
+        desktop["passed"] == true,
+        "owned interactive desktop verification failed"
+    );
+    for field in [
+        "interactive_station",
+        "expected_desktop_matches",
+        "station_visible",
+        "input_desktop_matches",
+    ] {
+        ensure!(
+            desktop["evidence"][field] == true,
+            "owned interactive desktop evidence missing: {field}"
+        );
+    }
     Ok(())
 }
 
@@ -336,13 +401,462 @@ fn verify_zip(path: &Path, rows: &[Row]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_public_client_receipt_survives_missing_or_unreadable_core() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("reports");
+        let work = temp.path().join("private");
+        fs::create_dir(&output).unwrap();
+        fs::create_dir(&work).unwrap();
+        let client_path = output.join("client-observations.json");
+        let mut client = json!({
+            "passed": false, "genuine_standard_user": false,
+            "account_cleanup_verified": false, "profile_cleanup_verified": false,
+            "restoration_verified": false, "quiescence_verified": false,
+            "failure": "native_lifecycle_unresolved"
+        });
+        for quiescence in [json!(false), Value::Null, json!("true"), json!(true)] {
+            client["quiescence_verified"] = quiescence;
+            fs::write(&client_path, serde_json::to_vec(&client).unwrap()).unwrap();
+            let mut receipt = json!({"passed": false});
+            assert!(retain_native_evidence(&work, &output, false, &mut receipt).is_err());
+            assert_eq!(receipt["standard_user_client"], client);
+            assert_eq!(receipt["passed"], false);
+            assert!(receipt.get("observations").is_none());
+            assert!(work.is_dir());
+        }
+        // Even an existing private report must not be read or promoted when the
+        // supervisor cannot establish process/MSI quiescence.
+        fs::write(work.join("observations.json"), b"not safe to read").unwrap();
+        client["quiescence_verified"] = json!(false);
+        fs::write(&client_path, serde_json::to_vec(&client).unwrap()).unwrap();
+        let mut receipt = json!({"passed": false});
+        assert!(retain_native_evidence(&work, &output, false, &mut receipt).is_err());
+        assert_eq!(receipt["standard_user_client"], client);
+        assert_eq!(
+            fs::read(work.join("observations.json")).unwrap(),
+            b"not safe to read"
+        );
+        let mut artifacts = fs::read_dir(&output).unwrap();
+        assert_eq!(
+            artifacts.next().unwrap().unwrap().file_name(),
+            "client-observations.json"
+        );
+        assert!(artifacts.next().is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unresolved_client_exits_and_retains_public_failure_without_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let reports = temp.path().join("reports");
+        let private = temp.path().join("private");
+        fs::create_dir(&reports).unwrap();
+        fs::create_dir(&private).unwrap();
+        for name in ["policy", "account", "profile", "tree"] {
+            fs::write(private.join(name), b"must remain unresolved").unwrap();
+        }
+        let script = temp.path().join("unresolved-client-fixture.ps1");
+        // Extract only the public failure/receipt seam. Never execute launcher
+        // preflight, native initialization, account creation, policy or MSI APIs.
+        fs::write(
+            &script,
+            r#"
+param([string]$Source, [string]$ReportDirectory, [string]$Work)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($Source, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'Client syntax errors' }
+foreach ($name in @('Require', 'Write-NewJson', 'Observe-NativeDesktopLease', 'Save-ClientReceipt', 'Stop-OwnedVm')) {
+    $definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name }, $true)
+    if ($null -eq $definition) { throw "Missing failure guard: $name" }
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$reportDirectoryValidated = $true
+$nativeInitialized = $false
+$metadata = [ordered]@{
+    schema = 1; passed = $false; classification = 'failed'; teardown_required = $false
+    stage = 'fixture_unresolved'; failure = $null; cleanup_failure = $null
+    genuine_standard_user = $false; account_cleanup_verified = $false
+    profile_cleanup_verified = $false; restoration_verified = $false
+    station_access_restoration_verified = $false; session_namespace_restoration_verified = $false
+    input_desktop_restoration_verified = $false
+    private_desktop_cleanup_verified = $false; interactive_station_acl_modified = $false
+    quiescence_verified = $false; uninstall_verified = $false
+    diagnostics = [Collections.Generic.List[string]]::new()
+}
+try { Stop-OwnedVm 'Fixture: process/MSI quiescence is unresolved' } catch {
+    [Console]::Error.WriteLine('Failure boundary threw instead of exiting with its public receipt')
+    exit 2
+}
+# These are inert file stand-ins, not actual policy/accounts/profiles. A return
+# from the fail-fast boundary would unsafely continue restoration and deletion.
+[IO.File]::WriteAllText((Join-Path $Work 'policy'), 'restored unsafely')
+foreach ($name in @('account', 'profile', 'tree')) { [IO.File]::Delete((Join-Path $Work $name)) }
+exit 0
+"#,
+        )
+        .unwrap();
+        let native = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/native");
+        let mut child = Command::new("pwsh.exe")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+            .arg(&script)
+            .arg(native.join("windows-installer-client.ps1"))
+            .arg(&reports)
+            .arg(&private)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("unresolved client retained an infinite-running process");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        assert_eq!(status.code(), Some(1));
+        let mut receipt = json!({"passed": false});
+        assert!(
+            retain_native_evidence(&private, &reports, status.success(), &mut receipt).is_err()
+        );
+        let client = &receipt["standard_user_client"];
+        assert_eq!(client["passed"], false);
+        assert_eq!(client["classification"], "unresolved");
+        assert_eq!(client["teardown_required"], true);
+        for field in [
+            "genuine_standard_user",
+            "account_cleanup_verified",
+            "profile_cleanup_verified",
+            "restoration_verified",
+            "quiescence_verified",
+            "uninstall_verified",
+            "station_access_restoration_verified",
+            "session_namespace_restoration_verified",
+            "input_desktop_restoration_verified",
+            "private_desktop_cleanup_verified",
+        ] {
+            assert_eq!(client[field], false);
+        }
+        assert!(receipt.get("observations").is_none());
+        assert!(!private.join("client-observations.json").exists());
+        for name in ["policy", "account", "profile", "tree"] {
+            assert_eq!(
+                fs::read(private.join(name)).unwrap(),
+                b"must remain unresolved"
+            );
+        }
+
+        let reuse_script = temp.path().join("reuse-failure-fixture.ps1");
+        fs::write(
+            &reuse_script,
+            r#"
+param([string]$Source, [string]$Reports, [string]$Work)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($Source, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'Reuse syntax errors' }
+foreach ($name in @('Require', 'Write-NewBytes', 'Write-NewJson', 'Assert-StandardUserEvidence', 'Retain-StandardUserEvidence')) {
+    $definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name }, $true)
+    if ($null -eq $definition) { throw "Missing evidence guard: $name" }
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$metadata = [ordered]@{ passed = $false; native_exit_code = 1 }
+$refused = $false
+try { Retain-StandardUserEvidence $Reports $Work $metadata } catch { $refused = $true }
+if (-not $refused -or $metadata.passed -or $metadata.standard_user_client.classification -cne 'unresolved' -or -not $metadata.standard_user_client.teardown_required) { throw 'Reuse lost unresolved failure evidence' }
+if (Test-Path -LiteralPath (Join-Path $Reports 'windows-core-installer-smoke.json')) { throw 'Reuse promoted unverified native evidence' }
+Write-NewJson (Join-Path $Reports 'reuse-failure.json') $metadata
+$missingCoreReports = Join-Path $Reports 'missing-core'
+[void][IO.Directory]::CreateDirectory($missingCoreReports)
+$failedClient = Get-Content -LiteralPath (Join-Path $Reports 'client-observations.json') -Raw | ConvertFrom-Json
+$failedClient.quiescence_verified = $true
+$failedClient.classification = 'failed'
+Write-NewJson (Join-Path $missingCoreReports 'client-observations.json') $failedClient
+$metadata = [ordered]@{ passed = $false; native_exit_code = 1 }
+$refused = $false
+try { Retain-StandardUserEvidence $missingCoreReports $Work $metadata } catch { $refused = $true }
+if (-not $refused -or $metadata.passed -or $metadata.standard_user_client.classification -cne 'failed' -or $metadata.standard_user_client.account_cleanup_verified) { throw 'Reuse discarded client metadata when core receipt was absent' }
+"#,
+        )
+        .unwrap();
+        let status = Command::new("pwsh.exe")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+            .arg(reuse_script)
+            .arg(native.join("windows-installer-reuse.ps1"))
+            .arg(&reports)
+            .arg(&private)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let reuse: Value =
+            serde_json::from_slice(&fs::read(reports.join("reuse-failure.json")).unwrap()).unwrap();
+        assert_eq!(reuse["passed"], false);
+        assert_eq!(reuse["native_exit_code"], 1);
+        assert_eq!(
+            reuse["standard_user_client"],
+            receipt["standard_user_client"]
+        );
+        for name in ["policy", "account", "profile", "tree"] {
+            assert_eq!(
+                fs::read(private.join(name)).unwrap(),
+                b"must remain unresolved"
+            );
+        }
+    }
+
+    #[test]
+    fn native_evidence_requires_genuine_identity_and_complete_cleanup() {
+        let client = json!({
+            "passed": true, "genuine_standard_user": true,
+            "account_cleanup_verified": true, "profile_cleanup_verified": true,
+            "restoration_verified": true, "quiescence_verified": true,
+            "station_access_restoration_verified": true,
+            "session_namespace_restoration_verified": true,
+            "input_desktop_restoration_verified": true, "private_desktop_cleanup_verified": true
+        });
+        let observed = json!({
+            "passed": true,
+            "observations": [{
+                "check": "genuine_standard_user_verified_before_installer", "passed": true
+            }, {
+                "check": "owned_interactive_desktop_verified_before_installer", "passed": true,
+                "evidence": {
+                    "interactive_station": true, "expected_desktop_matches": true,
+                    "station_visible": true, "input_desktop_matches": true
+                }
+            }]
+        });
+        assert!(validate_native_evidence(&client, &observed).is_ok());
+        for field in client.as_object().unwrap().keys() {
+            let mut missing = client.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(validate_native_evidence(&missing, &observed).is_err());
+            for invalid in [json!(false), json!("true"), json!(1), Value::Null] {
+                let mut invalid_client = client.clone();
+                invalid_client[field] = invalid;
+                assert!(validate_native_evidence(&invalid_client, &observed).is_err());
+            }
+        }
+        for field in [
+            "passed",
+            "interactive_station",
+            "expected_desktop_matches",
+            "station_visible",
+            "input_desktop_matches",
+        ] {
+            for invalid in [None, Some(json!(false)), Some(json!("true"))] {
+                let mut candidate = observed.clone();
+                let row = &mut candidate["observations"][1];
+                let target = if field == "passed" {
+                    row
+                } else {
+                    &mut row["evidence"]
+                };
+                if let Some(value) = invalid {
+                    target[field] = value;
+                } else {
+                    target.as_object_mut().unwrap().remove(field);
+                }
+                assert!(validate_native_evidence(&client, &candidate).is_err());
+            }
+        }
+        let mut missing_desktop = observed.clone();
+        missing_desktop["observations"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(validate_native_evidence(&client, &missing_desktop).is_err());
+        let mut duplicate_desktop = observed.clone();
+        duplicate_desktop["observations"]
+            .as_array_mut()
+            .unwrap()
+            .push(observed["observations"][1].clone());
+        assert!(validate_native_evidence(&client, &duplicate_desktop).is_err());
+        for invalid in [
+            json!({"passed": false, "observations": observed["observations"]}),
+            json!({"passed": true, "observations": []}),
+            json!({"passed": true, "observations": [{"check": "genuine_standard_user_verified_before_installer", "passed": "true"}]}),
+            json!({"passed": true, "observations": [observed["observations"][0], observed["observations"][0]]}),
+        ] {
+            assert!(validate_native_evidence(&client, &invalid).is_err());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn private_station_acl_grant_restoration_and_foreign_mutation_are_verified() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("private-station-acl-fixture.ps1");
+        // Real, newly created PRIVATE stations only: never open WinSta0, attach
+        // a station, activate a desktop, create accounts, or invoke MSI.
+        fs::write(
+            &script,
+            r#"
+param([string]$Source)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($Source, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'Client syntax errors' }
+$definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Initialize-InstallerNative' }, $true)
+if ($null -eq $definition) { throw 'Native helper initialization missing' }
+. ([scriptblock]::Create($definition.Extent.Text))
+Initialize-InstallerNative
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+public sealed class PrivateStationAclFixture : IDisposable {
+    [StructLayout(LayoutKind.Sequential)] struct SecurityAttributes {
+        public int length; public IntPtr descriptor; public int inherit;
+    }
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern IntPtr CreateWindowStationW(string name,uint flags,uint access,ref SecurityAttributes attributes);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool CloseWindowStation(IntPtr handle);
+    [DllImport("user32.dll", SetLastError=true)]
+    static extern bool GetUserObjectSecurity(IntPtr handle,ref uint information,byte[] descriptor,uint length,out uint needed);
+    [DllImport("user32.dll", SetLastError=true)]
+    static extern bool SetUserObjectSecurity(IntPtr handle,ref uint information,byte[] descriptor);
+    public const string Target = "S-1-5-21-987654321-876543219-765432198-999";
+    public const string Foreign = "S-1-5-21-987654321-876543219-765432198-998";
+    public IntPtr Handle { get; private set; }
+    public PrivateStationAclFixture(bool preexisting) {
+        using(var identity=WindowsIdentity.GetCurrent()) {
+            string sid=identity.User.Value;
+            var descriptor=new RawSecurityDescriptor("O:"+sid+"G:"+sid+
+                "D:P(D;;0x2;;;"+Foreign+")(A;;0xf037f;;;"+sid+")(A;;0xf037f;;;SY)"+
+                (preexisting ? "(A;;0x1;;;"+Target+")" : ""));
+            byte[] bytes=new byte[descriptor.BinaryLength]; descriptor.GetBinaryForm(bytes,0);
+            IntPtr memory=Marshal.AllocHGlobal(bytes.Length);
+            try {
+                Marshal.Copy(bytes,0,memory,bytes.Length);
+                var attributes=new SecurityAttributes {
+                    length=Marshal.SizeOf<SecurityAttributes>(),descriptor=memory,inherit=0
+                };
+                Handle=CreateWindowStationW("bt-acl-test-"+Guid.NewGuid().ToString("N"),1,0x60000,ref attributes);
+                if(Handle==IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+            } finally { Marshal.FreeHGlobal(memory); }
+        }
+    }
+    public RawSecurityDescriptor Read() {
+        uint information=4,needed;
+        bool unexpected=GetUserObjectSecurity(Handle,ref information,null,0,out needed);
+        int error=Marshal.GetLastWin32Error();
+        if(unexpected || error!=122 || needed==0 || needed>65536) throw new InvalidOperationException("Invalid fixture security descriptor size");
+        byte[] bytes=new byte[needed];
+        if(!GetUserObjectSecurity(Handle,ref information,bytes,(uint)bytes.Length,out needed))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        return new RawSecurityDescriptor(bytes,0);
+    }
+    static string AclBytes(RawAcl acl) {
+        if(acl==null) throw new InvalidOperationException("Fixture requires nonnull DACL");
+        byte[] bytes=new byte[acl.BinaryLength]; acl.GetBinaryForm(bytes,0);
+        return Convert.ToBase64String(bytes);
+    }
+    public string Fingerprint() {
+        var descriptor=Read();
+        return ((int)descriptor.ControlFlags).ToString()+":"+AclBytes(descriptor.DiscretionaryAcl);
+    }
+    static string AceBytes(GenericAce ace) {
+        byte[] bytes=new byte[ace.BinaryLength]; ace.GetBinaryForm(bytes,0);
+        return Convert.ToBase64String(bytes);
+    }
+    public void AssertGrant(RawSecurityDescriptor before) {
+        var after=Read();
+        if(before.ControlFlags!=after.ControlFlags || after.DiscretionaryAcl.Count!=before.DiscretionaryAcl.Count+1)
+            throw new InvalidOperationException("Grant changed DACL control or ACE count");
+        int originalIndex=0,targets=0;
+        foreach(GenericAce ace in after.DiscretionaryAcl) {
+            var common=ace as CommonAce;
+            if(common!=null && common.SecurityIdentifier.Value==Target) {
+                targets++;
+                if(common.AceQualifier!=AceQualifier.AccessAllowed || common.AceFlags!=AceFlags.None ||
+                    common.IsCallback || common.AccessMask!=0x2037f)
+                    throw new InvalidOperationException("Grant is not the exact noninheriting station access ACE");
+            } else {
+                if(originalIndex>=before.DiscretionaryAcl.Count ||
+                    AceBytes(ace)!=AceBytes(before.DiscretionaryAcl[originalIndex++]))
+                    throw new InvalidOperationException("Grant changed an unrelated ACE");
+            }
+        }
+        if(targets!=1 || originalIndex!=before.DiscretionaryAcl.Count)
+            throw new InvalidOperationException("Grant lost original access or duplicated target");
+    }
+    public void MutateForeignDacl() {
+        var descriptor=Read();
+        descriptor.DiscretionaryAcl.InsertAce(descriptor.DiscretionaryAcl.Count,
+            new CommonAce(AceFlags.None,AceQualifier.AccessAllowed,0x1,new SecurityIdentifier(Foreign),false,null));
+        byte[] bytes=new byte[descriptor.BinaryLength]; descriptor.GetBinaryForm(bytes,0);
+        uint information=4;
+        if(!SetUserObjectSecurity(Handle,ref information,bytes))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+    public void Dispose() {
+        if(Handle!=IntPtr.Zero) {
+            if(!CloseWindowStation(Handle)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            Handle=IntPtr.Zero;
+        }
+    }
+}
+'@
+$fixture = [PrivateStationAclFixture]::new($false)
+try {
+    $original = $fixture.Read()
+    $before = $fixture.Fingerprint()
+    $lease = [BroTypistWindowStationAccess]::new($fixture.Handle, [PrivateStationAclFixture]::Target)
+    if ($lease.Modified -or $fixture.Fingerprint() -cne $before) { throw 'Lease construction mutated station access before ownership was retained' }
+    $lease.Apply()
+    if (-not $lease.Modified -or $lease.Restored) { throw 'Grant receipt is false or prematurely restored' }
+    $fixture.AssertGrant($original)
+    $lease.Restore()
+    if (-not $lease.Restored -or $fixture.Fingerprint() -cne $before) { throw 'Independent readback found restoration corruption' }
+    # Do not repair or retry after foreign mutation. Closing the owned private
+    # station destroys the fixture without touching any shared station.
+    $lease = [BroTypistWindowStationAccess]::new($fixture.Handle, [PrivateStationAclFixture]::Target)
+    $lease.Apply()
+    $fixture.MutateForeignDacl()
+    $foreign = $fixture.Fingerprint()
+    $refused = $false
+    try { $lease.Restore() } catch { $refused = $true }
+    if (-not $refused -or $lease.Restored -or $fixture.Fingerprint() -cne $foreign) { throw 'Restoration overwrote foreign DACL mutation or claimed success' }
+} finally { $fixture.Dispose() }
+$fixture = [PrivateStationAclFixture]::new($true)
+try {
+    $before = $fixture.Fingerprint()
+    $refused = $false
+    try { $null = [BroTypistWindowStationAccess]::new($fixture.Handle, [PrivateStationAclFixture]::Target) } catch { $refused = $true }
+    if (-not $refused -or $fixture.Fingerprint() -cne $before) { throw 'Preexisting target SID was accepted or modified' }
+} finally { $fixture.Dispose() }
+"#,
+        )
+        .unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.github/native/windows-installer-client.ps1");
+        let status = Command::new("pwsh.exe")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+            .arg(script)
+            .arg(source)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn bounded_policy_and_real_write_rollback_evidence_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("bounded-installer-fixture.ps1");
-        // Parse/extract pure guards only. This test never touches HKLM, launches
-        // MSI, or promotes its synthetic logs to native lifecycle evidence.
+        // Extract guards and exercise only owned temporary directories. Never
+        // touch HKLM, create accounts, launch MSI, or claim native installer proof.
         fs::write(
             &script,
             r#"
@@ -360,9 +874,40 @@ function Load-Guards([string]$File, [string[]]$Names) {
         $definition.Extent.Text
     }
 }
-foreach ($definition in @(Load-Guards 'windows-installer-client.ps1' @('Require', 'Assert-DisableMsiPolicy', 'Assert-NativeQuiescence', 'Initialize-InstallerNative'))) { . ([scriptblock]::Create($definition)) }
+foreach ($definition in @(Load-Guards 'windows-installer-client.ps1' @('Require', 'Assert-DisableMsiPolicy', 'Assert-NativeQuiescence', 'Initialize-InstallerNative', 'Private-DirectoryAcl', 'New-PrivateDirectory', 'Remove-OwnedTree', 'Remove-CreatedTree'))) { . ([scriptblock]::Create($definition)) }
 # Compile owned P/Invoke declarations without calling any token/registry API.
 Initialize-InstallerNative
+$unowned = Join-Path $Work 'unowned-tree'
+[void][IO.Directory]::CreateDirectory($unowned)
+$sentinel = Join-Path $unowned 'preserve.txt'
+[IO.File]::WriteAllText($sentinel, 'unowned data must survive')
+Remove-CreatedTree (Join-Path $Work 'never-created') $false
+$refused = $false
+try { Remove-CreatedTree $unowned $false } catch { $refused = $true }
+if (-not $refused -or [IO.File]::ReadAllText($sentinel) -cne 'unowned data must survive') { throw 'Unconfirmed tree ownership did not preserve its data' }
+$created = Join-Path $Work 'created-tree'
+if ($IsWindows) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try { $currentSid = $identity.User.Value } finally { $identity.Dispose() }
+    New-PrivateDirectory $created (Private-DirectoryAcl $currentSid '' '')
+    $acl = Get-Acl -LiteralPath $created
+    if (-not $acl.AreAccessRulesProtected) { throw 'Private directory inherited unrelated access' }
+    $allowed = @($currentSid, 'S-1-5-18') | Select-Object -Unique
+    $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    foreach ($rule in $rules) {
+        if ($rule.IdentityReference.Value -notin $allowed -or $rule.AccessControlType -ne 'Allow') { throw 'Private directory granted an unrelated principal access' }
+    }
+    foreach ($sid in $allowed) {
+        if (-not ($rules | Where-Object { $_.IdentityReference.Value -ceq $sid -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl })) { throw 'Private directory lost supervisor or SYSTEM access' }
+    }
+} else {
+    [void][IO.Directory]::CreateDirectory($created)
+    Write-Output 'Native Windows ACL creation is not exercised on this host.'
+}
+[void][IO.Directory]::CreateDirectory((Join-Path $created 'child'))
+[IO.File]::WriteAllText((Join-Path $created 'child\owned.txt'), 'owned temporary data')
+Remove-CreatedTree $created $true
+if ((Test-Path -LiteralPath $created) -or [IO.File]::ReadAllText($sentinel) -cne 'unowned data must survive') { throw 'Owned-tree cleanup did not preserve its boundary' }
 Assert-DisableMsiPolicy @{ present = $false; kind = $null; value = $null }
 Assert-DisableMsiPolicy @{ present = $true; kind = 'DWord'; value = 0 }
 $rejected = 0
@@ -390,16 +935,86 @@ foreach ($outcome in @(
     try { Assert-NativeQuiescence $outcome } catch { $rejected++ }
 }
 if ($rejected -ne 6) { throw 'Unknown/untyped quiescence accepted as permission to restore host policy' }
-foreach ($definition in @(Load-Guards 'windows-installer-smoke.ps1' @('Observe', 'Assert-RollbackLog', 'New-MsiStartInfo'))) { . ([scriptblock]::Create($definition)) }
-foreach ($operation in @('/i', '/fa', '/x')) {
-    $msi = Join-Path $Work 'canonical package Unicode é.msi'
-    $log = Join-Path $Work 'native MSI Unicode é.log'
-    $start = New-MsiStartInfo @($operation, $msi) $log
-    $expected = @($operation, $msi, '/qn', '/norestart', '/L*v', $log)
-    if ($start.UseShellExecute -or -not [string]::IsNullOrEmpty($start.Arguments) -or $start.ArgumentList.Count -ne $expected.Count) { throw 'MSI direct raw-argv launch contract lost' }
-    for ($i = 0; $i -lt $expected.Count; $i++) {
-        if ($start.ArgumentList[$i] -cne $expected[$i]) { throw 'MSI argv element was pre-quoted, split, or rewritten' }
+foreach ($definition in @(Load-Guards 'windows-installer-smoke.ps1' @('Observe', 'Assert-RollbackLog', 'Assert-StandardUserToken', 'Redact'))) { . ([scriptblock]::Create($definition)) }
+$validToken = @{
+    matches_expected_user = $true; is_system = $false
+    administrator_role_enabled = $false; administrator_group_present = $false
+    token_elevation = 0; integrity_rid = 8192; token_type = 1
+    impersonation_level = 'None'; token_has_restrictions = 0
+}
+Assert-StandardUserToken $validToken
+foreach ($invalid in @(
+    @{ key = 'matches_expected_user'; value = $false },
+    @{ key = 'is_system'; value = $true },
+    @{ key = 'administrator_role_enabled'; value = $true },
+    @{ key = 'administrator_group_present'; value = $true },
+    @{ key = 'token_elevation'; value = 1 },
+    @{ key = 'integrity_rid'; value = 12288 },
+    @{ key = 'token_type'; value = 2 },
+    @{ key = 'impersonation_level'; value = 'Impersonation' },
+    @{ key = 'matches_expected_user'; value = 'true' }
+)) {
+    $token = $validToken.Clone(); $token[$invalid.key] = $invalid.value
+    $refused = $false
+    try { Assert-StandardUserToken $token } catch { $refused = $true }
+    if (-not $refused) { throw 'Invalid identity or elevated/impersonated token accepted' }
+}
+$ExpectedUserSid = 'S-1-5-21-100-200-300-1001'
+$ExpectedDesktopName = 'btci-00000000000000000000000000000000'
+$SupervisorSid = 'S-1-5-21-100-200-300-1002'
+$private = "$ExpectedUserSid $SupervisorSid $ExpectedDesktopName $env:USERNAME $env:USERPROFILE"
+$redacted = Redact ($private.ToUpperInvariant())
+foreach ($value in @($ExpectedUserSid, $SupervisorSid, $ExpectedDesktopName, $env:USERNAME, $env:USERPROFILE)) {
+    if (-not [string]::IsNullOrWhiteSpace($value) -and $redacted.Contains($value, [StringComparison]::OrdinalIgnoreCase)) { throw 'Private validation identity leaked' }
+}
+foreach ($definition in @(Load-Guards 'windows-installer-reuse.ps1' @('Assert-StandardUserEvidence'))) { . ([scriptblock]::Create($definition)) }
+$validClient = @{
+    passed = $true; genuine_standard_user = $true
+    account_cleanup_verified = $true; profile_cleanup_verified = $true
+    restoration_verified = $true; quiescence_verified = $true
+    station_access_restoration_verified = $true; session_namespace_restoration_verified = $true
+    input_desktop_restoration_verified = $true
+    private_desktop_cleanup_verified = $true
+}
+$desktopProof = @{ check = 'owned_interactive_desktop_verified_before_installer'; passed = $true; evidence = @{
+    interactive_station = $true; expected_desktop_matches = $true; station_visible = $true; input_desktop_matches = $true
+} }
+$validCore = @{ passed = $true; observations = @(@{ check = 'genuine_standard_user_verified_before_installer'; passed = $true }, $desktopProof) }
+Assert-StandardUserEvidence $validClient $validCore
+foreach ($field in @($validClient.Keys)) {
+    foreach ($invalid in @($false, 'true', 1, $null)) {
+        $candidate = $validClient.Clone(); $candidate[$field] = $invalid
+        $refused = $false
+        try { Assert-StandardUserEvidence $candidate $validCore } catch { $refused = $true }
+        if (-not $refused) { throw 'Incomplete or untyped standard-user lifecycle accepted by reuse' }
     }
+    $candidate = $validClient.Clone(); $candidate.Remove($field)
+    $refused = $false
+    try { Assert-StandardUserEvidence $candidate $validCore } catch { $refused = $true }
+    if (-not $refused) { throw 'Missing standard-user lifecycle fact accepted by reuse' }
+}
+foreach ($field in @('passed', 'interactive_station', 'expected_desktop_matches', 'station_visible', 'input_desktop_matches')) {
+    foreach ($invalid in @($false, 'true', $null)) {
+        $row = $desktopProof.Clone(); $row.evidence = $desktopProof.evidence.Clone()
+        $target = if ($field -ceq 'passed') { $row } else { $row.evidence }
+        if ($null -eq $invalid) { $target.Remove($field) } else { $target[$field] = $invalid }
+        $candidate = @{ passed = $true; observations = @($validCore.observations[0], $row) }
+        $refused = $false
+        try { Assert-StandardUserEvidence $validClient $candidate } catch { $refused = $true }
+        if (-not $refused) { throw 'Missing, false or untyped desktop proof accepted by reuse' }
+    }
+}
+foreach ($invalidCore in @(
+    @{ passed = $false; observations = $validCore.observations },
+    @{ passed = $true; observations = @() },
+    @{ passed = $true; observations = @($validCore.observations[0]) },
+    @{ passed = $true; observations = @($validCore.observations[0], $desktopProof, $desktopProof) },
+    @{ passed = $true; observations = @(@{ check = 'genuine_standard_user_verified_before_installer'; passed = 'true' }) },
+    @{ passed = $true; observations = @($validCore.observations[0], $validCore.observations[0]) }
+)) {
+    $refused = $false
+    try { Assert-StandardUserEvidence $validClient $invalidCore } catch { $refused = $true }
+    if (-not $refused) { throw 'Invalid core evidence accepted by reuse' }
 }
 $receipt = @{ observations = [Collections.Generic.List[object]]::new() }
 $path = Join-Path $Work 'rollback.log'
