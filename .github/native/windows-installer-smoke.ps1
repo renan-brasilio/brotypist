@@ -712,6 +712,7 @@ function Probe-TinyWorker([string]$Directory, [string]$Stage, [string]$OutputNam
     Assert-Run
 }
 function Probe-Gui([string]$Directory, [string]$Stage) {
+    $setupCompleted = (Get-Content -LiteralPath (Join-Path $profile 'settings.json') -Raw | ConvertFrom-Json).setup_completed
     # Connection handles opened by Windows are not inheritable. Select the
     # verified private desktop explicitly rather than the new logon's default.
     $gui = [BroTypistInstallerNative]::StartSettings((Join-Path $Directory 'BroTypist.exe'), $profile, $owned)
@@ -720,7 +721,7 @@ function Probe-Gui([string]$Directory, [string]$Stage) {
     $window = [IntPtr]::Zero
     do {
         if ($gui.HasExited) {
-            $receipt.observations.Add(@{ check = ($Stage + '_startup_exit'); passed = $false; evidence = [BroTypistInstallerNative]::GuiObservation($gui) })
+            $receipt.observations.Add(@{ check = ($Stage + '_startup_exit'); passed = $false; evidence = [BroTypistInstallerNative]::GuiObservation($gui, $setupCompleted) })
             throw 'GUI exited before visible Settings'
         }
         Capture-Children $gui $children
@@ -728,7 +729,7 @@ function Probe-Gui([string]$Directory, [string]$Stage) {
         if ($window -ne [IntPtr]::Zero) { break }
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
-    $receipt.observations.Add(@{ check = ($Stage + '_window_state'); passed = $null; status = 'observed'; evidence = [BroTypistInstallerNative]::GuiObservation($gui) })
+    $receipt.observations.Add(@{ check = ($Stage + '_window_state'); passed = $null; status = 'observed'; evidence = [BroTypistInstallerNative]::GuiObservation($gui, $setupCompleted) })
     Require ($window -ne [IntPtr]::Zero) 'Owned visible Settings HWND not observed before deadline'
     $button = [BroTypistInstallerNative]::GetDlgItem($window, 13)
     Require ($button -ne [IntPtr]::Zero) 'Canonical Quit control ID 13 missing'
@@ -936,16 +937,18 @@ public static class BroTypistInstallerNative {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr hwnd,StringBuilder text,int length);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr hwnd,StringBuilder text,int length);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd,uint flags);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)] public static extern IntPtr SendMessageTimeoutW(IntPtr hwnd,uint message,UIntPtr wp,IntPtr lp,uint flags,uint timeout,out UIntPtr result);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)] public static extern IntPtr SendMessageTimeoutW(IntPtr hwnd,uint message,UIntPtr wp,IntPtr lp,uint flags,uint timeout,out UIntPtr result);
+    [DllImport("user32.dll", ExactSpelling=true, SetLastError=true)] static extern IntPtr GetWindowLongPtrW(IntPtr hwnd,int index);
     static string Class(IntPtr hwnd) { var text=new StringBuilder(256); GetClassNameW(hwnd,text,text.Capacity); return text.ToString(); }
     static string DesktopKind(string name) {
         if(name.Equals("Probe",StringComparison.OrdinalIgnoreCase)) return "owned_probe";
         if(name.Equals("Default",StringComparison.OrdinalIgnoreCase)) return "default";
         return "other";
     }
-    public static System.Collections.Generic.Dictionary<string,object> GuiObservation(System.Diagnostics.Process process) {
+    public static System.Collections.Generic.Dictionary<string,object> GuiObservation(System.Diagnostics.Process process,bool setupCompleted) {
         var facts=new System.Collections.Generic.Dictionary<string,object> {
-            {"explicit_private_desktop",true}, {"stderr_captured",false}
+            {"explicit_private_desktop",true}, {"stderr_captured",false},
+            {"profile_setup_completed_at_launch",setupCompleted}
         };
         bool alive=false;
         try {
@@ -985,16 +988,30 @@ public static class BroTypistInstallerNative {
         } catch(System.ComponentModel.Win32Exception error) { facts["desktop_query_error"]=error.NativeErrorCode; }
         catch(InvalidOperationException) { facts["desktop_query_unavailable"]=true; }
         var windows=new System.Collections.Generic.List<object>();
-        bool truncated=false;
+        bool truncated=false,probedSettings=false;
         uint pid=unchecked((uint)process.Id);
         bool complete=EnumWindows((hwnd,data)=>{
             uint owner; GetWindowThreadProcessId(hwnd,out owner);
             if(owner!=pid) return true;
             if(windows.Count>=32) { truncated=true; return false; }
-            windows.Add(new System.Collections.Generic.Dictionary<string,object> {
-                {"class",Class(hwnd)}, {"visible",IsWindowVisible(hwnd)},
-                {"iconic",IsIconic(hwnd)}, {"hung",IsHungAppWindow(hwnd)}
-            });
+            string windowClass=Class(hwnd);
+            IntPtr style=GetWindowLongPtrW(hwnd,-16);
+            int styleError=style==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+            var windowFacts=new System.Collections.Generic.Dictionary<string,object> {
+                {"class",windowClass}, {"visible",IsWindowVisible(hwnd)},
+                {"iconic",IsIconic(hwnd)}, {"hung",IsHungAppWindow(hwnd)},
+                {"style",unchecked((uint)style.ToInt64()).ToString("X8")}, {"style_error",styleError}
+            };
+            if(windowClass=="BroTypist.Settings" && !probedSettings) {
+                probedSettings=true;
+                UIntPtr result;
+                // WM_NULL observes startup/message-pump liveness without showing,
+                // activating, closing, or modifying an application window.
+                IntPtr sent=SendMessageTimeoutW(hwnd,0,UIntPtr.Zero,IntPtr.Zero,0x0003,2000,out result);
+                windowFacts["null_message_responded"]=sent!=IntPtr.Zero;
+                windowFacts["null_message_error"]=sent==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+            }
+            windows.Add(windowFacts);
             return true;
         },IntPtr.Zero);
         facts["owned_windows"]=windows;

@@ -852,6 +852,14 @@ fn exercise(output: &Path, receipt: &mut Value) -> Result<bool> {
         native.instance,
     )?;
     let scenario = (|| -> Result<bool> {
+        ensure!(
+            unsafe { IsWindowVisible(shell.window).as_bool() },
+            "Settings did not become visible during normal no-tray startup."
+        );
+        passed(
+            receipt,
+            "initial-settings-visible-before-observer-activation",
+        );
         shell.show();
         pump(&mut shell, &clipboard)?;
         ensure!(
