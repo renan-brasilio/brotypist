@@ -23,6 +23,9 @@ $metadata = [ordered]@{
     interactive_station_acl_modified = $false; station_access_restoration_verified = $false
     input_desktop_restoration_verified = $false; private_desktop_cleanup_verified = $false
     station_user_access_mask = '0x0002037f'; desktop_user_access_mask = '0x000f01ff'
+    session_namespace_acl_modified = $false; session_namespace_restoration_verified = $false
+    session_namespace_acl_mutation_attempted = $false; session_namespace_user_access_mask = '0x0000000f'
+    session_namespace_original_access = $null
     station_acl_mutation_attempted = $false; private_desktop_creation_attempted = $false
     private_desktop_created = $false; input_desktop_activation_attempted = $false; input_desktop_activated = $false
     owned_interactive_desktop_verified = $false
@@ -71,14 +74,12 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Security.AccessControl;
 using System.Security.Principal;
-// Borrowed station handle: only the DACL is read/written, never owner or SACL.
+// Borrowed handle: only the DACL is read/written, never owner or SACL.
 // Win32 offers no ACL compare-and-swap. A changed snapshot is refused, and
-// every write is read back; this lease is only for a disposable isolated runner.
-public sealed class BroTypistWindowStationAccess {
-    // READ_CONTROL | WINSTA_ALL_ACCESS: documented operational read/write/execute
-    // rights, without DELETE, WRITE_DAC or WRITE_OWNER on the shared station.
-    public const int UserAccessMask=0x2037f;
-    readonly IntPtr station;
+// every write is read back; these leases are only for a disposable isolated runner.
+public abstract class BroTypistDaclLease {
+    readonly IntPtr handle;
+    readonly bool kernelObject;
     readonly RawSecurityDescriptor original,granted;
     bool applicationAttempted,restorationAttempted;
     public bool Modified { get; private set; }
@@ -88,14 +89,25 @@ public sealed class BroTypistWindowStationAccess {
     static extern bool GetUserObjectSecurity(IntPtr handle,ref uint information,[Out] byte[] descriptor,uint size,out uint needed);
     [DllImport("user32.dll", SetLastError=true)]
     static extern bool SetUserObjectSecurity(IntPtr handle,ref uint information,byte[] descriptor);
-    internal static RawSecurityDescriptor ReadDacl(IntPtr handle) {
-        uint information=4,needed;
-        bool unexpected=GetUserObjectSecurity(handle,ref information,null,0,out needed);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool GetKernelObjectSecurity(IntPtr handle,uint information,[Out] byte[] descriptor,uint size,out uint needed);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool SetKernelObjectSecurity(IntPtr handle,uint information,byte[] descriptor);
+    static bool Query(IntPtr handle,bool kernelObject,byte[] descriptor,out uint needed) {
+        uint information=4,size=descriptor==null ? 0 : (uint)descriptor.Length;
+        return kernelObject
+            ? GetKernelObjectSecurity(handle,information,descriptor,size,out needed)
+            : GetUserObjectSecurity(handle,ref information,descriptor,size,out needed);
+    }
+    internal static RawSecurityDescriptor ReadDacl(IntPtr handle) { return ReadDacl(handle,false); }
+    internal static RawSecurityDescriptor ReadDacl(IntPtr handle,bool kernelObject) {
+        uint needed;
+        bool unexpected=Query(handle,kernelObject,null,out needed);
         int error=Marshal.GetLastWin32Error();
         if(unexpected || error!=122 || needed<20 || needed>131072)
             throw new InvalidOperationException("Native DACL size query refused");
         byte[] bytes=new byte[needed];
-        if(!GetUserObjectSecurity(handle,ref information,bytes,(uint)bytes.Length,out needed))
+        if(!Query(handle,kernelObject,bytes,out needed))
             throw new Win32Exception(Marshal.GetLastWin32Error());
         if(needed>bytes.Length) throw new InvalidOperationException("Native DACL size changed");
         var descriptor=new RawSecurityDescriptor(bytes,0);
@@ -117,53 +129,90 @@ public sealed class BroTypistWindowStationAccess {
         uint information=4;
         byte[] bytes=new byte[descriptor.BinaryLength];
         descriptor.GetBinaryForm(bytes,0);
-        if(!SetUserObjectSecurity(station,ref information,bytes))
-            throw new Win32Exception(Marshal.GetLastWin32Error());
+        bool written=kernelObject
+            ? SetKernelObjectSecurity(handle,information,bytes)
+            : SetUserObjectSecurity(handle,ref information,bytes);
+        if(!written) throw new Win32Exception(Marshal.GetLastWin32Error());
     }
-    public BroTypistWindowStationAccess(IntPtr station,string sid) {
-        if(station==IntPtr.Zero || station==new IntPtr(-1)) throw new ArgumentException("Station handle required");
+    protected BroTypistDaclLease(IntPtr handle,string sid,int accessMask,bool kernelObject) {
+        if(handle==IntPtr.Zero || handle==new IntPtr(-1)) throw new ArgumentException("Object handle required");
         var target=new SecurityIdentifier(sid);
-        this.station=station;
-        original=ReadDacl(station);
+        this.handle=handle; this.kernelObject=kernelObject;
+        original=ReadDacl(handle,kernelObject);
         RawAcl acl=original.DiscretionaryAcl;
         if(acl.Revision!=GenericAcl.AclRevision && acl.Revision!=GenericAcl.AclRevisionDS)
             throw new InvalidOperationException("Unsupported DACL revision");
         int insertion=acl.Count;
         for(int index=0;index<acl.Count;index++) {
-            var ace=acl[index] as CommonAce;
-            if(ace==null || ace.IsCallback || (ace.AceType!=AceType.AccessAllowed && ace.AceType!=AceType.AccessDenied))
-                throw new InvalidOperationException("Unsupported station ACE");
+            // Every existing ACE is preserved byte-for-byte. One whose trustee
+            // cannot be read cannot prove the target SID absent, so refuse it.
+            var ace=acl[index] as KnownAce;
+            if(ace==null) throw new InvalidOperationException("Uninspectable ACE refused");
             if(ace.SecurityIdentifier==target) throw new InvalidOperationException("Preexisting target SID refused");
             if(insertion==acl.Count && (ace.AceFlags&AceFlags.Inherited)!=0) insertion=index;
         }
         var amended=new RawAcl(acl.Revision,acl.Count+1);
         for(int index=0;index<=acl.Count;index++) {
-            if(index==insertion) amended.InsertAce(amended.Count,new CommonAce(AceFlags.None,AceQualifier.AccessAllowed,UserAccessMask,target,false,null));
+            if(index==insertion) amended.InsertAce(amended.Count,new CommonAce(AceFlags.None,AceQualifier.AccessAllowed,accessMask,target,false,null));
             if(index<acl.Count) amended.InsertAce(amended.Count,acl[index]);
         }
         granted=new RawSecurityDescriptor(original.ControlFlags,original.Owner,original.Group,original.SystemAcl,amended);
     }
     public void Apply() {
-        if(applicationAttempted || restorationAttempted) throw new InvalidOperationException("Station grant cannot be retried");
+        if(applicationAttempted || restorationAttempted) throw new InvalidOperationException("Access grant cannot be retried");
         applicationAttempted=true;
-        if(!SameDacl(ReadDacl(station),original)) throw new InvalidOperationException("Station DACL changed before grant");
+        if(!SameDacl(ReadDacl(handle,kernelObject),original)) throw new InvalidOperationException("DACL changed before grant");
         MutationAttempted=true;
         WriteDacl(granted);
         Modified=true;
-        if(!SameDacl(ReadDacl(station),granted)) throw new InvalidOperationException("Station grant read-back differs");
+        if(!SameDacl(ReadDacl(handle,kernelObject),granted)) throw new InvalidOperationException("Access grant read-back differs");
     }
     public void Restore() {
         if(Restored) return;
-        if(restorationAttempted) throw new InvalidOperationException("Station restoration cannot be retried");
+        if(restorationAttempted) throw new InvalidOperationException("Access restoration cannot be retried");
         restorationAttempted=true;
-        var current=ReadDacl(station);
+        var current=ReadDacl(handle,kernelObject);
         if(!SameDacl(current,original)) {
-            if(!MutationAttempted || !SameDacl(current,granted)) throw new InvalidOperationException("Unexpected station DACL preserved");
+            if(!MutationAttempted || !SameDacl(current,granted)) throw new InvalidOperationException("Unexpected DACL preserved");
             WriteDacl(original);
         }
-        if(!SameDacl(ReadDacl(station),original)) throw new InvalidOperationException("Original station DACL restoration unverified");
+        if(!SameDacl(ReadDacl(handle,kernelObject),original)) throw new InvalidOperationException("Original DACL restoration unverified");
         Restored=true;
     }
+    // Principal classes and masks only: never a raw SID, name or identifier.
+    public System.Collections.Generic.List<object> OriginalAccessSummary() {
+        var rows=new System.Collections.Generic.List<object>();
+        foreach(GenericAce entry in original.DiscretionaryAcl) {
+            if(rows.Count>=32) break;
+            var ace=entry as KnownAce;
+            if(ace==null) continue;
+            string sid=ace.SecurityIdentifier.Value;
+            string principal=sid=="S-1-5-18" ? "system" : sid=="S-1-5-32-544" ? "administrators" :
+                sid=="S-1-1-0" ? "everyone" : sid=="S-1-5-32-545" ? "users" : sid=="S-1-5-11" ? "authenticated_users" :
+                sid=="S-1-5-4" ? "interactive" : sid=="S-1-5-12" ? "restricted" : sid=="S-1-3-0" ? "creator_owner" :
+                sid.StartsWith("S-1-5-5-",StringComparison.Ordinal) ? "logon_session" :
+                sid.StartsWith("S-1-5-21-",StringComparison.Ordinal) ? "account" :
+                sid.StartsWith("S-1-15-",StringComparison.Ordinal) ? "application_package" : "other";
+            rows.Add(new System.Collections.Generic.Dictionary<string,object> {
+                {"principal",principal}, {"type",ace.AceType.ToString()},
+                {"mask",ace.AccessMask.ToString("x8")}, {"flags",((int)ace.AceFlags).ToString("x2")}
+            });
+        }
+        return rows;
+    }
+}
+public sealed class BroTypistWindowStationAccess : BroTypistDaclLease {
+    // READ_CONTROL | WINSTA_ALL_ACCESS: documented operational read/write/execute
+    // rights, without DELETE, WRITE_DAC or WRITE_OWNER on the shared station.
+    public const int UserAccessMask=0x2037f;
+    public BroTypistWindowStationAccess(IntPtr station,string sid) : base(station,sid,UserAccessMask,false) {}
+}
+public sealed class BroTypistSessionNamespaceAccess : BroTypistDaclLease {
+    // DIRECTORY_QUERY | TRAVERSE | CREATE_OBJECT | CREATE_SUBDIRECTORY: the
+    // named-object rights an interactive logon ordinarily holds in its own
+    // session. No DELETE, WRITE_DAC or WRITE_OWNER on the shared directory.
+    public const int UserAccessMask=0xf;
+    public BroTypistSessionNamespaceAccess(IntPtr directory,string sid) : base(directory,sid,UserAccessMask,true) {}
 }
 public static class BroTypistStandardUserInstallerClient {
     public static bool LogonAttempted, ClientLaunched, ClientResumed, ClientExited, DeadlineExceeded, JobQuiescent, OwnershipUnresolved;
@@ -172,14 +221,18 @@ public static class BroTypistStandardUserInstallerClient {
     public static string Stage="native_setup";
     public static int LastNativeError;
     public static bool DesktopCreationAttempted, DesktopCreated, CreatorOutstanding, InputActivationAttempted, InputActivated;
-    public static bool StationAccessRestorationVerified, InputDesktopRestorationVerified, PrivateDesktopCleanupVerified;
+    public static bool StationAccessRestorationVerified, InputDesktopRestorationVerified, PrivateDesktopCleanupVerified, SessionNamespaceRestorationVerified;
     public static bool InteractiveStationAclModified { get { return stationAccess!=null && stationAccess.Modified; } }
     public static bool StationAclMutationAttempted { get { return stationAccess!=null && stationAccess.MutationAttempted; } }
+    public static bool SessionNamespaceAclModified { get { return namespaceAccess!=null && namespaceAccess.Modified; } }
+    public static bool SessionNamespaceMutationAttempted { get { return namespaceAccess!=null && namespaceAccess.MutationAttempted; } }
+    public static System.Collections.Generic.List<object> SessionNamespaceOriginalAccess { get { return namespaceAccess==null ? null : namespaceAccess.OriginalAccessSummary(); } }
     public static System.Collections.Generic.Dictionary<string,object> DeadlineObservation;
-    static IntPtr station,desktop,originalInput,job;
+    static IntPtr station,desktop,originalInput,job,sessionNamespace;
     static ProcessInfo process;
     static string desktopName,originalInputName;
     static BroTypistWindowStationAccess stationAccess;
+    static BroTypistSessionNamespaceAccess namespaceAccess;
     [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
     struct Startup {
         public int size;
@@ -199,6 +252,14 @@ public static class BroTypistStandardUserInstallerClient {
         public long user,kernel,periodUser,periodKernel;
         public uint faults,total,active,terminated;
     }
+    [StructLayout(LayoutKind.Sequential)] struct UnicodeString { public ushort length,maximum; public IntPtr buffer; }
+    [StructLayout(LayoutKind.Sequential)] struct ObjectAttributes {
+        public int length; public IntPtr root,name; public uint attributes; public IntPtr descriptor,quality;
+    }
+    [DllImport("ntdll.dll", ExactSpelling=true)] static extern int NtOpenDirectoryObject(out IntPtr directory,uint access,ref ObjectAttributes attributes);
+    [DllImport("ntdll.dll", ExactSpelling=true)] static extern uint RtlNtStatusToDosError(int status);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool ProcessIdToSessionId(uint process,out uint session);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentProcessId();
     [DllImport("advapi32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
     static extern bool CreateProcessWithLogonW(string user,string domain,IntPtr password,uint logonFlags,string application,StringBuilder command,uint flags,IntPtr environment,string directory,ref Startup startup,out ProcessInfo process);
     [DllImport("advapi32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
@@ -267,6 +328,26 @@ public static class BroTypistStandardUserInstallerClient {
             if(needed!=12 || (Marshal.ReadInt32(buffer,8)&1)==0)
                 throw new InvalidOperationException("Visible interactive station required");
         } finally { Marshal.FreeHGlobal(buffer); }
+    }
+    static IntPtr OpenSessionNamespace() {
+        uint session; Check(ProcessIdToSessionId(GetCurrentProcessId(),out session));
+        // Session 0 shares the machine-wide directory; refuse rather than change it.
+        if(session==0) throw new InvalidOperationException("Interactive session namespace required");
+        string path=@"\Sessions\"+session.ToString(System.Globalization.CultureInfo.InvariantCulture)+@"\BaseNamedObjects";
+        IntPtr text=Marshal.StringToHGlobalUni(path),name=Marshal.AllocHGlobal(Marshal.SizeOf<UnicodeString>());
+        try {
+            Marshal.StructureToPtr(new UnicodeString { length=(ushort)(path.Length*2),maximum=(ushort)(path.Length*2+2),buffer=text },name,false);
+            var attributes=new ObjectAttributes { length=Marshal.SizeOf<ObjectAttributes>(),name=name,attributes=0x40 };
+            IntPtr directory;
+            // READ_CONTROL | WRITE_DAC only: the supervisor never enumerates,
+            // creates or deletes another logon's session objects.
+            int status=NtOpenDirectoryObject(out directory,0x60000,ref attributes);
+            if(status<0 || directory==IntPtr.Zero) {
+                LastNativeError=unchecked((int)RtlNtStatusToDosError(status));
+                throw new Win32Exception(LastNativeError);
+            }
+            return directory;
+        } finally { Marshal.FreeHGlobal(name); Marshal.FreeHGlobal(text); }
     }
     static bool DesktopExists() {
         bool found=false;
@@ -449,6 +530,13 @@ public static class BroTypistStandardUserInstallerClient {
             Stage="station_access_grant";
             stationAccess=new BroTypistWindowStationAccess(station,expectedSid);
             stationAccess.Apply();
+            Stage="session_namespace_grant";
+            // A secondary logon cannot open this session's named-object
+            // directory, through which both Local\ and Global\ names resolve;
+            // Windows Installer cannot acquire its execution mutex without it.
+            sessionNamespace=OpenSessionNamespace();
+            namespaceAccess=new BroTypistSessionNamespaceAccess(sessionNamespace,expectedSid);
+            namespaceAccess.Apply();
             Stage="private_desktop";
             // Preserve full access on this newly owned private desktop, as in
             // the original working logon fixture. WinSta0 stays narrowly granted.
@@ -576,6 +664,11 @@ public static class BroTypistStandardUserInstallerClient {
             stationAccess.Restore();
             StationAccessRestorationVerified=stationAccess.Restored;
         } else StationAccessRestorationVerified=true;
+        Stage="session_namespace_restoration";
+        if(namespaceAccess!=null) {
+            namespaceAccess.Restore();
+            SessionNamespaceRestorationVerified=namespaceAccess.Restored;
+        } else SessionNamespaceRestorationVerified=true;
         Stage="private_desktop_cleanup";
         if(desktop!=IntPtr.Zero) {
             if(!DesktopCreated) FailOwnership();
@@ -591,6 +684,7 @@ public static class BroTypistStandardUserInstallerClient {
         PrivateDesktopCleanupVerified=true;
         if(originalInput!=IntPtr.Zero) { Check(CloseDesktop(originalInput)); originalInput=IntPtr.Zero; }
         if(station!=IntPtr.Zero) { Check(CloseWindowStation(station)); station=IntPtr.Zero; }
+        if(sessionNamespace!=IntPtr.Zero) { Check(CloseHandle(sessionNamespace)); sessionNamespace=IntPtr.Zero; }
         if(process.thread!=IntPtr.Zero) { Check(CloseHandle(process.thread)); process.thread=IntPtr.Zero; }
         if(process.process!=IntPtr.Zero) { Check(CloseHandle(process.process)); process.process=IntPtr.Zero; }
         if(job!=IntPtr.Zero) { Check(CloseHandle(job)); job=IntPtr.Zero; }
@@ -742,6 +836,10 @@ function Observe-NativeDesktopLease {
     $metadata.station_access_restoration_verified = [BroTypistStandardUserInstallerClient]::StationAccessRestorationVerified
     $metadata.input_desktop_restoration_verified = [BroTypistStandardUserInstallerClient]::InputDesktopRestorationVerified
     $metadata.private_desktop_cleanup_verified = [BroTypistStandardUserInstallerClient]::PrivateDesktopCleanupVerified
+    $metadata.session_namespace_acl_modified = [BroTypistStandardUserInstallerClient]::SessionNamespaceAclModified
+    $metadata.session_namespace_acl_mutation_attempted = [BroTypistStandardUserInstallerClient]::SessionNamespaceMutationAttempted
+    $metadata.session_namespace_restoration_verified = [BroTypistStandardUserInstallerClient]::SessionNamespaceRestorationVerified
+    $metadata.session_namespace_original_access = [BroTypistStandardUserInstallerClient]::SessionNamespaceOriginalAccess
     $metadata.native_ownership_unresolved = [BroTypistStandardUserInstallerClient]::OwnershipUnresolved
     $metadata.desktop_creator_outstanding = [BroTypistStandardUserInstallerClient]::CreatorOutstanding
     $metadata.child_deadline_exceeded = [BroTypistStandardUserInstallerClient]::DeadlineExceeded
@@ -788,6 +886,7 @@ function Stop-OwnedVm([string]$Reason) {
         restoration_verified = $metadata.restoration_verified
         interactive_station_acl_modified = $metadata.interactive_station_acl_modified
         station_access_restoration_verified = $metadata.station_access_restoration_verified
+        session_namespace_restoration_verified = $metadata.session_namespace_restoration_verified
         input_desktop_restoration_verified = $metadata.input_desktop_restoration_verified
         private_desktop_cleanup_verified = $metadata.private_desktop_cleanup_verified
         teardown_required = $metadata.teardown_required
@@ -1167,7 +1266,7 @@ try {
         if ($nativeInitialized) {
             try { [BroTypistStandardUserInstallerClient]::ReleaseObjects() }
             finally { Observe-NativeDesktopLease }
-            Require ($metadata.station_access_restoration_verified -and $metadata.input_desktop_restoration_verified -and $metadata.private_desktop_cleanup_verified) 'Interactive desktop lease restoration unverified'
+            Require ($metadata.station_access_restoration_verified -and $metadata.session_namespace_restoration_verified -and $metadata.input_desktop_restoration_verified -and $metadata.private_desktop_cleanup_verified) 'Interactive desktop or session namespace lease restoration unverified'
         }
     } catch {
         if ($null -eq $metadata.cleanup_failure) { $metadata.cleanup_failure = Failure-Facts $_ $metadata.stage }
@@ -1276,7 +1375,7 @@ try {
         $metadata.diagnostics.Add(('Cleanup stage {0} failed ({1}); no exception text or identifiers retained' -f $metadata.stage, $_.Exception.GetType().Name))
         Stop-OwnedVm 'Owned account/profile/tree cleanup unverified; disposable VM teardown required'
     }
-    $metadata.passed = $nativeLifecycleSucceeded -and $null -eq $metadata.failure -and $null -eq $metadata.cleanup_failure -and $null -ne $outcome -and $outcome.passed -is [bool] -and $outcome.passed -and $metadata.restoration_verified -and $metadata.genuine_standard_user -and $metadata.owned_interactive_desktop_verified -and $metadata.station_access_restoration_verified -and $metadata.input_desktop_restoration_verified -and $metadata.private_desktop_cleanup_verified -and $metadata.account_cleanup_verified -and $metadata.profile_cleanup_verified -and $metadata.private_tree_cleanup_verified
+    $metadata.passed = $nativeLifecycleSucceeded -and $null -eq $metadata.failure -and $null -eq $metadata.cleanup_failure -and $null -ne $outcome -and $outcome.passed -is [bool] -and $outcome.passed -and $metadata.restoration_verified -and $metadata.genuine_standard_user -and $metadata.owned_interactive_desktop_verified -and $metadata.station_access_restoration_verified -and $metadata.session_namespace_restoration_verified -and $metadata.input_desktop_restoration_verified -and $metadata.private_desktop_cleanup_verified -and $metadata.account_cleanup_verified -and $metadata.profile_cleanup_verified -and $metadata.private_tree_cleanup_verified
     $metadata.stage = 'complete'
     } catch {
         if ($null -eq $metadata.cleanup_failure) { $metadata.cleanup_failure = Failure-Facts $_ $metadata.stage }

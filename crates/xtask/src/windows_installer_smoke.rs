@@ -224,6 +224,7 @@ fn validate_native_evidence(client: &Value, observed: &Value) -> Result<()> {
         "restoration_verified",
         "quiescence_verified",
         "station_access_restoration_verified",
+        "session_namespace_restoration_verified",
         "input_desktop_restoration_verified",
         "private_desktop_cleanup_verified",
     ] {
@@ -479,7 +480,8 @@ $metadata = [ordered]@{
     stage = 'fixture_unresolved'; failure = $null; cleanup_failure = $null
     genuine_standard_user = $false; account_cleanup_verified = $false
     profile_cleanup_verified = $false; restoration_verified = $false
-    station_access_restoration_verified = $false; input_desktop_restoration_verified = $false
+    station_access_restoration_verified = $false; session_namespace_restoration_verified = $false
+    input_desktop_restoration_verified = $false
     private_desktop_cleanup_verified = $false; interactive_station_acl_modified = $false
     quiescence_verified = $false; uninstall_verified = $false
     diagnostics = [Collections.Generic.List[string]]::new()
@@ -535,6 +537,7 @@ exit 0
             "quiescence_verified",
             "uninstall_verified",
             "station_access_restoration_verified",
+            "session_namespace_restoration_verified",
             "input_desktop_restoration_verified",
             "private_desktop_cleanup_verified",
         ] {
@@ -615,6 +618,7 @@ if (-not $refused -or $metadata.passed -or $metadata.standard_user_client.classi
             "account_cleanup_verified": true, "profile_cleanup_verified": true,
             "restoration_verified": true, "quiescence_verified": true,
             "station_access_restoration_verified": true,
+            "session_namespace_restoration_verified": true,
             "input_desktop_restoration_verified": true, "private_desktop_cleanup_verified": true
         });
         let observed = json!({
@@ -968,7 +972,8 @@ $validClient = @{
     passed = $true; genuine_standard_user = $true
     account_cleanup_verified = $true; profile_cleanup_verified = $true
     restoration_verified = $true; quiescence_verified = $true
-    station_access_restoration_verified = $true; input_desktop_restoration_verified = $true
+    station_access_restoration_verified = $true; session_namespace_restoration_verified = $true
+    input_desktop_restoration_verified = $true
     private_desktop_cleanup_verified = $true
 }
 $desktopProof = @{ check = 'owned_interactive_desktop_verified_before_installer'; passed = $true; evidence = @{

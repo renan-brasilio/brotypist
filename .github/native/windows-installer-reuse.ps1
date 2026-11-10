@@ -130,8 +130,8 @@ function Redact([string]$Text) {
 }
 
 function Assert-StandardUserEvidence($Client, $Core) {
-    foreach ($field in @('passed', 'genuine_standard_user', 'account_cleanup_verified', 'profile_cleanup_verified', 'restoration_verified', 'quiescence_verified', 'station_access_restoration_verified', 'input_desktop_restoration_verified', 'private_desktop_cleanup_verified')) {
-        Require ($Client.$field -is [bool] -and $Client.$field -eq $true) 'Shared standard-user identity, cleanup, quiescence, desktop or policy restoration evidence missing'
+    foreach ($field in @('passed', 'genuine_standard_user', 'account_cleanup_verified', 'profile_cleanup_verified', 'restoration_verified', 'quiescence_verified', 'station_access_restoration_verified', 'session_namespace_restoration_verified', 'input_desktop_restoration_verified', 'private_desktop_cleanup_verified')) {
+        Require ($Client.$field -is [bool] -and $Client.$field -eq $true) 'Shared standard-user identity, cleanup, quiescence, desktop, session namespace or policy restoration evidence missing'
     }
     Require (@($Core.observations | Where-Object { $_.check -ceq 'genuine_standard_user_verified_before_installer' -and $_.passed -is [bool] -and $_.passed -eq $true }).Count -eq 1) 'Child did not independently verify genuine standard-user identity before installer access'
     $desktop = @($Core.observations | Where-Object { $_.check -ceq 'owned_interactive_desktop_verified_before_installer' })

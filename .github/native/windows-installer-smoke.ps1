@@ -881,6 +881,22 @@ public static class BroTypistInstallerNative {
         }
         return facts;
     }
+    public static System.Collections.Generic.Dictionary<string,object> NamedObjectNamespace() {
+        // Open-only: a never-created name must be reported absent (2). Access
+        // denied means the namespace itself cannot be opened, so neither can
+        // any Windows Installer mutex. Nothing is created, acquired or changed.
+        var facts=new System.Collections.Generic.Dictionary<string,object>();
+        bool accessible=true;
+        foreach(string scope in new[] { "Local","Global" }) {
+            IntPtr control=OpenMutexW(0x100000,false,scope+@"\btci-"+Guid.NewGuid().ToString("N"));
+            int error=control==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+            if(control!=IntPtr.Zero) CloseHandle(control);
+            facts[scope.ToLowerInvariant()+"_uncreated_name_error"]=error;
+            if(error!=2) accessible=false;
+        }
+        facts["session_named_objects_accessible"]=accessible;
+        return facts;
+    }
     public static System.Collections.Generic.Dictionary<string,object> ProcessTokenFacts(IntPtr process,string expectedSid) {
         IntPtr token;
         // TOKEN_QUERY | TOKEN_DUPLICATE: WindowsPrincipal.IsInRole duplicates a
@@ -1188,6 +1204,9 @@ public static class BroTypistInstallerNative {
     Observe-ClientAndPolicy
     Observe 'owned_interactive_desktop_verified_before_installer' ([BroTypistInstallerNative]::VerifyInteractiveDesktop($ExpectedDesktopName))
     $receipt.observations.Add(@{ check = 'installer_mutex_access_before_api_preflight'; status = 'observed'; passed = $null; evidence = @{ diagnostic_only = $true; opens = [BroTypistInstallerNative]::InstallerMutexAccess() } })
+    $namedObjects = [BroTypistInstallerNative]::NamedObjectNamespace()
+    $receipt.observations.Add(@{ check = 'session_named_objects_accessible_before_installer'; passed = [bool]$namedObjects.session_named_objects_accessible; evidence = $namedObjects })
+    Require ([bool]$namedObjects.session_named_objects_accessible) 'Standard user cannot open the session named-object namespace; Windows Installer cannot acquire its execution mutex'
     $installDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\BroTypist'
     $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'BroTypist.lnk'
     Require (-not (Test-Path -LiteralPath $installDirectory) -and -not (Test-Path -LiteralPath $shortcut) -and -not (Test-Path -LiteralPath 'HKCU:\Software\Inklow\Installer')) 'Existing BroTypist installation/registration refused'
