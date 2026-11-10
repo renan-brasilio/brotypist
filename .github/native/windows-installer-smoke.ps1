@@ -428,6 +428,17 @@ function Observe-ClientAndPolicy {
             } finally { if ($null -ne $key) { $key.Dispose() }; $base.Dispose() }
         }
     )
+    $uac = @{ present = $false; dword = $false; value = $null; modified = $false }
+    $base = $null; $key = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        $key = $base.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Policies\System', $false)
+        $uac.present = $null -ne $key -and $key.GetValueNames() -contains 'EnableLUA'
+        $uac.dword = $uac.present -and $key.GetValueKind('EnableLUA') -eq [Microsoft.Win32.RegistryValueKind]::DWord
+        if ($uac.dword) { $uac.value = [int]$key.GetValue('EnableLUA') }
+    } catch { $uac.read_error_type = $_.Exception.GetType().FullName }
+    finally { if ($null -ne $key) { $key.Dispose() }; if ($null -ne $base) { $base.Dispose() } }
+    $receipt.observations.Add(@{ check = 'host_uac_policy'; status = 'observed'; passed = $null; evidence = $uac })
     $receipt.observations.Add(@{ check = 'installer_client_token_and_policies'; status = 'observed'; passed = $null; evidence = @{ client = $client; policies = $policies; modified_by_this_core = $false; launcher_policy_fixture = 'separate client-observations.json before/during/restored evidence, not a core claim of unchanged host policy' } })
     Assert-StandardUserToken $client
     $processToken = [BroTypistInstallerNative]::ProcessTokenFacts([Diagnostics.Process]::GetCurrentProcess().Handle, $ExpectedUserSid)
@@ -576,6 +587,7 @@ function New-MsiStartInfo([string[]]$Arguments, [string]$Log) {
 }
 function Msi-Transaction([string]$Stage, [string[]]$Arguments, [switch]$ExpectedFailure, [switch]$RollbackFailure) {
     Require (-not ($ExpectedFailure -and $RollbackFailure)) 'Ambiguous expected MSI failure refused'
+    $receipt.observations.Add(@{ check = 'installer_mutex_access_before_client'; status = 'observed'; passed = $null; evidence = @{ stage = $Stage; diagnostic_only = $true; opens = [BroTypistInstallerNative]::InstallerMutexAccess() } })
     $log = Join-Path $Work ($Stage + '.msi.log')
     $logs.Add($log)
     # Set before launch and clear only after a synchronous client exit. Any
@@ -587,6 +599,7 @@ function Msi-Transaction([string]$Stage, [string[]]$Arguments, [switch]$Expected
     $start = New-MsiStartInfo $Arguments $log
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
+    $startedAt = [DateTime]::UtcNow
     Require ($process.Start()) 'Direct msiexec client creation failed'
     $owned.Add($process)
     [void]$process.Handle
@@ -600,6 +613,7 @@ function Msi-Transaction([string]$Stage, [string[]]$Arguments, [switch]$Expected
         $actualClientVerified = $true
     } catch { $actualClientVerified = $false }
     $receipt.observations.Add(@{ check = 'msi_client_primary_token'; passed = $actualClientVerified; evidence = @{ stage = $Stage; shell_execute = $false; launch = 'direct ProcessStartInfo, inherited primary token/environment, no alternate credentials'; actual_child_token = $actualClientToken; token_query_succeeded = $null -ne $actualClientToken; genuine_standard_user = $actualClientVerified } })
+    $receipt.observations.Add(@{ check = 'msi_client_desktop'; status = 'observed'; passed = $null; evidence = [BroTypistInstallerNative]::ProcessObservation($process, $null, $false) })
     if (-not $process.WaitForExit(180000)) {
         $script:transactionUnknown = $true
         try {
@@ -610,6 +624,38 @@ function Msi-Transaction([string]$Stage, [string[]]$Arguments, [switch]$Expected
     }
     $code = $process.ExitCode
     $script:installerTransactionActive = $false
+    if ($code -notin @(0, 3010)) {
+        $receipt.observations.Add(@{ check = 'installer_mutex_access_after_failure'; status = 'observed'; passed = $null; evidence = @{ stage = $Stage; diagnostic_only = $true; opens = [BroTypistInstallerNative]::InstallerMutexAccess() } })
+        $environment = @{ stage = $Stage; service_status = $null; events_are_temporal_only = $true; events = @() }
+        $service = $null
+        try {
+            $service = Get-Service -Name 'msiserver'
+            $environment.service_status = $service.Status.ToString()
+        } catch { $environment.service_query_error_type = $_.Exception.GetType().FullName }
+        finally { if ($null -ne $service) { $service.Dispose() } }
+        try {
+            $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; Id = 1015; StartTime = $startedAt.AddSeconds(-2) } -MaxEvents 8)
+            $environment.events = @(
+                foreach ($event in $events) {
+                    try {
+                        $codes = @(
+                            foreach ($property in @($event.Properties | Select-Object -First 1)) {
+                                $value = $property.Value
+                                if ($value -is [string] -and $value -cmatch '^0[xX][0-9a-fA-F]{8}$') { $value.ToLowerInvariant() }
+                                elseif (($value -is [int] -or $value -is [uint32] -or $value -is [long]) -and [long]$value -ge [int]::MinValue -and [long]$value -le [uint32]::MaxValue) { '0x{0:x8}' -f ([uint32]([long]$value -band 0xffffffffL)) }
+                            }
+                        )
+                        @{ event_id = 1015; error_codes = $codes }
+                    } finally { $event.Dispose() }
+                }
+            )
+            $environment.event_query = 'observed'
+        } catch {
+            $environment.event_query = if ($_.FullyQualifiedErrorId.StartsWith('NoMatchingEventsFound', [StringComparison]::Ordinal)) { 'no_matching_events' } else { 'failed' }
+            if ($environment.event_query -ceq 'failed') { $environment.event_query_error_type = $_.Exception.GetType().FullName }
+        }
+        $receipt.observations.Add(@{ check = 'installer_service_after_failure'; status = 'observed'; passed = $null; evidence = $environment })
+    }
     Observe-MsiRouting $Stage $log
     if (-not $actualClientVerified) {
         foreach ($product in $products) { Observe-ArpScope ($Stage + '_after_unverified_child_exit') $product }
@@ -722,7 +768,7 @@ function Probe-Gui([string]$Directory, [string]$Stage) {
     $window = [IntPtr]::Zero
     do {
         if ($gui.HasExited) {
-            $receipt.observations.Add(@{ check = ($Stage + '_startup_exit'); passed = $false; evidence = [BroTypistInstallerNative]::GuiObservation($gui, $setupCompleted) })
+            $receipt.observations.Add(@{ check = ($Stage + '_startup_exit'); passed = $false; evidence = [BroTypistInstallerNative]::ProcessObservation($gui, $setupCompleted, $true) })
             throw 'GUI exited before visible Settings'
         }
         Capture-Children $gui $children
@@ -730,7 +776,7 @@ function Probe-Gui([string]$Directory, [string]$Stage) {
         if ($window -ne [IntPtr]::Zero) { break }
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
-    $receipt.observations.Add(@{ check = ($Stage + '_window_state'); passed = $null; status = 'observed'; evidence = [BroTypistInstallerNative]::GuiObservation($gui, $setupCompleted) })
+    $receipt.observations.Add(@{ check = ($Stage + '_window_state'); passed = $null; status = 'observed'; evidence = [BroTypistInstallerNative]::ProcessObservation($gui, $setupCompleted, $true) })
     Require ($window -ne [IntPtr]::Zero) 'Owned visible Settings HWND not observed before deadline'
     $button = [BroTypistInstallerNative]::GetDlgItem($window, 13)
     Require ($button -ne [IntPtr]::Zero) 'Canonical Quit control ID 13 missing'
@@ -781,6 +827,28 @@ public static class BroTypistInstallerNative {
     [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthority(IntPtr sid,uint index);
     [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr process,uint access,out IntPtr token);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    static extern IntPtr OpenMutexW(uint access,bool inherit,string name);
+    public static System.Collections.Generic.List<object> InstallerMutexAccess() {
+        // Open-only observations: never create, acquire, release, or change the
+        // security of an Installer mutex. Errors are observations, not absence.
+        var facts=new System.Collections.Generic.List<object>();
+        uint[] access={0x100000,0x1,0x20000,0x1f0001};
+        string[] kinds={"synchronize","modify_state","read_control","all_access"};
+        foreach(string scope in new[] { "Global","Local" }) {
+            string name=scope+@"\_MSIExecute";
+            for(int index=0;index<access.Length;index++) {
+                IntPtr mutex=OpenMutexW(access[index],false,name);
+                int error=mutex==IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+                bool? closed=mutex==IntPtr.Zero ? (bool?)null : CloseHandle(mutex);
+                facts.Add(new System.Collections.Generic.Dictionary<string,object> {
+                    {"candidate_name","_MSIExecute"}, {"scope",scope}, {"access",kinds[index]}, {"opened",mutex!=IntPtr.Zero},
+                    {"error",error}, {"handle_closed",closed}
+                });
+            }
+        }
+        return facts;
+    }
     public static System.Collections.Generic.Dictionary<string,object> ProcessTokenFacts(IntPtr process,string expectedSid) {
         IntPtr token;
         // TOKEN_QUERY | TOKEN_DUPLICATE: WindowsPrincipal.IsInRole duplicates a
@@ -976,9 +1044,9 @@ public static class BroTypistInstallerNative {
         if(name.Equals("Default",StringComparison.OrdinalIgnoreCase)) return "default";
         return "other";
     }
-    public static System.Collections.Generic.Dictionary<string,object> GuiObservation(System.Diagnostics.Process process,bool setupCompleted) {
+    public static System.Collections.Generic.Dictionary<string,object> ProcessObservation(System.Diagnostics.Process process,bool? setupCompleted,bool explicitDesktop) {
         var facts=new System.Collections.Generic.Dictionary<string,object> {
-            {"explicit_private_desktop",true}, {"stderr_captured",false},
+            {"explicit_private_desktop",explicitDesktop}, {"stderr_captured",false},
             {"profile_setup_completed_at_launch",setupCompleted}
         };
         bool alive=false;
@@ -1087,6 +1155,7 @@ public static class BroTypistInstallerNative {
 '@
     Observe-ClientAndPolicy
     Observe 'owned_interactive_desktop_verified_before_installer' ([BroTypistInstallerNative]::VerifyInteractiveDesktop($ExpectedDesktopName))
+    $receipt.observations.Add(@{ check = 'installer_mutex_access_before_api_preflight'; status = 'observed'; passed = $null; evidence = @{ diagnostic_only = $true; opens = [BroTypistInstallerNative]::InstallerMutexAccess() } })
     $installDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\BroTypist'
     $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'BroTypist.lnk'
     Require (-not (Test-Path -LiteralPath $installDirectory) -and -not (Test-Path -LiteralPath $shortcut) -and -not (Test-Path -LiteralPath 'HKCU:\Software\Inklow\Installer')) 'Existing BroTypist installation/registration refused'
