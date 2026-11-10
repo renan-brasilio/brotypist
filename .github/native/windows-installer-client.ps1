@@ -98,9 +98,6 @@ public static class BroTypistStandardUserInstallerClient {
     static extern IntPtr CreateDesktopW(string name,IntPtr device,IntPtr mode,uint flags,uint access,ref SecurityAttributes attributes);
     [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetProcessWindowStation();
     [DllImport("user32.dll", SetLastError=true)] static extern bool SetProcessWindowStation(IntPtr station);
-    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr GetThreadDesktop(uint thread);
-    [DllImport("user32.dll", SetLastError=true)] static extern bool SetThreadDesktop(IntPtr desktop);
     [DllImport("user32.dll", SetLastError=true)] static extern bool CloseWindowStation(IntPtr station);
     [DllImport("user32.dll", SetLastError=true)] static extern bool CloseDesktop(IntPtr desktop);
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)] static extern IntPtr CreateJobObjectW(IntPtr attributes,string name);
@@ -158,25 +155,42 @@ public static class BroTypistStandardUserInstallerClient {
             Check(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl,1,out descriptor,IntPtr.Zero));
             var attributes=new SecurityAttributes { size=Marshal.SizeOf<SecurityAttributes>(),descriptor=descriptor };
             IntPtr original=GetProcessWindowStation(); Check(original!=IntPtr.Zero);
-            IntPtr originalDesktop=GetThreadDesktop(GetCurrentThreadId()); Check(originalDesktop!=IntPtr.Zero);
             // GENERIC_ALL maps to the noninteractive station's supported rights.
             station=CreateWindowStationW(stationName,1,0x10000000,ref attributes); Check(station!=IntPtr.Zero);
             Exception desktopFailure=null;
+            bool creatorOutstanding=false;
             try {
                 Check(SetProcessWindowStation(station));
-                desktop=CreateDesktopW("Probe",IntPtr.Zero,IntPtr.Zero,0,0x10000000,ref attributes);
-                Check(desktop!=IntPtr.Zero);
+                Exception creationFailure=null;
+                // CreateDesktop binds its caller. A short-lived thread releases
+                // that binding without moving the PowerShell supervisor thread.
+                var creator=new System.Threading.Thread(() => {
+                    IntPtr desktopDescriptor=IntPtr.Zero;
+                    try {
+                        Check(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl,1,out desktopDescriptor,IntPtr.Zero));
+                        var desktopAttributes=new SecurityAttributes { size=Marshal.SizeOf<SecurityAttributes>(),descriptor=desktopDescriptor };
+                        desktop=CreateDesktopW("Probe",IntPtr.Zero,IntPtr.Zero,0,0x10000000,ref desktopAttributes);
+                        Check(desktop!=IntPtr.Zero);
+                    } catch(Exception failure) { creationFailure=failure; }
+                    finally { if(desktopDescriptor!=IntPtr.Zero) LocalFree(desktopDescriptor); }
+                });
+                creator.IsBackground=true;
+                creator.Start();
+                creatorOutstanding=true;
+                if(!creator.Join(30000)) { DeadlineExceeded=true; FailOwnership(); }
+                creatorOutstanding=false;
+                if(creationFailure!=null)
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(creationFailure).Throw();
             } catch(Exception failure) { desktopFailure=failure; throw; }
             finally {
-                // CreateDesktop assigns the desktop to this thread. Restore the
-                // process station first, then its thread binding; borrowed handles
-                // remain owned by Windows and are never closed here.
-                bool restored=SetProcessWindowStation(original);
-                if(restored) restored=SetThreadDesktop(originalDesktop);
-                if(!restored) {
+                if(creatorOutstanding) {
+                    // Do not race a live creator into the original station.
+                    OwnershipUnresolved=true;
+                    CleanupFailureStage="desktop_creator_unresolved";
+                } else if(!SetProcessWindowStation(original)) {
                     LastNativeError=Marshal.GetLastWin32Error();
                     OwnershipUnresolved=true;
-                    CleanupFailureStage="desktop_context_restoration"; CleanupNativeError=LastNativeError;
+                    CleanupFailureStage="window_station_restoration"; CleanupNativeError=LastNativeError;
                     if(desktopFailure==null) FailOwnership();
                 }
             }
