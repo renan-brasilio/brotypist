@@ -573,10 +573,14 @@ function Assert-Installed($Package) {
         Equal $arp.WindowsInstaller 1 'ARP is not a Windows Installer product'
         Require ($arp.PSObject.Properties.Name -notcontains 'SystemComponent' -or $arp.SystemComponent -eq 0) 'ARP product is hidden'
         Require (-not [string]::IsNullOrWhiteSpace($arp.UninstallString) -and $arp.UninstallString.IndexOf($product, [StringComparison]::OrdinalIgnoreCase) -ge 0) 'ARP uninstall command does not reference owned product'
-        Require (-not [string]::IsNullOrWhiteSpace($arp.DisplayIcon)) 'ARP icon is missing'
-        $icon = ($arp.DisplayIcon -replace ',\s*-?\d+$', '').Trim('"')
-        Require (Test-Path -LiteralPath $icon -PathType Leaf) 'ARP icon file is missing'
     }
+    # Windows Installer does not write DisplayIcon into Uninstall records; Apps
+    # and Programs resolve an MSI product's icon from its ARPPRODUCTICON-derived
+    # ProductIcon registration, which must point at the cached icon file.
+    $icon = Product-Info $product 2 'ProductIcon'
+    Require (-not [string]::IsNullOrWhiteSpace($icon)) 'Installed product icon is not registered'
+    $icon = ($icon -replace ',\s*-?\d+$', '').Trim('"')
+    Require (Test-Path -LiteralPath $icon -PathType Leaf) 'Installed product icon file is missing'
     $registration = Get-ItemProperty -LiteralPath 'HKCU:\Software\Inklow\Installer'
     Equal $registration.Version $Package.version 'HKCU version differs'
     Equal $registration.SourceCommit $Package.source_commit 'HKCU source differs'
