@@ -38,6 +38,9 @@ $installDirectory = $null
 $shortcut = $null
 $rollbackFixture = $null
 $rollbackFixtureOwned = $false
+# Requirements that must still fail the run but need not stop the remaining
+# lifecycle from being exercised and observed first.
+$deferredFailures = [System.Collections.Generic.List[string]]::new()
 
 function Require([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 function Equal($Actual, $Expected, [string]$Message) { Require ($Actual -ceq $Expected) $Message }
@@ -577,10 +580,34 @@ function Assert-Installed($Package) {
     # Windows Installer does not write DisplayIcon into Uninstall records; Apps
     # and Programs resolve an MSI product's icon from its ARPPRODUCTICON-derived
     # ProductIcon registration, which must point at the cached icon file.
-    $icon = Product-Info $product 2 'ProductIcon'
-    Require (-not [string]::IsNullOrWhiteSpace($icon)) 'Installed product icon is not registered'
-    $icon = ($icon -replace ',\s*-?\d+$', '').Trim('"')
-    Require (Test-Path -LiteralPath $icon -PathType Leaf) 'Installed product icon file is missing'
+    $registeredIcon = Product-Info $product 2 'ProductIcon'
+    $iconFacts = [ordered]@{ registered = -not [string]::IsNullOrWhiteSpace($registeredIcon); file_exists = $false }
+    if ($iconFacts.registered) {
+        $icon = ($registeredIcon -replace ',\s*-?\d+$', '').Trim('"')
+        $roamingCache = Join-Path ([Environment]::GetFolderPath('ApplicationData')) "Microsoft\Installer\$product"
+        $iconFacts.rooted = [IO.Path]::IsPathFullyQualified($icon)
+        $iconFacts.location = if (-not $iconFacts.rooted) { 'relative' }
+            elseif ([IO.Path]::GetDirectoryName($icon) -ieq $roamingCache) { 'roaming_installer_product_cache' }
+            elseif ($icon.StartsWith((Join-Path $env:WINDIR 'Installer'), [StringComparison]::OrdinalIgnoreCase)) { 'windows_installer_cache' }
+            elseif ($icon.StartsWith([Environment]::GetFolderPath('UserProfile'), [StringComparison]::OrdinalIgnoreCase)) { 'other_user_profile' }
+            else { 'other' }
+        $iconFacts.file_name_is_authored_icon = [IO.Path]::GetFileName($icon) -ceq 'Inklow.exe'
+        $iconFacts.contains_environment_reference = $icon.Contains('%')
+        if ($iconFacts.rooted) {
+            $iconFacts.file_exists = Test-Path -LiteralPath $icon -PathType Leaf
+            $parent = [IO.Path]::GetDirectoryName($icon)
+            $iconFacts.parent_exists = Test-Path -LiteralPath $parent -PathType Container
+            try { [void](Get-Item -LiteralPath $icon -Force -ErrorAction Stop); $iconFacts.get_item = 'succeeded' }
+            catch { $iconFacts.get_item = $_.Exception.GetType().FullName }
+            if ($iconFacts.parent_exists) {
+                try { $iconFacts.cache_entries = @(Get-ChildItem -LiteralPath $parent -Force -Name -ErrorAction Stop | Select-Object -First 8) }
+                catch { $iconFacts.cache_listing_error = $_.Exception.GetType().FullName }
+            }
+        }
+    }
+    $receipt.observations.Add(@{ check = 'installed_product_icon'; passed = [bool]$iconFacts.file_exists; evidence = $iconFacts })
+    if (-not $iconFacts.registered) { $deferredFailures.Add('Installed product icon is not registered') }
+    elseif (-not $iconFacts.file_exists) { $deferredFailures.Add('Installed product icon file is missing') }
     $registration = Get-ItemProperty -LiteralPath 'HKCU:\Software\Inklow\Installer'
     Equal $registration.Version $Package.version 'HKCU version differs'
     Equal $registration.SourceCommit $Package.source_commit 'HKCU source differs'
@@ -1333,6 +1360,7 @@ public static class BroTypistInstallerNative {
     Probe-Cli $installDirectory $package 'installed_cli_doctor'
     Probe-TinyWorker $installDirectory 'installed_tiny_worker' 'tiny-worker' $input.worker $input.model
     Probe-Gui $installDirectory 'installed_native_settings_quit'
+    Require ($deferredFailures.Count -eq 0) ('Deferred installer requirement failed: ' + ($deferredFailures -join '; '))
 } catch {
     $receipt.diagnostics.Add((Redact $_.Exception.Message))
 } finally {
