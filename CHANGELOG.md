@@ -5,6 +5,15 @@ was redacted with maintainer approval; unchanged native downloads retain their
 original signed provenance, not the source identity of rewritten tags. Legacy
 Python-era downloads were withdrawn; their release pages remain historical records.
 
+## 0.6.2 — Continuous multi-word prediction and sentence closure fix
+
+macOS Apple Silicon patch release. Fixes prediction stalls where generation ceased
+after typing 4–5 words, completed clauses, or sentence punctuation.
+
+- Require at least one non-delimiter/word token in the GBNF grammar constraint following replayed healing tails and on empty tails (`root ::= <healing> [^\n\r]* [^ \t\n\r.,!?;:] [^\n\r]*`). Previously, `root ::= <healing> [^\n\r]*` allowed zero characters after the replayed tail, causing complete clauses and 4–5 word sentences to emit immediate EOG (`<turn|>`), which `HealingReplay` stripped into an empty string.
+- Prevent leading punctuation from prematurely terminating completions in `ShortWriting::push`. Sentence boundaries are now recognized only after at least one alphanumeric token has been emitted (`self.raw[..index].chars().any(is_alphanumeric)`), preserving sentence continuations that begin with period/question/comma closures.
+- Retain GBNF word requirement when healing is empty so sentence-final punctuation naturally continues into following sentences without immediate stop.
+
 ## 0.6.1 — Native verification and Welcome ownership
 
 macOS Apple Silicon patch release from merged PR #5. Native CI passes on all

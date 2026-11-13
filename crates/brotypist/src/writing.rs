@@ -426,11 +426,17 @@ impl ShortWriting {
                 || (matches!(c, '.' | '!' | '?')
                     && chars.peek().is_some_and(|(_, next)| is_space(*next)))
             {
-                sentence = Some(index + c.len_utf8());
-                break;
+                if self.raw[..index].chars().any(is_alphanumeric) {
+                    sentence = Some(index + c.len_utf8());
+                    break;
+                }
             }
         }
-        if sentence.is_none() && terminal && self.raw.ends_with(['.', '!', '?']) {
+        if sentence.is_none()
+            && terminal
+            && self.raw.ends_with(['.', '!', '?'])
+            && self.raw[..self.raw.len() - 1].chars().any(is_alphanumeric)
+        {
             sentence = Some(self.raw.len());
         }
         let word = self
@@ -660,6 +666,13 @@ mod tests {
             state.push(" one two three four five", false, 4).0,
             " one two three four "
         );
+    }
+    #[test]
+    fn leading_punctuation_does_not_abort_sentence() {
+        let mut state = ShortWriting::default();
+        let (out, done) = state.push(". Can we meet tomorrow?", true, 6);
+        assert_eq!(out, ". Can we meet tomorrow?");
+        assert!(done);
     }
     #[test]
     fn references_rank_deduplicate_and_bound_bytes() {

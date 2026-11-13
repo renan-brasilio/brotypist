@@ -341,11 +341,11 @@ impl DiagnosticSession {
             Some(UTILITY_GRAMMAR.into())
         } else if !healing.is_empty() {
             Some(format!(
-                "root ::= {} [^\\n\\r]*",
+                "root ::= {} [^\\n\\r]* [^ \\t\\n\\r.,!?;:] [^\\n\\r]*",
                 serde_json::to_string(&healing)?
             ))
         } else {
-            None
+            Some("root ::= [^\\n\\r]* [^ \\t\\n\\r.,!?;:] [^\\n\\r]*".into())
         };
         let limit = (token_cap as usize)
             .checked_add(replay_tokens)

@@ -20,12 +20,12 @@ use. Accept what fits, dismiss what doesn't, and keep writing—without moving
 your draft into a chatbot. It lives in the menu bar or system tray, with
 OS-native Settings and local model inference.
 
-**Native Rust, with macOS first.** **[0.6.1 downloads](https://github.com/renan-brasilio/brotypist/releases/tag/v0.6.1):
+**Native Rust, with macOS first.** **[0.6.2 downloads](https://github.com/renan-brasilio/brotypist/releases/tag/v0.6.2):
 macOS stable; Windows and Linux ALPHA.** Apple Silicon DMG/ZIP, Linux x86-64
 DEB/portable archive and unsigned Windows x86-64 MSI/ZIP are listed separately.
-This release retains 0.6.0's native writing reliability and scoped preferences,
-with native verification fixes and Windows Welcome worker-ownership corrections.
-macOS inference policy is unchanged from 0.6.0; no speed improvement is claimed.
+This release fixes generation stalls where prediction stopped after typing 4–5 words,
+completed clauses, or sentence punctuation, restoring continuous sentence and multi-word
+prediction across English and Portuguese.
 Model relevance and text-field compatibility still vary: stable does not mean
 every app is supported or establish three-platform parity. The
 [migration and acceptance record](docs/rust-migration/README.md) separates
@@ -55,7 +55,7 @@ source-bound observations from final release proof and remaining platform gates.
 
 | Platform | Current native status | Installation |
 | --- | --- | --- |
-| **macOS 15+, Apple Silicon** | **0.6.1 stable channel.** Native writing reliability and scoped preferences; compatibility varies by text field. | Mac-only DMG/ZIP in Releases; Apple Development signed, **not notarized**. |
+| **macOS 15+, Apple Silicon** | **0.6.2 stable channel.** Native writing reliability and scoped preferences; continuous multi-word prediction; compatibility varies by text field. | Mac-only DMG/ZIP in Releases; Apple Development signed, **not notarized**. |
 | **Linux x86-64, X11** | **ALPHA.** Desktop typing compatibility is limited; emoji/synonym/typo rewrites are unavailable. | Manual DEB or portable archive in the same v0.6.1 release. |
 | **Linux x86-64, Wayland** | **ALPHA. Ordinary inline completion is unavailable.** Manual preview only. | Same Linux downloads; installation does not enable an input method. |
 | **Windows x86-64** | **ALPHA, unsigned.** Hosted installer/runtime checks do not establish full physical typing, upgrade or rollback acceptance. | Manual per-user MSI or portable ZIP in the same v0.6.1 release; Windows OTA remains held. |

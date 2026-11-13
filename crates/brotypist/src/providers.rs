@@ -1206,9 +1206,9 @@ impl GgufProvider {
         let grammar = if utility {
             Some(UTILITY_GRAMMAR.into())
         } else if !healing.is_empty() {
-            Some(format!("root ::= {} [^\\n\\r]*", writing::json(&healing)))
+            Some(format!("root ::= {} [^\\n\\r]* [^ \\t\\n\\r.,!?;:] [^\\n\\r]*", writing::json(&healing)))
         } else {
-            None
+            Some("root ::= [^\\n\\r]* [^ \\t\\n\\r.,!?;:] [^\\n\\r]*".into())
         };
         let native_limit = (self.config.max_tokens as usize)
             .checked_add(replay_tokens)
