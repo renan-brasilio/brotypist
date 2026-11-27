@@ -572,6 +572,7 @@ impl Engine {
             start: native.start,
             length: native.length,
             remainder: plan.remainder,
+            previous_advance: None,
             at: native.accepted_at,
             revision: offer.revision,
             mode: native.mode,

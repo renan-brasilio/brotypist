@@ -1158,6 +1158,7 @@ struct PendingEdit {
     start: usize,
     length: usize,
     remainder: Option<SuggestionState>,
+    previous_advance: Option<(Snapshot, String)>,
     at: Instant,
     revision: u64,
     mode: String,
@@ -2839,14 +2840,7 @@ impl Engine {
         {
             return s.eligible(1)
                 && (s.inline_safe()
-                    || self
-                        .advance
-                        .as_ref()
-                        .is_some_and(|(key, authority, geometry, _)| {
-                            key.matches(s)
-                                && authority_matches(authority, s)
-                                && geometry.inline_safe()
-                        }));
+                    || self.completion_advance(&s.key(), &s.authority()).is_some());
         }
         if s.on_demand_only
             || !self.completion_eligible(s)
@@ -3165,6 +3159,16 @@ impl Engine {
             "rect":s.anchor_rect(),"field_rect":s.field_rect,"field_anchor":s.caret_rect.is_none(),"native_anchor":s.native_anchor,
             "inline":mode == "completion" || mode == "correction","render":s.inline_render,"choices":choices})
     }
+    fn completion_advance(
+        &self,
+        key: &SnapshotKey,
+        authority: &Authority,
+    ) -> Option<(&Snapshot, &str)> {
+        self.advance
+            .as_ref()
+            .filter(|(k, a, geometry, _)| k == key && a == authority && geometry.inline_safe())
+            .map(|(_, _, geometry, text)| (geometry, text.as_str()))
+    }
     fn publish_completion(&mut self) {
         self.claims.retain(|c| c.mode != "completion");
         self.completion_offer = None;
@@ -3172,20 +3176,14 @@ impl Engine {
         let Some(s) = self.suggestion.snapshot.clone() else {
             return;
         };
-        let fallback = !s.inline_safe()
-            && self
-                .advance
-                .as_ref()
-                .is_some_and(|(key, authority, geometry, _)| {
-                    *key == s.key() && *authority == s.authority() && geometry.inline_safe()
-                });
-        if !fallback {
-            self.advance = None;
-        }
-        let geometry = if fallback {
-            &self.advance.as_ref().expect("verified advance").2
+        let fallback = (!s.inline_safe())
+            .then(|| self.completion_advance(&s.key(), &s.authority()))
+            .flatten();
+        let (geometry, accepted) = if let Some(fallback) = fallback {
+            fallback
         } else {
-            &s
+            self.advance = None;
+            (&s, "")
         };
         if self.suggestion.text.is_empty() || !geometry.inline_safe() {
             self.emit(json!({"type":"clear"}));
@@ -3201,7 +3199,7 @@ impl Engine {
         event["field_rect"] = json!(geometry.field_rect);
         event["native_anchor"] = json!(geometry.native_anchor);
         event["render"] = json!(geometry.inline_render);
-        if let Some((_, _, _, accepted)) = &self.advance {
+        if !accepted.is_empty() {
             event["advance"] = json!(accepted);
         }
         if !choices.is_empty() {
@@ -3932,6 +3930,10 @@ impl Engine {
             }
         }
     }
+    fn has_accepted_remainder(&self) -> bool {
+        // The current completion has already recorded its first accepted word.
+        self.completion_counted && !self.suggestion.text.is_empty()
+    }
     fn schedule(&mut self, s: &Snapshot) {
         if s.app_id == WHATSAPP_APP_ID {
             self.whatsapp_diagnostic.last_schedule_eligible = Some(false);
@@ -3943,6 +3945,7 @@ impl Engine {
             || self.field_paused(s)
             || self.pending_edit.is_some()
             || !s.has_anchor()
+            || self.has_accepted_remainder()
         {
             return;
         }
@@ -4062,6 +4065,9 @@ impl Engine {
     fn prepare_models(&mut self) {
         if !self.active() || (self.on_battery && self.config.battery_on_demand) {
             self.resident = None;
+            return;
+        }
+        if self.has_accepted_remainder() {
             return;
         }
         if self.config.idle_release_seconds == 0 {
@@ -4185,10 +4191,7 @@ impl Engine {
             "completion" => (self.suggestion.snapshot.as_ref().is_some_and(|s| {
                 s.key() == *key
                     && s.authority() == *authority
-                    && (s.inline_safe()
-                        || self.advance.as_ref().is_some_and(|(k, a, g, _)| {
-                            *k == *key && *a == *authority && g.inline_safe()
-                        }))
+                    && (s.inline_safe() || self.completion_advance(key, authority).is_some())
             }) && self.suggestion.text.starts_with(visible))
             .then_some(features::ChoiceMap::default()),
             "correction" => self
@@ -4490,6 +4493,7 @@ impl Engine {
         }) else {
             return false;
         };
+        let mut previous_advance = None;
         let (text, start, length, remainder) = if claim.mode == "correction" {
             let Some((s, r)) = &self.correction else {
                 return false;
@@ -4538,7 +4542,18 @@ impl Engine {
             }
             (c.values[index].clone(), c.start, c.length, None)
         } else {
-            if !current.inline_safe() || !current.eligible(1) {
+            // AppKit measures and paints the verified remainder at the last
+            // caret plus the committed insertion. Its receipt can authorize
+            // those visible words while fresh caret geometry catches up.
+            if !current.inline_safe()
+                && cfg!(target_os = "macos")
+                && matches!(&claim.evidence, PresentationEvidence::Rendered)
+            {
+                previous_advance = self
+                    .completion_advance(&claim.key, &claim.authority)
+                    .map(|(geometry, text)| (geometry.clone(), text.to_owned()));
+            }
+            if (!current.inline_safe() && previous_advance.is_none()) || !current.eligible(1) {
                 self.clear(true, true);
                 return false;
             }
@@ -4583,6 +4598,7 @@ impl Engine {
             start,
             length,
             remainder,
+            previous_advance,
             at: self.now(),
             revision: claim.revision,
             mode: claim.mode.clone(),
@@ -4737,13 +4753,17 @@ impl Engine {
         self.capture_after = self.now();
         if let Some(mut remainder) = edit.remainder {
             if !remainder.text.is_empty() {
-                if !readback.inline_safe() && edit.before.inline_safe() {
-                    self.advance = Some((
-                        readback.key(),
-                        readback.authority(),
-                        edit.before.clone(),
-                        edit.text.clone(),
-                    ));
+                if !readback.inline_safe() {
+                    let advance = if edit.before.inline_safe() {
+                        Some((edit.before, String::new()))
+                    } else {
+                        edit.previous_advance
+                    };
+                    if let Some((geometry, mut accepted)) = advance {
+                        accepted.push_str(&edit.text);
+                        self.advance =
+                            Some((readback.key(), readback.authority(), geometry, accepted));
+                    }
                 }
                 remainder.snapshot = Some(readback.clone());
                 self.suggestion = remainder;
@@ -6178,6 +6198,7 @@ impl Engine {
     fn refresh_context(&mut self) {
         if !self.active()
             || !(self.config.screen_context || self.config.screenshot_context)
+            || self.has_accepted_remainder()
             || self.preparing.is_some()
             || self.request.is_some()
         {
@@ -9104,6 +9125,50 @@ mod tests {
             !h.invoke_hook(Action::Word),
             "no-suggestion Tab passes through after the bounded guard"
         );
+    }
+    #[test]
+    fn automatic_prediction_work_waits_for_the_last_accepted_word() {
+        let config = Config {
+            debounce_ms: 200,
+            screen_context: true,
+            alternatives_enabled: true,
+            alternatives_mode: "pause".into(),
+            alternatives_delay_ms: 100,
+            ..Config::default()
+        };
+        let mut h = harness(config, None);
+        h.native.borrow_mut().snapshot.as_mut().unwrap().multiline = true;
+        h.offer(" arrives tomorrow");
+        let warmups = h.worker.borrow().prepared;
+        h.drawn(" arrives tomorrow", "completion");
+        assert!(h.invoke_hook(Action::Word));
+        h.engine.tick();
+
+        let snapshot = h.native.borrow().snapshot.clone().unwrap();
+        h.native.borrow_mut().context = Some(ContextTicket {
+            snapshot,
+            gate: None,
+            entered: None,
+            text: "Optional reference".into(),
+        });
+        h.drawn("tomorrow", "completion");
+        h.elapse(500);
+        h.engine.tick();
+        assert!(h.preparation.borrow().pending.is_none());
+        assert_eq!(h.preparation.borrow().prefetched, 0);
+        assert_eq!(h.worker.borrow().prepared, warmups);
+        assert_eq!(h.worker.borrow().submitted.len(), 1);
+        assert!(h.invoke_hook(Action::Word));
+        h.engine.tick();
+
+        h.elapse(200);
+        h.engine.tick();
+        h.engine.tick();
+        h.prepared();
+        let worker = h.worker.borrow();
+        assert_eq!(worker.submitted.len(), 2);
+        assert_eq!(worker.submitted[1].1, "The update arrives tomorrow ");
+        assert!(worker.submitted[1].3.utility.is_empty());
     }
     fn continuation_guard_harness(offer: &str) -> Harness {
         continuation_guard_harness_in_app(offer, WHATSAPP_APP_ID)
@@ -13106,29 +13171,52 @@ mod tests {
         assert!(locked(&h.storage).stats.is_empty());
         assert_eq!(h.native.borrow().edits.len(), 1);
     }
+    #[cfg(target_os = "macos")]
     #[test]
-    fn partial_remainder_uses_verified_advance_but_waits_for_current_geometry_before_another_edit()
-    {
+    fn word_acceptance_keeps_painted_remainder_when_native_caret_geometry_lags() {
         let mut h = harness(Config::default(), None);
-        h.offer(" arrives tomorrow");
-        h.drawn(" arrives tomorrow", "completion");
         h.native.borrow_mut().outcome = Outcome::AppliedNoGeometry;
-        h.engine.drain_events();
-        h.engine.command(Command::Action(Action::Word));
-        assert!(
-            h.engine
+        h.offer(" arrives tomorrow before noon");
+        for (remainder, advance, draft) in [
+            (" arrives tomorrow before noon", "", "The update arrives "),
+            (
+                "tomorrow before noon",
+                " arrives ",
+                "The update arrives tomorrow ",
+            ),
+            (
+                "before noon",
+                " arrives tomorrow ",
+                "The update arrives tomorrow before ",
+            ),
+            (
+                "noon",
+                " arrives tomorrow before ",
+                "The update arrives tomorrow before noon ",
+            ),
+        ] {
+            let offer = h
+                .engine
                 .drain_events()
-                .iter()
-                .any(|e| e["type"] == "suggestion"
-                    && e["text"] == "tomorrow"
-                    && e["advance"] == " arrives ")
-        );
-        h.drawn("tomorrow", "completion");
-        assert!(h.invoke_hook(Action::Word));
-        h.engine.tick();
-        assert_eq!(h.native.borrow().edits.len(), 1);
-        assert_eq!(h.native.borrow().finished, vec![false]);
-        assert_eq!(locked(&h.storage).stats.len(), 1);
+                .into_iter()
+                .rev()
+                .find(|e| e["type"] == "suggestion" && e["mode"] == "completion")
+                .expect("the remaining words must be repainted");
+            assert_eq!(offer["text"], remainder);
+            assert_eq!(offer["advance"].as_str().unwrap_or(""), advance);
+            h.acknowledge_offer(&offer);
+            assert!(h.invoke_hook(Action::Word));
+            h.engine.tick();
+            let native = h.native.borrow();
+            let snapshot = native.snapshot.as_ref().unwrap();
+            assert_eq!(snapshot.text.as_ref(), draft);
+            assert_eq!(snapshot.caret, draft.len());
+            assert!(!snapshot.inline_safe());
+            assert_eq!(h.worker.borrow().submitted.len(), 1);
+            assert!(h.preparation.borrow().pending.is_none());
+        }
+        assert_eq!(h.native.borrow().finished, [true; 4]);
+        assert_eq!(locked(&h.storage).stats.len(), 4);
     }
     #[test]
     fn native_startup_failure_retains_settings_and_shutdown_then_explicit_retry_recovers() {
