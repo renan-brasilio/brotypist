@@ -5,6 +5,11 @@ was redacted with maintainer approval; unchanged native downloads retain their
 original signed provenance, not the source identity of rewritten tags. Legacy
 Python-era downloads were withdrawn; their release pages remain historical records.
 
+## 0.6.3 — Consecutive Tab acceptance
+
+- On macOS, accept visible predicted words one at a time with Tab even when fresh caret geometry arrives late. Each acceptance still requires a current rendered suggestion and confirmation from the host field.
+- Defer automatic prediction work while words remain in a partially accepted suggestion. The next completion request follows the normal debounce after the last word is confirmed.
+
 ## 0.6.2 — Continuous multi-word prediction and sentence closure fix
 
 macOS Apple Silicon patch release. Fixes prediction stalls where generation ceased
